@@ -1,0 +1,40 @@
+[project]
+name = "transcribe-in-textbox"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "Karlis Balcers", email = "karlis.balcers@gmail.com"}
+]
+readme = "README.md"
+requires-python = ">=3.11"
+
+[tool.poetry]
+package-mode = false
+
+[tool.poetry.dependencies]
+python = "^3.11"
+#speechrecognition = ">=3.14.1,<4.0.0"
+#pyautogui = ">=0.9.54,<0.10.0"
+pyaudio = ">=0.2.14,<0.3.0"
+#pyqt6 = ">=6.8.1,<7.0.0"
+#faster-whisper = ">=1.1.1,<2.0.0"
+#torch = { version = "^2.6.0", source = "pytorch" }
+#torchvision = { version = "^0.21.0", source = "pytorch" }
+#torchaudio = { version = "^2.6.0", source = "pytorch" }
+tk = "^0.1.0"
+pyaudiowpatch = "^0.2.12.7"
+#pystray = "^0.19.5"
+python-dotenv = "^1.0.1"
+openai = "^1.63.0"
+pywinauto = "^0.6.9"
+numpy = "^2.3.1"
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+
+[[tool.poetry.source]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu118"
+priority = "explicit"
