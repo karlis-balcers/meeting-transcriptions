@@ -15,7 +15,7 @@ if [ ! -d ".venv" ]; then
         echo
     fi
 fi=============================================="
-echo "Starting transcribe-in-textbox application"
+echo "Starting transcribe application"
 echo "==============================================="
 echo
 

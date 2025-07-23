@@ -1,6 +1,6 @@
 @echo off
 echo ===============================================
-echo Starting transcribe-in-textbox application
+echo Starting transcribe application
 echo ===============================================
 echo.
 

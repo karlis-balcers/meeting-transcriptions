@@ -53,7 +53,7 @@ class Assistant:
                 except Exception as e:
                     print(f"Error storing message in Assistant thread: {e}")
 
-                if message.find("?")>0:
+                if role != "assistant": #and message.find("?")>0:
                     self._answer()
             except Empty:
                 continue
@@ -75,7 +75,22 @@ class Assistant:
         run = self.client.beta.threads.runs.create_and_poll(
             thread_id=self.thread.id,
             assistant_id=self.assistant_id,
-            instructions=f"Please address the user as {self.your_name}.\n{self.assistant.instructions}\nSound like a human having a conversation. Do not add intro or outro details and also skip references. If there is not enough transcript for a reasonable answer then reply with '---'. Try not to repeat yourself, and if there is nothing new to say then respond with '---'.",
+            instructions=f"""{self.assistant.instructions}
+You are helping user with name '{self.your_name}'.
+Your task is to help the user to run the conversation. The user is sharing with you the raw meeting transcript.
+The user is never addressing you - if the user says "hi"or "hello" or asks a question he not talking to you but to the participants of the meeting.
+Make your responses short and to the point to allow user to read them quickly while the meeting is ongoing
+Do not return references to the documents. Skip intros and outros. 
+Your response should:
+* Suggest some questions to ask 
+* Answers to provide
+* Suggest what to discuss next
+
+In responses prefer use of lists as it's easy to read. Do not use Markdown, but plain-text.
+If there is not enough transcript for a reasonable answer then reply with '---'. 
+Try not to respond with similar advices or answers as you already provided before.
+If there is nothing new to say then respond with '---'. 
+            """,
         )
 
         while not run.completed_at:

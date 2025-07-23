@@ -89,6 +89,20 @@ try:
 except:
     pass
 
+g_agent_font_size = 14
+try:
+    g_agent_font_size = int(os.environ.get("AGENT_FONT_SIZE", "14"))
+    print(f"Agent font size: {g_agent_font_size}")
+except:
+    pass
+
+g_default_font_size = 10
+try:
+    g_default_font_size = int(os.environ.get("DEFAULT_FONT_SIZE", "10"))
+    print(f"Default font size: {g_default_font_size}")
+except:
+    pass
+
 g_transcript_ai=None
 try:
     g_openai_model_for_transcript = os.environ.get("OPENAI_MODEL_FOR_TRANSCRIPT")
@@ -260,19 +274,19 @@ def setup_ui():
     
     # Create Mute button
     mute_button = tk.Button(button_frame, text="Mute Mic", command=toggle_mute, 
-                           bg="#ff6b6b", fg="white", font=("Arial", 10, "bold"))
+                           bg="#ff6b6b", fg="white", font=("Arial", g_default_font_size, "bold"))
     mute_button.pack(side=tk.LEFT, padx=(0, 5))
     
     # Create Reset button
     reset_button = tk.Button(button_frame, text="Reset Log", command=reset_log_file,
-                            bg="#4ecdc4", fg="white", font=("Arial", 10, "bold"))
+                            bg="#4ecdc4", fg="white", font=("Arial", g_default_font_size, "bold"))
     reset_button.pack(side=tk.LEFT, padx=(0, 5))
     
     chat_window = tk.Text(root, wrap=tk.WORD, state=tk.DISABLED)
     chat_window.pack(expand=True, fill=tk.BOTH, padx=5, pady=(0, 5))
     chat_window.tag_config("microphone", foreground="blue")
     chat_window.tag_config("output", foreground="green")
-    chat_window.tag_config("agent", foreground="gray")
+    chat_window.tag_config("agent", foreground="gray", font=("Arial", g_agent_font_size, "bold"))
     
     # Bind extra events to see when the window is being hidden/destroyed.
     def on_destroy(event):
@@ -325,7 +339,13 @@ def update_chat():
 
             last_user=user
         else:
-            chat_window.insert(tk.END, f"{text}\n", "microphone" if user == g_my_name else "output")
+            if user == g_my_name:
+                chat_window.insert(tk.END, f"{text}\n", "microphone")
+            elif user == AGENT_NAME:
+                chat_window.insert(tk.END, f"{text}\n", "agent")
+            else:
+                chat_window.insert(tk.END, f"{text}\n", "output")
+ 
     chat_window.config(state=tk.DISABLED)
     chat_window.yview(tk.END)
 
