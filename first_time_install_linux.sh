@@ -16,6 +16,11 @@ if ! command -v python3 &> /dev/null; then
     exit 1
 fi
 
+sudo apt-get update
+sudo apt-get install -y portaudio19-dev python3-dev build-essential
+
+sudo apt-get install python3-tk
+
 echo "Python found. Checking version..."
 python3 --version
 

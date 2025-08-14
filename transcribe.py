@@ -1,4 +1,8 @@
-import pyaudiowpatch as pyaudio
+import sys
+if sys.platform == "win32":
+    import pyaudiowpatch as pyaudio  # WASAPI features on Windows
+else:
+    import pyaudio  # Standard PyAudio on non-Windows
 #import torch
 #import torchaudio
 import time
@@ -13,7 +17,8 @@ from dotenv import load_dotenv
 import numpy as np
 import struct
 
-from pywinauto import Application
+if sys.platform == "win32":
+    from pywinauto import Application
 import re
 import assistant
 #import fastwhisper_transcribe
@@ -149,17 +154,20 @@ global_audio = pyaudio.PyAudio()
 
 g_window_name = "Meeting compact view*"
 g_ms_teams_app = None
-try:
-    # Connect to Microsoft Teams by title, or you can use process ID or path
-    g_ms_teams_app = Application(backend="uia").connect(title_re=g_window_name)
-except:
-    pass
+if sys.platform == "win32":
+    try:
+        # Connect to Microsoft Teams by title, or you can use process ID or path
+        g_ms_teams_app = Application(backend="uia").connect(title_re=g_window_name)
+    except:
+        pass
 
 g_previous_speaker = None
 g_current_speaker = None
 
 def inspect_ms_teams():
     global g_ms_teams_app
+    if sys.platform != "win32":
+        return None
     try:
         if g_ms_teams_app==None:
             g_ms_teams_app = Application(backend="uia").connect(title_re=g_window_name)
@@ -563,16 +571,21 @@ def stop_recording():
 def initialize_recording():
     try:
         with pyaudio.PyAudio() as p:
-            wasapi_info = p.get_host_api_info_by_type(pyaudio.paWASAPI)
             global g_device_in, g_device_out
-            g_device_in = p.get_device_info_by_index(wasapi_info["defaultInputDevice"])
-            g_device_out = p.get_device_info_by_index(wasapi_info["defaultOutputDevice"])
+            if sys.platform == "win32":
+                wasapi_info = p.get_host_api_info_by_type(pyaudio.paWASAPI)
+                g_device_in = p.get_device_info_by_index(wasapi_info["defaultInputDevice"])
+                g_device_out = p.get_device_info_by_index(wasapi_info["defaultOutputDevice"])
 
-            if not g_device_out["isLoopbackDevice"]:
-                for loopback in p.get_loopback_device_info_generator():
-                    if g_device_out["name"] in loopback["name"]:
-                        g_device_out = loopback
-                        break
+                if not g_device_out.get("isLoopbackDevice", False):
+                    for loopback in p.get_loopback_device_info_generator():
+                        if g_device_out["name"] in loopback.get("name", ""):
+                            g_device_out = loopback
+                            break
+            else:
+                # Fallback: Pick default input/output devices
+                g_device_in = p.get_default_input_device_info()
+                g_device_out = p.get_default_output_device_info()
         print("[Init] Devices initialized successfully.")
     except Exception as e:
         print(f"[Init] Error initializing devices: {e}")

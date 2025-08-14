@@ -5,6 +5,7 @@ echo "Starting transcribe application"
 echo "==============================================="
 echo
 
+
 # Check if Poetry is available
 if ! command -v poetry &> /dev/null; then
     echo "ERROR: Poetry is not installed or not in PATH."
