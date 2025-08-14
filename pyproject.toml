@@ -22,11 +22,13 @@ pyaudio = ">=0.2.14,<0.3.0"
 #torchvision = { version = "^0.21.0", source = "pytorch" }
 #torchaudio = { version = "^2.6.0", source = "pytorch" }
 tk = "^0.1.0"
-pyaudiowpatch = "^0.2.12.7"
+# Only available/needed on Windows (WASAPI loopback)
+pyaudiowpatch = { version = "^0.2.12.7", markers = "sys_platform == 'win32'" }
 #pystray = "^0.19.5"
 python-dotenv = "^1.0.1"
 openai = "^1.63.0"
-pywinauto = "^0.6.9"
+# Windows-only UI automation library
+pywinauto = { version = "^0.6.9", markers = "sys_platform == 'win32'" }
 numpy = "^2.3.1"
 
 [build-system]
