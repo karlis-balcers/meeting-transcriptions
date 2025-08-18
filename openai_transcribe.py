@@ -2,6 +2,7 @@ from openai import OpenAI
 from segment import Segment
 from typing import Iterable
 
+FAKE_KEYWORD = "LAMPA"
 
 class OpenAITranscribe:
     def __init__(self, model: str = "gpt-4o-mini-transcribe", language="en", keywords: str = None):
@@ -9,7 +10,7 @@ class OpenAITranscribe:
         self.model = model
         self.language = language
         self.keywords = keywords
-        self.initial_prompt = f"This discussion might mention {keywords}." if keywords else ""
+        self.initial_prompt = f"This discussion might mention {FAKE_KEYWORD}, {keywords}." if keywords else ""
 
     def transcribe(self, audio_file_path: str) -> Iterable[Segment]:
         """
@@ -28,7 +29,7 @@ class OpenAITranscribe:
         if "text" not in json_response:
             print(f"Error: No transcription found: {json_response}")
         else:
-            if transcription.text.lower().find("this discussion might mention") < 0:
+            if transcription.text.find(FAKE_KEYWORD) < 0 and transcription.text.find('###') < 0 and transcription.text.find('context/instructions') < 0:
                 segment = Segment(start=0, end=1.0, text=transcription.text)
                 segments.append(segment)
         return segments
