@@ -55,8 +55,8 @@ This Python application provides real-time audio recording, transcription, and c
     LANGUAGE=en
     INTERUPT_MANUALLY=True
     OPENAI_API_KEY=<Your Open AI API Key - from the same organization as the Assistant, if you will use it>
-    # Comment out if you don't want answers from Assistant. Set the right assisant ID with the right knowledge (should start wtith asst_*)
-    OPENAI_ASSISTANT_ID_FOR_ANSWERS=
+    # Comment out if you don't want answers from Assistant. Set the right vector store ID with the right knowledge (should start wtith vs_*)
+    OPENAI_VECTOR_STORE_ID_FOR_ANSWERS=
     # Comment out if you don't want to use OpenAI for transcription, but use local model instead
     OPENAI_MODEL_FOR_TRANSCRIPT=gpt-4o-mini-transcribe
     #OPENAI_MODEL_FOR_TRANSCRIPT=gpt-4o-transcribe

@@ -80,9 +80,9 @@ g_interupt_manually = True
 
 g_assistant=None
 try:
-    assistant_id=os.environ.get("OPENAI_ASSISTANT_ID_FOR_ANSWERS")
-    g_assistant = assistant.Assistant(assistant_id, g_my_name, agent_name=AGENT_NAME, answer_queue=g_transcriptions_in)
-    print(f"Using assistant ID to auto-answer: {assistant_id}")
+    vector_store_id=os.environ.get("OPENAI_VECTOR_STORE_ID_FOR_ANSWERS")
+    g_assistant = assistant.Assistant(vector_store_id, g_my_name, agent_name=AGENT_NAME, answer_queue=g_transcriptions_in)
+    print(f"Using vector store ID to auto-answer: {vector_store_id}")
 except:
     pass
 
@@ -538,7 +538,7 @@ def add_transcription(user, text, start_time):
     """
     g_transcriptions_in.put((user, text, start_time))
     if g_assistant:
-        g_assistant.add_message(f"{user}: {text}")
+        g_assistant.add_message(start_time+1,f"{user}: {text}")
 
 def update_screen_on_new_transcription():
     global g_transcription
