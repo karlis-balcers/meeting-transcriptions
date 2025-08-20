@@ -123,7 +123,7 @@ If there is nothing new to say then respond with '---'.
         }
 
         if self.vector_store_id:
-            payload["model"] = "gpt-4o" # `file_search` is only supported by previous models and not by GPT-5.
+            payload["model"] = "gpt-4o-mini" # `file_search` is only supported by previous models and not by GPT-5.
             # For /v1/responses, pass the store on the tool itself (NOT top-level tool_resources)
             payload["tools"] = [
                 {"type": "file_search", "vector_store_ids": [self.vector_store_id]}
