@@ -30,6 +30,7 @@ openai = "^1.63.0"
 # Windows-only UI automation library
 pywinauto = { version = "^0.6.9", markers = "sys_platform == 'win32'" }
 numpy = "^2.3.1"
+requests = "^2.32.5"
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
