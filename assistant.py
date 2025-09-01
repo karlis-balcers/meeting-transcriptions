@@ -2,8 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import thread
 from urllib import response
-#from openai import AsyncOpenAI
-#from openai import OpenAI
+from openai import OpenAI, APIError
 import time
 from queue import Queue, Empty
 from threading import Thread, Event, Lock
@@ -13,7 +12,6 @@ from dataclasses import dataclass
 import os
 from typing import Iterable, Optional, Any
 import json
-import requests
 
 
 @dataclass
@@ -35,14 +33,14 @@ class Assistant:
         self.message_thread.start()
         self.last_answer = None
         self.messages = []
-        self.api_key = os.getenv("OPENAI_API_KEY")
-        self.model = "gpt-5-mini"
+        self.client = OpenAI()
+        self.model = os.getenv("OPENAI_MODEL_FOR_ASSISTANT", "gpt-4o-mini")
 
-    def start_new_thread(self):
+    def reset_conversation_state(self):
         """
-        Start a new thread for the assistant.
+        Reset the assistant's conversation state.
         """
-        print(f"New thread started: {self.thread.id}")
+        print("Resetting assistant state.")
         self.messages = []
         self.last_answer = None
         self.messages_in = Queue()
@@ -85,7 +83,7 @@ class Assistant:
         print("Answering question...")
         time_val = timestamp
 
-        system = f"""You are helping user with name '{self.your_name}'. Your task is to help the user by suggesting what to say next. Never summarize the transcript.
+        system_prompt = f"""You are helping user with name '{self.your_name}'. Your task is to help the user by suggesting what to say next. Never summarize the transcript.
 The user is sharing with you the raw meeting transcript.
 The user is never addressing you - if the user says "hi"or "hello" or asks a question he is not talking to you but to the participants of the meeting.
 Make your responses short and to the point - no more than 3 sentences.
@@ -103,73 +101,54 @@ If there is nothing new to say then respond with '---'.
         last_message = f"Latest from {self.messages[-1].user}: {self.messages[-1].text}"
         content.append({"type": "input_text", "text": last_message})
 
-        url = "https://api.openai.com/v1/responses"
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
-
         user_message: dict[str, Any] = {
             "role": "user",
             "content": content,
         }
 
-        # Attach vector store for file_search if configured
-        payload: dict[str, Any] = {
-            "model": self.model or "gpt-5-mini",
-            "instructions": system,
-            "input": [user_message],
-            "max_output_tokens": 1000,
-        }
-
-        if self.vector_store_id:
-            payload["model"] = "gpt-4o-mini" # `file_search` is only supported by previous models and not by GPT-5.
-            # For /v1/responses, pass the store on the tool itself (NOT top-level tool_resources)
-            payload["tools"] = [
-                {"type": "file_search", "vector_store_ids": [self.vector_store_id]}
-            ]
-            payload["tool_choice"] = {"type": "file_search"}  # enforce tool usage
-
-        if payload["model"].find('5')>=0:
-            payload["reasoning"] =  {"effort": "low"} #only gpt-5 supports reasoning effort config.
-
         try:
-            resp = requests.post(url, headers=headers, json=payload, timeout=60)
-        except requests.RequestException:
-            return ":eyes:"
-        if not (200 <= resp.status_code < 300):
-            # Print brief error context for troubleshooting
-            try:
-                err = resp.json()
-                print("Responses API error:", json.dumps(err, indent=2)[:2000])
-            except Exception:
-                print("Responses API error (raw):", (resp.text or "")[:2000])
-            return ":eyes:"
+            request_params = {
+                "model": self.model,
+                "instructions": system_prompt,
+                "input": [user_message],
+                "max_output_tokens": 1000,
+            }
 
-        print("RAW:",resp)
-        try:
-            data = resp.json()
-        except Exception:
-            return ":eyes:"
+            if self.vector_store_id:
+                request_params["model"] = "gpt-4o-mini" # `file_search` is only supported by previous models and not by GPT-5.
+                request_params["tools"] = [
+                    {"type": "file_search", "vector_store_ids": [self.vector_store_id]}
+                ]
+                request_params["tool_choice"] = {"type": "file_search"}  # enforce tool usage
 
-        # Extract friendly text output; fall back to raw JSON text if schema differs
-        text = data.get("output_text")
-        if not text:
-            out_parts: list[str] = []
-            for item in data.get("output", []) or []:
-                for c in item.get("content", []) or []:
-                    if "text" in c:
-                        t = c["text"]["value"] if isinstance(c["text"], dict) else c["text"]
-                        if isinstance(t, str):
-                            out_parts.append(t)
-            text = "\n".join(out_parts) or json.dumps(data, indent=2)
-        if text =="---":
-            self.last_answer = None
-        else:
-            self.last_answer = text
-            if self.answer_queue:
-                print(f"Answered at {time_val}: {self.last_answer}")
-                self.answer_queue.put((self.agent_name, self.last_answer, time_val))
-                self.add_message(time_val, self.last_answer, role="assistant")
+            if "5" in request_params["model"]:
+                request_params["reasoning"] = {"effort": "low"} #only gpt-5 supports reasoning effort config.
+
+            response = self.client.responses.create(**request_params)
+
+            text = response.output_text
+            if not text:
+                out_parts: list[str] = []
+                for item in response.output or []:
+                    for c in item.content or []:
+                        if hasattr(c, "text"):
+                            t = c.text.value if hasattr(c.text, "value") else c.text
+                            if isinstance(t, str):
+                                out_parts.append(t)
+                text = "\n".join(out_parts)
+
+            if text == "---":
+                self.last_answer = None
+            else:
+                self.last_answer = text
+                if self.answer_queue:
+                    print(f"Answered at {time_val}: {self.last_answer}")
+                    self.answer_queue.put((self.agent_name, self.last_answer, time_val))
+                    self.add_message(time_val, self.last_answer, role="assistant")
+
+        except APIError as e:
+            print(f"OpenAI API Error: {e}")
+        except Exception as e:
+            print(f"An unexpected error occurred: {e}")
 
         print("Answering question... DONE")

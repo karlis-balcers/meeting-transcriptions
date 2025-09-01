@@ -23,8 +23,23 @@ import re
 import assistant
 #import fastwhisper_transcribe
 import openai_transcribe
+from gui import TranscriptionUI
 
 print("Loading configuration from '.env' file...")
+
+g_filter_phrases = []
+
+def load_filter_phrases(filename="filter_phrases.txt"):
+    """Load filter phrases from a file."""
+    global g_filter_phrases
+    try:
+        with open(filename, "r") as f:
+            g_filter_phrases = [line.strip() for line in f if line.strip()]
+        print(f"Loaded {len(g_filter_phrases)} filter phrases from {filename}")
+    except FileNotFoundError:
+        print(f"Warning: Filter phrases file not found at {filename}. Filtering will be disabled.")
+    except Exception as e:
+        print(f"Error loading filter phrases: {e}")
 
 
 # Constants
@@ -231,17 +246,13 @@ def get_speaker_name():
 
 def toggle_mute():
     """Toggle the microphone mute state."""
-    global mute_button
     if mute_mic_event.is_set():
         mute_mic_event.clear()
         print("[UI] Microphone unmuted")
-        root.title("Live Audio Chat")
-        mute_button.config(text="Mute Mic", bg="#ff6b6b")  # Red when ready to mute
     else:
         mute_mic_event.set()
         print("[UI] Microphone muted")
-        root.title("Live Audio Chat - MIC MUTED")
-        mute_button.config(text="Unmute Mic", bg="#2ecc40")  # Green when muted (ready to unmute)
+    ui.update_mute_button(mute_mic_event.is_set())
 
 def reset_log_file():
     """Reset the transcription log file with a new timestamp."""
@@ -261,101 +272,11 @@ def reset_log_file():
         g_transcription = []
 
         if g_assistant:
-            g_assistant.start_new_thread()
-        root.after(0, update_chat)
+            g_assistant.reset_conversation_state()
+        ui.update_chat(g_transcription)
         
     except Exception as e:
         print(f"[UI] Error creating new log file: {e}")
-
-
-# GUI Setup
-def setup_ui():
-    global chat_window, root, mute_button
-    
-    root = tk.Tk()
-    root.title("Live Audio Chat")
-    root.geometry("600x400")
-    
-    # Create button frame at the top
-    button_frame = tk.Frame(root)
-    button_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
-    
-    # Create Mute button
-    mute_button = tk.Button(button_frame, text="Mute Mic", command=toggle_mute, 
-                           bg="#ff6b6b", fg="white", font=("Arial", g_default_font_size, "bold"))
-    mute_button.pack(side=tk.LEFT, padx=(0, 5))
-    
-    # Create Reset button
-    reset_button = tk.Button(button_frame, text="Reset Log", command=reset_log_file,
-                            bg="#4ecdc4", fg="white", font=("Arial", g_default_font_size, "bold"))
-    reset_button.pack(side=tk.LEFT, padx=(0, 5))
-    
-    chat_window = tk.Text(root, wrap=tk.WORD, state=tk.DISABLED)
-    chat_window.pack(expand=True, fill=tk.BOTH, padx=5, pady=(0, 5))
-    chat_window.tag_config("microphone", foreground="blue")
-    chat_window.tag_config("output", foreground="green")
-    chat_window.tag_config("agent", foreground="gray", font=("Arial", g_agent_font_size, "bold"))
-    
-    # Bind extra events to see when the window is being hidden/destroyed.
-    def on_destroy(event):
-        print("[Tkinter] Window destroy event triggered:", event)
-    def on_unmap(event):
-        print("[Tkinter] Window unmap (hidden) event triggered:", event)
-    root.bind("<Destroy>", on_destroy)
-    root.bind("<Unmap>", on_unmap)
-    '''
-    # Bind key press events for manual splitting.
-    def on_split_key(event):
-        global flush_counter
-        with flush_counter_lock:
-            flush_counter += 1
-        print("[UI] Split key pressed. Flushing current audio buffers.")
-    root.bind("<KeyPress-s>", on_split_key)
-    root.bind("<KeyPress-S>", on_split_key)
-    '''
-    # Bind key press events for any letter key a-z
-    def on_key_press(event):
-        global flush_letter_mic, flush_letter_out
-        with flush_letter_lock:
-            flush_letter_mic = event.char
-            flush_letter_out = event.char
-        print(f"[UI] Key '{event.char}' pressed. Flushing current audio buffers.")
-
-    if g_interupt_manually:
-        for key in "abcdefghijklmnopqrstuvwxyz":
-            root.bind(f"<KeyPress-{key}>", on_key_press)
-            root.bind(f"<KeyPress-{key.upper()}>", on_key_press)  # Also bind uppercase versions
-    #--------------
-    root.protocol("WM_DELETE_WINDOW", stop_recording)
-    print("[GUI] UI setup complete.")
-    
-    return root
-
-def update_chat():
-    chat_window.config(state=tk.NORMAL)
-    chat_window.delete("1.0", tk.END)
-    last_user=''
-    for entry in g_transcription:
-        user, text, start_time = entry
-        if user != last_user:
-            if user == g_my_name:
-                chat_window.insert(tk.END, f"\n# {user}:\n{text}\n", "microphone")
-            elif user == AGENT_NAME:
-                chat_window.insert(tk.END, f"\n# {user}:\n{text}\n", "agent")
-            else:
-                chat_window.insert(tk.END, f"\n# {user}:\n{text}\n", "output")
-
-            last_user=user
-        else:
-            if user == g_my_name:
-                chat_window.insert(tk.END, f"{text}\n", "microphone")
-            elif user == AGENT_NAME:
-                chat_window.insert(tk.END, f"{text}\n", "agent")
-            else:
-                chat_window.insert(tk.END, f"{text}\n", "output")
- 
-    chat_window.config(state=tk.DISABLED)
-    chat_window.yview(tk.END)
 
 # Audio Recording Functions
 def store_audio_stream(queue, filename_suffix, device_info, from_microphone):
@@ -494,6 +415,31 @@ def collect_from_stream(queue, input_device, p_instance, from_microphone):
         print(f"[{input_device.get('name', 'Unknown')}] Failed to open audio stream: {e}")
     print(f"[{input_device.get('name', 'Unknown')}] collect_from_stream exiting.")
 
+def is_text_filtered(text, keywords):
+    """Check if the text should be filtered based on a list of phrases."""
+    if not text:
+        return True
+
+    # Exact matches
+    if text in g_filter_phrases:
+        return True
+
+    # Starts with any of the filter phrases
+    for phrase in g_filter_phrases:
+        if text.startswith(phrase):
+            return True
+
+    # Contains any of the filter phrases
+    for phrase in g_filter_phrases:
+        if phrase in text:
+            return True
+
+    # Contains keywords
+    if keywords and keywords in text:
+        return True
+
+    return False
+
 def transcribe_and_display(file, from_microphone, letter):
     global g_transcription
     if not letter:
@@ -508,15 +454,7 @@ def transcribe_and_display(file, from_microphone, letter):
         #with g_transcription_lock:
         for segment in segments:
             text = segment.text.strip()
-            if len(text) > 0:
-                #print(f"Segment: {segment}") 
-                # FastWhisper often returns the following text values which are not an actual transcriptions but halucinations.
-                if text == 'Bye.'  or text == 'Um' or text.startswith("Thanks for watching") or text.startswith("Thank you for watching") or text.startswith("Thanks for listening") or text.startswith("Thank you for joining") \
-                        or text.startswith("Thank you very much") or text.startswith("Thank you for tuning in") or text == 'Paldies!' or text =="Thank you." or text == '.' or text == 'You' \
-                        or text.find("please subscribe to my channel")>=0 or text.startswith("Thank you guys.") \
-                        or text.find("www.NorthstarIT.co.uk")>=0 or text.find("Amara.org")>=0 or text.find("I'll see you in the next video")>=0 or text.find("brandhagen10.com") >=0 or text.find("WWW.ABERCAP.COM")>=0 \
-                        or text.find(g_keywords)>=0:
-                    continue
+            if not is_text_filtered(text, g_keywords):
                 converted_time = datetime.fromtimestamp(segment.start)
                 #print(converted_time)  # Outputs in a readable format
                 print(f"[{converted_time} -> {segment.end:.2f}] {segment.text}")
@@ -558,7 +496,7 @@ def update_screen_on_new_transcription():
             pass
         g_transcription.append([user, text, start_time])
         g_transcription = sorted(g_transcription, key=lambda entry: entry[2])
-        root.after(0, update_chat)
+        root.after(0, ui.update_chat, g_transcription)
 
 # Stop Recording
 def stop_recording():
@@ -602,8 +540,12 @@ def handler(signum, frame):
 if __name__ == "__main__":
     print("[Main] Starting application...")
     signal.signal(signal.SIGINT, handler)
+    load_filter_phrases()
     os.makedirs("output", exist_ok=True)
-    root = setup_ui()
+
+    root = tk.Tk()
+    ui = TranscriptionUI(root, stop_recording, toggle_mute, reset_log_file, AGENT_NAME, g_my_name, g_default_font_size, g_agent_font_size)
+
     if initialize_recording():
         print("[Main] Recording initialized. Launching UI.")
         threads = [
