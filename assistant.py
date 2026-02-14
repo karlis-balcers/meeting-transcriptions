@@ -12,7 +12,7 @@ from threading import Thread, Event, Lock
 from dataclasses import dataclass
 import os
 import logging
-from typing import Iterable, Optional, Any
+from typing import Iterable, Optional, Any, Callable
 import json
 import requests
 
@@ -27,11 +27,12 @@ class Message:
 
 class Assistant:
 
-    def __init__(self, vector_store_id: str, your_name: str, agent_name: str = "Agent", answer_queue: Queue = None):
+    def __init__(self, vector_store_id: str, your_name: str, agent_name: str = "Agent", answer_queue: Queue = None, status_callback: Optional[Callable[[str, str], None]] = None):
         self.vector_store_id = vector_store_id
         self.your_name = your_name or "You"
         self.agent_name = agent_name
         self.answer_queue = answer_queue
+        self.status_callback = status_callback
         self.messages_in = Queue()
         self.stop_event = Event()
         self.messages_lock = Lock()
@@ -48,7 +49,108 @@ class Assistant:
 
         configured_model = os.getenv("OPENAI_MODEL_FOR_ASSISTANT")
         self.model = configured_model.strip() if configured_model and configured_model.strip() else "gpt-5.2"
+        self.api_max_retries = int(os.getenv("ASSISTANT_API_MAX_RETRIES", "3"))
+        self.api_retry_base_seconds = float(os.getenv("ASSISTANT_API_RETRY_BASE_SECONDS", "1.0"))
+        self.answer_timeout_seconds = float(os.getenv("ASSISTANT_API_TIMEOUT_SECONDS", "60"))
+        self.summary_timeout_seconds = float(os.getenv("ASSISTANT_SUMMARY_TIMEOUT_SECONDS", "120"))
+        self.title_timeout_seconds = float(os.getenv("ASSISTANT_TITLE_TIMEOUT_SECONDS", "30"))
         logger.info("Assistant model: %s", self.model)
+
+    def _emit_status(self, message: str, level: str = "info") -> None:
+        if self.status_callback:
+            try:
+                self.status_callback(message, level)
+            except Exception as e:
+                logger.debug("Status callback failed: %s", e)
+
+    def _compute_backoff(self, attempt: int) -> float:
+        return self.api_retry_base_seconds * (2 ** max(0, attempt - 1))
+
+    def _post_with_retry(
+        self,
+        url: str,
+        headers: dict[str, str],
+        payload: dict[str, Any],
+        timeout_seconds: float,
+        operation_name: str,
+    ) -> tuple[Optional[requests.Response], bool]:
+        """Post with exponential backoff.
+
+        Returns:
+            Tuple[response_or_none, is_hard_failure]
+        """
+        max_attempts = max(1, self.api_max_retries + 1)
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                resp = requests.post(url, headers=headers, json=payload, timeout=timeout_seconds)
+            except (requests.Timeout, requests.ConnectionError) as e:
+                should_retry = attempt < max_attempts
+                if should_retry:
+                    delay = self._compute_backoff(attempt)
+                    logger.warning(
+                        "%s transient network error on attempt %s/%s: %s. Retrying in %.2fs.",
+                        operation_name,
+                        attempt,
+                        max_attempts,
+                        e,
+                        delay,
+                    )
+                    self._emit_status(f"{operation_name}: transient network issue, retrying...", "warning")
+                    time.sleep(delay)
+                    continue
+
+                logger.error("%s failed after %s attempts due to network error: %s", operation_name, max_attempts, e)
+                self._emit_status(f"{operation_name} failed: network error.", "error")
+                return None, False
+            except requests.RequestException as e:
+                logger.error("%s request exception (non-retryable): %s", operation_name, e)
+                self._emit_status(f"{operation_name} failed: request error.", "error")
+                return None, False
+
+            if 200 <= resp.status_code < 300:
+                return resp, False
+
+            if resp.status_code in (401, 403):
+                try:
+                    body_preview = json.dumps(resp.json(), indent=2)[:1500]
+                except Exception:
+                    body_preview = (resp.text or "")[:1500]
+                logger.error("%s hard failure %s (auth/permission): %s", operation_name, resp.status_code, body_preview)
+                self._emit_status(f"{operation_name} failed: authentication/permissions issue.", "error")
+                return None, True
+
+            transient_status = resp.status_code in (408, 409, 429) or resp.status_code >= 500
+            if transient_status and attempt < max_attempts:
+                delay = self._compute_backoff(attempt)
+                logger.warning(
+                    "%s transient API status %s on attempt %s/%s. Retrying in %.2fs.",
+                    operation_name,
+                    resp.status_code,
+                    attempt,
+                    max_attempts,
+                    delay,
+                )
+                self._emit_status(f"{operation_name}: service busy ({resp.status_code}), retrying...", "warning")
+                time.sleep(delay)
+                continue
+
+            try:
+                body_preview = json.dumps(resp.json(), indent=2)[:1500]
+            except Exception:
+                body_preview = (resp.text or "")[:1500]
+
+            if transient_status:
+                logger.error("%s failed after retries. Last status=%s body=%s", operation_name, resp.status_code, body_preview)
+                self._emit_status(f"{operation_name} failed after retries ({resp.status_code}).", "error")
+                return None, False
+
+            logger.error("%s hard failure status=%s body=%s", operation_name, resp.status_code, body_preview)
+            self._emit_status(f"{operation_name} failed ({resp.status_code}).", "error")
+            return None, True
+
+        self._emit_status(f"{operation_name} failed: unknown error.", "error")
+        return None, False
 
     def start_new_thread(self):
         """
@@ -371,16 +473,17 @@ The user is in a live meeting and shares raw transcript snippets. Treat earlier 
             elif self.vector_store_id:
                 payload["tool_choice"] = {"type": "file_search"}
 
-        try:
-            resp = requests.post(url, headers=headers, json=payload, timeout=60)
-        except requests.RequestException:
-            return ":eyes:"
-        if not (200 <= resp.status_code < 300):
-            try:
-                err = resp.json()
-                    logger.error("Responses API error: %s", json.dumps(err, indent=2)[:2000])
-            except Exception:
-                    logger.error("Responses API error (raw): %s", (resp.text or "")[:2000])
+        self._emit_status("Assistant request in progress...", "info")
+        resp, is_hard_failure = self._post_with_retry(
+            url=url,
+            headers=headers,
+            payload=payload,
+            timeout_seconds=self.answer_timeout_seconds,
+            operation_name="Assistant reply",
+        )
+        if resp is None:
+            if is_hard_failure:
+                self._emit_status("Assistant disabled by API auth/permission error.", "error")
             return ":eyes:"
 
         try:
@@ -393,6 +496,7 @@ The user is in a live meeting and shares raw transcript snippets. Treat earlier 
         text = self._extract_text_from_response(data)
         if not text or text.strip() == "---":
             self.last_answer = None
+            self._emit_status("Assistant: no actionable response.", "info")
         else:
             self.last_answer = text
             with self.messages_lock:
@@ -401,6 +505,7 @@ The user is in a live meeting and shares raw transcript snippets. Treat earlier 
             if self.answer_queue:
                 logger.info("Answered at %s", time_val)
                 self.answer_queue.put((self.agent_name, self.last_answer, time_val))
+            self._emit_status("Assistant response ready.", "info")
 
         logger.info("Answering question... DONE")
 
@@ -517,13 +622,15 @@ The title should be professional and descriptive. Only return the title text, no
         
         summary = None
         try:
-            resp = requests.post(url, headers=headers, json=summary_payload, timeout=120)
-            if not (200 <= resp.status_code < 300):
-                try:
-                    err = resp.json()
-                        logger.error("Summary API error: %s", json.dumps(err, indent=2)[:2000])
-                except Exception:
-                        logger.error("Summary API error (raw): %s", (resp.text or "")[:2000])
+            self._emit_status("Summary generation in progress...", "info")
+            resp, _ = self._post_with_retry(
+                url=url,
+                headers=headers,
+                payload=summary_payload,
+                timeout_seconds=self.summary_timeout_seconds,
+                operation_name="Summary generation",
+            )
+            if resp is None:
                 return None
             
             data = resp.json()
@@ -532,9 +639,11 @@ The title should be professional and descriptive. Only return the title text, no
             summary = self._extract_text_from_response(data)
             if not summary or not summary.strip():
                 logger.warning("No summary text extracted from response")
+                self._emit_status("Summary generation produced no text.", "warning")
                 return None
             
             logger.info("Meeting summary generated successfully")
+            self._emit_status("Summary generated successfully.", "info")
                 
         except Exception as e:
             logger.exception("Error generating summary: %s", e)
@@ -570,8 +679,14 @@ Only return the title text, nothing else. Do not use quotes."""
             
             title = "Meeting Summary"  # Default fallback
             try:
-                resp = requests.post(url, headers=headers, json=title_payload, timeout=30)
-                if 200 <= resp.status_code < 300:
+                resp, _ = self._post_with_retry(
+                    url=url,
+                    headers=headers,
+                    payload=title_payload,
+                    timeout_seconds=self.title_timeout_seconds,
+                    operation_name="Summary title generation",
+                )
+                if resp is not None and 200 <= resp.status_code < 300:
                     data = resp.json()
                     extracted_title = self._extract_text_from_response(data)
                     if extracted_title and extracted_title.strip():

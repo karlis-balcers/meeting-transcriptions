@@ -51,6 +51,17 @@ def _env_int(name: str, default: int, warnings: list[str]) -> int:
         return default
 
 
+def _env_float(name: str, default: float, warnings: list[str]) -> float:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        warnings.append(f"Invalid number for {name}='{raw}'. Using default {default}.")
+        return default
+
+
 def _env_bool(name: str, default: bool, warnings: list[str]) -> bool:
     raw = os.getenv(name)
     if raw is None or raw.strip() == "":
@@ -78,6 +89,10 @@ def _print_startup_summary() -> None:
     logger.info("Language: %s", g_language)
     logger.info("Manual interrupt enabled: %s", g_interupt_manually)
     logger.info("Transcript model: %s", g_openai_model_for_transcript)
+    logger.info("Record seconds: %s", RECORD_SECONDS)
+    logger.info("Silence threshold: %s", SILENCE_THRESHOLD)
+    logger.info("Silence duration: %s", SILENCE_DURATION)
+    logger.info("Frame duration (ms): %s", FRAME_DURATION_MS)
     logger.info("Keywords configured: %s", 'yes' if g_keywords else 'no')
     logger.info("OpenAI API key configured: %s", 'yes' if g_open_api_key else 'no')
     logger.info("Assistant enabled: %s", 'yes' if g_assistant else 'no')
@@ -92,12 +107,11 @@ def _print_startup_summary() -> None:
     logger.info("=====================================")
 
 
-# Constants
-RECORD_SECONDS = 300 
-#RECORD_SECONDS = 120  # Updated from 5 to 60 seconds (5 minutes = 55 MB, OpenAPI only support up to 25 MB files)
-
-SILENCE_THRESHOLD = 50  # Adjust this based on your microphone sensitivity
-SILENCE_DURATION = 1.0  # seconds
+# Default constants (can be overridden by .env)
+DEFAULT_RECORD_SECONDS = 300
+DEFAULT_SILENCE_THRESHOLD = 50.0
+DEFAULT_SILENCE_DURATION = 1.0
+DEFAULT_FRAME_DURATION_MS = 100
 
 # Global Queues & Event
 g_recordings_in = Queue()
@@ -107,6 +121,9 @@ stop_event = Event()
 mute_mic_event = Event()  # Event to control microphone muting
 g_transcription = []
 g_transcription_lock = Lock()
+g_status_lock = Lock()
+g_status_message = "Ready"
+g_status_level = "info"
 
 g_device_in = {}
 g_device_out = {}
@@ -118,9 +135,73 @@ flush_letter_out = None
 flush_letter_lock = Lock()
 g_speaker_state_lock = Lock()
 
+root = None
+status_label = None
+
+
+def set_status(message: str, level: str = "info"):
+    """Update global status and refresh UI label if available."""
+    global g_status_message, g_status_level
+
+    if not message:
+        return
+
+    with g_status_lock:
+        g_status_message = message
+        g_status_level = (level or "info").lower()
+
+    if root is None or status_label is None:
+        return
+
+    def _apply_status():
+        with g_status_lock:
+            current_message = g_status_message
+            current_level = g_status_level
+
+        color_by_level = {
+            "info": "#2d3436",
+            "warning": "#d35400",
+            "error": "#c0392b",
+        }
+        color = color_by_level.get(current_level, "#2d3436")
+        status_label.config(text=f"Status: {current_message}", fg=color)
+
+    try:
+        root.after(0, _apply_status)
+    except Exception:
+        pass
+
+
+def _assistant_status_callback(message: str, level: str = "info"):
+    set_status(f"Assistant: {message}", level)
+
+
+def _transcription_status_callback(message: str, level: str = "info"):
+    set_status(f"Transcription: {message}", level)
+
 load_dotenv()  # Load variables from .env file
 
 g_startup_warnings: list[str] = []
+
+RECORD_SECONDS = _env_int("RECORD_SECONDS", DEFAULT_RECORD_SECONDS, g_startup_warnings)
+if RECORD_SECONDS <= 0:
+    g_startup_warnings.append(f"RECORD_SECONDS must be > 0. Using default {DEFAULT_RECORD_SECONDS}.")
+    RECORD_SECONDS = DEFAULT_RECORD_SECONDS
+
+SILENCE_THRESHOLD = _env_float("SILENCE_THRESHOLD", DEFAULT_SILENCE_THRESHOLD, g_startup_warnings)
+if SILENCE_THRESHOLD < 0:
+    g_startup_warnings.append(f"SILENCE_THRESHOLD must be >= 0. Using default {DEFAULT_SILENCE_THRESHOLD}.")
+    SILENCE_THRESHOLD = DEFAULT_SILENCE_THRESHOLD
+
+SILENCE_DURATION = _env_float("SILENCE_DURATION", DEFAULT_SILENCE_DURATION, g_startup_warnings)
+if SILENCE_DURATION < 0:
+    g_startup_warnings.append(f"SILENCE_DURATION must be >= 0. Using default {DEFAULT_SILENCE_DURATION}.")
+    SILENCE_DURATION = DEFAULT_SILENCE_DURATION
+
+FRAME_DURATION_MS = _env_int("FRAME_DURATION_MS", DEFAULT_FRAME_DURATION_MS, g_startup_warnings)
+if FRAME_DURATION_MS <= 0:
+    g_startup_warnings.append(f"FRAME_DURATION_MS must be > 0. Using default {DEFAULT_FRAME_DURATION_MS}.")
+    FRAME_DURATION_MS = DEFAULT_FRAME_DURATION_MS
 
 g_my_name = _env_str("YOUR_NAME", "You")
 if g_my_name == "You":
@@ -149,6 +230,7 @@ if g_open_api_key:
             g_my_name,
             agent_name=AGENT_NAME,
             answer_queue=g_transcriptions_in,
+            status_callback=_assistant_status_callback,
         )
         if g_vector_store_id:
             logger.info("Assistant configured with vector store ID: %s", g_vector_store_id)
@@ -183,6 +265,7 @@ try:
         model=g_openai_model_for_transcript,
         keywords=g_keywords,
         language=g_language,
+        status_callback=_transcription_status_callback,
     )
 except Exception as e:
     g_startup_warnings.append(
@@ -193,6 +276,7 @@ except Exception as e:
         model=g_openai_model_for_transcript,
         keywords=g_keywords,
         language=g_language,
+        status_callback=_transcription_status_callback,
     )
     g_startup_warnings.append(
         f"Falling back to transcription model '{g_openai_model_for_transcript}'."
@@ -548,7 +632,7 @@ def generate_summary():
 
 # GUI Setup
 def setup_ui():
-    global chat_window, root, mute_button, assistant_buttons, custom_prompt_entry, send_prompt_button, summary_button
+    global chat_window, root, mute_button, assistant_buttons, custom_prompt_entry, send_prompt_button, summary_button, status_label
     
     root = tk.Tk()
     root.title("Live Audio Chat")
@@ -602,6 +686,19 @@ def setup_ui():
     chat_window.tag_config("microphone", foreground="blue")
     chat_window.tag_config("output", foreground="green")
     chat_window.tag_config("agent", foreground="gray", font=("Arial", g_agent_font_size, "bold"))
+
+    status_label = tk.Label(
+        root,
+        text="Status: Ready",
+        anchor="w",
+        bg="#ecf0f1",
+        fg="#2d3436",
+        font=("Arial", max(8, g_default_font_size - 1)),
+        padx=6,
+        pady=3,
+    )
+    status_label.pack(side=tk.BOTTOM, fill=tk.X)
+    set_status("Ready", "info")
     
     # Bind extra events to see when the window is being hidden/destroyed.
     def on_destroy(event):
@@ -697,11 +794,11 @@ def store_audio_stream(queue, filename_suffix, device_info, from_microphone):
         transcribe_and_display(filename, filename_suffix == "in", letter)
         try:
             os.remove(filename)
-                logger.debug("[%s] Removed temporary file %s.", filename_suffix, filename)
+            logger.debug("[%s] Removed temporary file %s.", filename_suffix, filename)
         except Exception as e:
-                logger.warning("[%s] Error removing file %s: %s", filename_suffix, filename, e)
+            logger.warning("[%s] Error removing file %s: %s", filename_suffix, filename, e)
 
-            logger.info("[%s] store_audio_stream exiting.", filename_suffix)
+    logger.info("[%s] store_audio_stream exiting.", filename_suffix)
 
 def collect_from_stream(queue, input_device, p_instance, from_microphone):
     global g_sample_size
@@ -717,8 +814,9 @@ def collect_from_stream(queue, input_device, p_instance, from_microphone):
         logger.debug("[%s] Chunk size: %s samples", input_device['name'], int(frame_rate * 0.1))
         logger.debug("[%s] Frames per buffer: %s samples", input_device['name'], int(frame_rate * 0.1))
         logger.debug("[%s] Input device index: %s", input_device['name'], input_device['index'])
-        FRAME_DURATION_MS = 100
         chunk_size = int(frame_rate * FRAME_DURATION_MS / 1000)  # 20 ms worth of samples
+        if chunk_size <= 0:
+            chunk_size = 1
         with p_instance.open(format=pyaudio.paInt16,
                              channels=input_device["maxInputChannels"],
                              rate=frame_rate,
@@ -835,7 +933,7 @@ def transcribe_and_display(file, from_microphone, letter):
                         or text.startswith("Thank you very much") or text.startswith("Thank you for tuning in") or text == 'Paldies!' or text =="Thank you." or text == '.' or text == 'You' \
                         or text.find("please subscribe to my channel")>=0 or text.startswith("Thank you guys.") \
                         or text.find("www.NorthstarIT.co.uk")>=0 or text.find("Amara.org")>=0 or text.find("I'll see you in the next video")>=0 or text.find("brandhagen10.com") >=0 or text.find("WWW.ABERCAP.COM")>=0 \
-                        or text.find(g_keywords)>=0:
+                    or (g_keywords and text.find(g_keywords)>=0):
                     continue
                 converted_time = datetime.fromtimestamp(segment.start)
                 #print(converted_time)  # Outputs in a readable format
