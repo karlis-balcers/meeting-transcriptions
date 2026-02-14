@@ -54,4 +54,3 @@ if %errorlevel% neq 0 (
 )
 
 :end
-pause
