@@ -25,6 +25,7 @@ import audio_capture as audio_capture_module
 import ui as ui_module
 from logging_utils import setup_logging
 from transcript_store import TranscriptStore
+from transcript_filter import TranscriptFilter
 from speaker_detection import TeamsSpeakerDetector
 
 setup_logging(app_name="meeting-transcriptions", log_dir=os.path.join("output", "logs"))
@@ -124,6 +125,7 @@ g_transcriptions_in = Queue()
 stop_event = Event()
 mute_mic_event = Event()  # Event to control microphone muting
 g_transcript_store = None
+g_transcript_filter = None
 g_status_lock = Lock()
 g_status_message = "Ready"
 g_status_level = "info"
@@ -248,6 +250,8 @@ g_keywords = None
 g_keywords = _env_str("KEYWORDS")
 if g_keywords:
     logger.info("Using keywords for initial prompt: %s", g_keywords)
+
+g_transcript_filter = TranscriptFilter(keywords=g_keywords)
 
 g_agent_font_size = _env_int("AGENT_FONT_SIZE", 14, g_startup_warnings)
 logger.info("Agent font size: %s", g_agent_font_size)
@@ -675,13 +679,9 @@ def transcribe_and_display(file, from_microphone, letter):
         for segment in segments:
             text = segment.text.strip()
             if len(text) > 0:
-                #print(f"Segment: {segment}") 
-                # FastWhisper often returns the following text values which are not an actual transcriptions but halucinations.
-                if text == 'Bye.'  or text == 'Um' or text.startswith("Thanks for watching") or text.startswith("Thank you for watching") or text.startswith("Thanks for listening") or text.startswith("Thank you for joining") \
-                        or text.startswith("Thank you very much") or text.startswith("Thank you for tuning in") or text == 'Paldies!' or text =="Thank you." or text == '.' or text == 'You' \
-                        or text.find("please subscribe to my channel")>=0 or text.startswith("Thank you guys.") \
-                        or text.find("www.NorthstarIT.co.uk")>=0 or text.find("Amara.org")>=0 or text.find("I'll see you in the next video")>=0 or text.find("brandhagen10.com") >=0 or text.find("WWW.ABERCAP.COM")>=0 \
-                    or (g_keywords and text.find(g_keywords)>=0):
+                should_filter, reason = g_transcript_filter.should_filter(text)
+                if should_filter:
+                    logger.debug("[Transcribe] Filtered segment (%s): %s", reason, text)
                     continue
                 converted_time = datetime.fromtimestamp(segment.start)
                 #print(converted_time)  # Outputs in a readable format
