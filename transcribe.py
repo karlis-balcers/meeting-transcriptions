@@ -101,6 +101,7 @@ def _print_startup_summary() -> None:
     logger.info("Auto-summarize on stop: %s", g_auto_summarize_on_stop)
     logger.info("Assistant web search for custom prompts: %s", g_assistant_web_search_for_custom_prompts)
     logger.info("Transcription output dir: %s", g_output_dir)
+    logger.info("Temporary audio dir: %s", g_temp_dir)
     logger.info("Summary output dir: %s", g_summaries_dir)
     logger.info("Keywords configured: %s", 'yes' if g_keywords else 'no')
     logger.info("OpenAI API key configured: %s", 'yes' if g_open_api_key else 'no')
@@ -165,6 +166,7 @@ g_auto_summarize_var = None
 
 mic_icon_on = None
 mic_icon_off = None
+g_is_closing = False
 
 
 def _normalize_transcription_text(text: str) -> str:
@@ -389,10 +391,15 @@ g_summaries_dir = _env_str("SUMMARIES_DIR", "output_summaries")
 if not os.path.exists(g_summaries_dir):
     os.makedirs(g_summaries_dir)
 
-# Delete all wav files in the output directory
-for file in os.listdir(g_output_dir):
+# Check if temporary audio dir exists
+g_temp_dir = _env_str("TEMP_DIR", "tmp")
+if not os.path.exists(g_temp_dir):
+    os.makedirs(g_temp_dir)
+
+# Delete all wav files in the temporary audio directory
+for file in os.listdir(g_temp_dir):
     if file.endswith(".wav"):
-        file_path = os.path.join(g_output_dir, file)
+        file_path = os.path.join(g_temp_dir, file)
         try:
             os.remove(file_path)
             logger.info("Deleted old file: %s", file_path)
@@ -402,7 +409,7 @@ for file in os.listdir(g_output_dir):
 # Clear the file and initialize the transcription log
 g_trans_file_name = f"{g_output_dir}/transcription-{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
 try:
-    with open(g_trans_file_name, "w") as f:
+    with open(g_trans_file_name, "w", encoding="utf-8") as f:
         f.write(f"# Transcription Log\n\n")
         f.write(f"**Created:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
 except Exception as e:
@@ -676,7 +683,65 @@ def toggle_start_stop():
         start_transcription()
 
 
+def _run_summary_before_close(transcription_snapshot: list[list]) -> None:
+    dialog = tk.Toplevel(root)
+    dialog.title("Closing")
+    dialog.geometry("440x120")
+    dialog.resizable(False, False)
+    dialog.transient(root)
+    dialog.grab_set()
+    dialog.protocol("WM_DELETE_WINDOW", lambda: None)
+
+    tk.Label(
+        dialog,
+        text="Generating summary before closing.\nPlease wait...",
+        justify=tk.CENTER,
+        font=("Arial", max(9, g_default_font_size)),
+    ).pack(padx=12, pady=(16, 8))
+
+    progress = ttk.Progressbar(dialog, mode="indeterminate", length=360)
+    progress.pack(padx=12, pady=(0, 12))
+    progress.start(10)
+
+    completed = Event()
+    error_holder: list[Exception] = []
+
+    def _worker():
+        try:
+            _generate_and_save_summary(transcription_snapshot)
+        except Exception as e:
+            error_holder.append(e)
+        finally:
+            completed.set()
+
+    worker = Thread(target=_worker, daemon=True)
+    worker.start()
+
+    while not completed.is_set():
+        try:
+            root.update_idletasks()
+            root.update()
+        except Exception:
+            break
+        time.sleep(0.05)
+
+    try:
+        progress.stop()
+        dialog.grab_release()
+        dialog.destroy()
+    except Exception:
+        pass
+
+    if error_holder:
+        logger.warning("Error while generating summary during close: %s", error_holder[-1])
+
+
 def close_app():
+    global g_is_closing
+    if g_is_closing:
+        return
+    g_is_closing = True
+
     logger.info("[UI] Closing application")
     was_recording = g_is_recording
     try:
@@ -687,15 +752,9 @@ def close_app():
     if was_recording and g_auto_summarize_on_stop and g_assistant:
         try:
             set_status("Summarising transcript...", "info")
-            try:
-                root.update_idletasks()
-                root.update()
-            except Exception:
-                pass
-
             transcription_snapshot = g_transcript_store.snapshot()
             if transcription_snapshot:
-                _generate_and_save_summary(transcription_snapshot)
+                _run_summary_before_close(transcription_snapshot)
             else:
                 logger.info("[UI] No transcript to summarize during close.")
         except Exception as e:
@@ -734,7 +793,7 @@ def reset_log_file():
     
     # Initialize the new transcription log
     try:
-        with open(new_filename, "w") as f:
+        with open(new_filename, "w", encoding="utf-8") as f:
             f.write(f"# Transcription Log\n\n")
             f.write(f"**Created:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
         g_trans_file_name = new_filename
@@ -996,6 +1055,7 @@ def store_audio_stream(queue, filename_suffix, device_info, from_microphone):
         queue=queue,
         filename_suffix=filename_suffix,
         device_info=device_info,
+        temp_dir=g_temp_dir,
         stop_event=stop_event,
         sample_size_getter=lambda: g_sample_size,
         transcribe_callback=transcribe_and_display,
@@ -1037,11 +1097,10 @@ def collect_from_stream(queue, input_device, p_instance, from_microphone):
 def transcribe_and_display(file, from_microphone, letter):
     if not letter:
         letter = "?"
-    #print(f"[Transcribe] Starting transcription for {file}.")
-    file_size = os.path.getsize(file)  # Size in bytes
-    logger.debug("[Transcribe] File size: %.2f MB", file_size / (1024 * 1024))
     try:
-        start_time = float(file.split("/")[-1].split("-")[0])
+        file_size = os.path.getsize(file)  # Size in bytes
+        logger.debug("[Transcribe] File size: %.2f MB", file_size / (1024 * 1024))
+        start_time = float(os.path.basename(file).split("-")[0])
         segments = g_transcript_ai.transcribe(file)
         new_segments = False
         #with g_transcription_lock:
@@ -1123,7 +1182,8 @@ def main():
     global g_devices_initialized
     logger.info("[Main] Starting application...")
     signal.signal(signal.SIGINT, handler)
-    os.makedirs("output", exist_ok=True)
+    os.makedirs(g_output_dir, exist_ok=True)
+    os.makedirs(g_temp_dir, exist_ok=True)
     root = setup_ui()
     g_devices_initialized = initialize_recording()
     if not g_devices_initialized:

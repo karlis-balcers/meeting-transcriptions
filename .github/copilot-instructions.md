@@ -88,6 +88,7 @@ OPENAI_MODEL_FOR_ASSISTANT=gpt-5.2
 OPENAI_VECTOR_STORE_ID_FOR_ANSWERS=vs_* # Optional, for assistant
 OPENAI_MODEL_FOR_TRANSCRIPT=gpt-4o-mini-transcribe # or gpt-4o-transcribe
 OUTPUT_DIR=output
+TEMP_DIR=tmp
 SUMMARIES_DIR=output_summaries
 KEYWORDS="Cat, Mouse, Dog" # Domain-specific terms for better transcription
 ```
@@ -119,7 +120,7 @@ KEYWORDS="Cat, Mouse, Dog" # Domain-specific terms for better transcription
 - **Use Locks** for protecting shared mutable state (`Lock()`)
 
 ### Audio File Handling
-- Store temporary files in `output/` directory
+- Store temporary files in `tmp/` directory (configurable via `TEMP_DIR`)
 - Use timestamp format: `transcription-YYYYMMDD_HHMMSS.md`
 - Clean up WAV files after transcription
 - Keep Markdown transcripts for future reference

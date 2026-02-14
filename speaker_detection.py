@@ -3,8 +3,11 @@ from __future__ import annotations
 import re
 import sys
 import time
+import io
+from contextlib import redirect_stdout
 from threading import Lock
 from typing import Optional
+import os
 
 
 class TeamsSpeakerDetector:
@@ -17,6 +20,7 @@ class TeamsSpeakerDetector:
 		self._current_speaker: Optional[str] = None
 		self._meeting_title: Optional[str] = None
 		self._teams_app = None
+		self._debug_dump_controls = os.getenv("TEAMS_DEBUG_DUMP_CONTROLS", "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 	def _is_supported(self) -> bool:
 		return sys.platform == "win32"
@@ -98,9 +102,17 @@ class TeamsSpeakerDetector:
 				return None
 
 			teams_window = app.window(title_re=self.window_name)
-			teams_window.print_control_identifiers(filename="teams_controls.txt")
-			with open("teams_controls.txt", "r", encoding="utf-8") as f:
-				return f.read()
+			buffer = io.StringIO()
+			with redirect_stdout(buffer):
+				teams_window.print_control_identifiers()
+			data = buffer.getvalue()
+			if self._debug_dump_controls and data:
+				try:
+					with open("teams_controls.txt", "w", encoding="utf-8") as f:
+						f.write(data)
+				except Exception as dump_error:
+					self.logger.debug("Failed to write teams_controls.txt debug dump: %s", dump_error)
+			return data
 		except Exception as e:
 			self.logger.debug("inspect_ms_teams failed: %s", e)
 			return None

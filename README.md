@@ -104,7 +104,8 @@ Use `env.sample` as the source of truth. Important settings:
 
 ### Output paths
 
-- `OUTPUT_DIR` - transcript + runtime output directory
+- `OUTPUT_DIR` - transcript markdown output directory
+- `TEMP_DIR` - temporary WAV chunk directory (default `tmp`)
 - `SUMMARIES_DIR` - summary markdown output directory
 
 ### Reliability and logging
@@ -135,7 +136,7 @@ The app settings dialog allows runtime updates and persists them to `.env`:
   - `output/transcription-YYYYMMDD_HHMMSS.md` (or custom `OUTPUT_DIR`)
 - Summaries are written as Markdown:
   - `output_summaries/YYYYMMDD_HHMMSS_<ai_title>.md` (or custom `SUMMARIES_DIR`)
-- Temporary `.wav` files are cleaned up from output directory.
+- Temporary `.wav` files are written to `tmp/` (or custom `TEMP_DIR`) and cleaned up.
 
 ## Development and testing
 

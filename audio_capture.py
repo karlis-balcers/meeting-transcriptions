@@ -11,12 +11,14 @@ def store_audio_stream(
 	queue,
 	filename_suffix,
 	device_info,
+	temp_dir,
 	stop_event,
 	sample_size_getter,
 	transcribe_callback,
 	logger,
 ):
 	logger.info("[%s] store_audio_stream started.", filename_suffix)
+	os.makedirs(temp_dir, exist_ok=True)
 	while not stop_event.is_set():
 		try:
 			frames, letter, start_time = queue.get(block=True, timeout=1)
@@ -28,7 +30,7 @@ def store_audio_stream(
 			logger.debug("[%s] Queue read skipped: %s", filename_suffix, e)
 			continue
 
-		filename = f"output/{start_time:.2f}-{filename_suffix}.wav"
+		filename = os.path.join(temp_dir, f"{start_time:.2f}-{filename_suffix}.wav")
 		try:
 			with wave.open(filename, "wb") as wf:
 				wf.setnchannels(device_info["maxInputChannels"])
@@ -40,7 +42,10 @@ def store_audio_stream(
 			logger.error("[%s] Error writing WAV file: %s", filename_suffix, e)
 			continue
 
-		transcribe_callback(filename, filename_suffix == "in", letter)
+		try:
+			transcribe_callback(filename, filename_suffix == "in", letter)
+		except Exception as e:
+			logger.exception("[%s] Transcribe callback failed for %s: %s", filename_suffix, filename, e)
 		try:
 			os.remove(filename)
 			logger.debug("[%s] Removed temporary file %s.", filename_suffix, filename)
