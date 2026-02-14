@@ -99,6 +99,7 @@ def _print_startup_summary() -> None:
     logger.info("Frame duration (ms): %s", FRAME_DURATION_MS)
     logger.info("Auto-start transcription: %s", g_auto_start_transcription)
     logger.info("Auto-summarize on stop: %s", g_auto_summarize_on_stop)
+    logger.info("Assistant web search for custom prompts: %s", g_assistant_web_search_for_custom_prompts)
     logger.info("Transcription output dir: %s", g_output_dir)
     logger.info("Summary output dir: %s", g_summaries_dir)
     logger.info("Keywords configured: %s", 'yes' if g_keywords else 'no')
@@ -157,6 +158,7 @@ settings_button = None
 
 g_auto_start_transcription = False
 g_auto_summarize_on_stop = False
+g_assistant_web_search_for_custom_prompts = True
 
 g_auto_start_var = None
 g_auto_summarize_var = None
@@ -310,6 +312,7 @@ if not g_open_api_key:
 g_interupt_manually = _env_bool("INTERUPT_MANUALLY", True, g_startup_warnings)
 g_auto_start_transcription = _env_bool("AUTO_START_TRANSCRIPTION", False, g_startup_warnings)
 g_auto_summarize_on_stop = _env_bool("AUTO_SUMMARIZE_ON_STOP", False, g_startup_warnings)
+g_assistant_web_search_for_custom_prompts = _env_bool("ASSISTANT_ENABLE_WEB_SEARCH_FOR_CUSTOM_PROMPTS", True, g_startup_warnings)
 
 g_assistant = None
 g_vector_store_id = _env_str("OPENAI_VECTOR_STORE_ID_FOR_ANSWERS")
@@ -323,6 +326,7 @@ if g_open_api_key:
             answer_queue=g_transcriptions_in,
             status_callback=_assistant_status_callback,
         )
+        g_assistant.set_custom_prompt_web_search_enabled(g_assistant_web_search_for_custom_prompts)
         if g_vector_store_id:
             logger.info("Assistant configured with vector store ID: %s", g_vector_store_id)
         else:
@@ -517,6 +521,7 @@ def _sync_auto_start_var():
 
 def _open_settings():
     global g_language, g_auto_summarize_on_stop, g_output_dir, g_summaries_dir
+    global g_assistant_web_search_for_custom_prompts
 
     win = tk.Toplevel(root)
     win.title("Settings")
@@ -529,6 +534,7 @@ def _open_settings():
 
     auto_start_var = tk.BooleanVar(value=g_auto_start_transcription)
     auto_sum_var = tk.BooleanVar(value=g_auto_summarize_on_stop)
+    web_search_custom_prompt_var = tk.BooleanVar(value=g_assistant_web_search_for_custom_prompts)
     lang_var = tk.StringVar(value=g_language or "en")
     out_var = tk.StringVar(value=g_output_dir)
     sum_var = tk.StringVar(value=g_summaries_dir)
@@ -546,6 +552,13 @@ def _open_settings():
     tk.Checkbutton(frame, text="Automatically summarize transcription when stopped", variable=auto_sum_var).grid(row=row, column=0, columnspan=3, sticky="w", pady=4)
     row += 1
 
+    tk.Checkbutton(
+        frame,
+        text="Enable internet search for assistant answers to custom prompts",
+        variable=web_search_custom_prompt_var,
+    ).grid(row=row, column=0, columnspan=3, sticky="w", pady=4)
+    row += 1
+
     tk.Label(frame, text="Transcriptions folder").grid(row=row, column=0, sticky="w", pady=4)
     tk.Entry(frame, textvariable=out_var, width=60).grid(row=row, column=1, sticky="we", pady=4)
     tk.Button(frame, text="Browse", command=lambda: out_var.set(filedialog.askdirectory(initialdir=out_var.get() or ".") or out_var.get())).grid(row=row, column=2, padx=4)
@@ -560,8 +573,10 @@ def _open_settings():
 
     def on_save():
         global g_language, g_auto_summarize_on_stop, g_output_dir, g_summaries_dir
+        global g_assistant_web_search_for_custom_prompts
         g_language = (lang_var.get() or "en").strip()
         g_auto_summarize_on_stop = bool(auto_sum_var.get())
+        g_assistant_web_search_for_custom_prompts = bool(web_search_custom_prompt_var.get())
         g_output_dir = out_var.get().strip() or "output"
         g_summaries_dir = sum_var.get().strip() or "output_summaries"
 
@@ -577,10 +592,14 @@ def _open_settings():
                 "AUTO_START_TRANSCRIPTION": "True" if bool(auto_start_var.get()) else "False",
                 "LANGUAGE": g_language,
                 "AUTO_SUMMARIZE_ON_STOP": "True" if g_auto_summarize_on_stop else "False",
+                "ASSISTANT_ENABLE_WEB_SEARCH_FOR_CUSTOM_PROMPTS": "True" if g_assistant_web_search_for_custom_prompts else "False",
                 "OUTPUT_DIR": g_output_dir,
                 "SUMMARIES_DIR": g_summaries_dir,
             }
         )
+
+        if g_assistant:
+            g_assistant.set_custom_prompt_web_search_enabled(g_assistant_web_search_for_custom_prompts)
 
         _reinitialize_transcript_ai()
         reset_log_file()

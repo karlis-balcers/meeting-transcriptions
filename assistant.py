@@ -54,7 +54,27 @@ class Assistant:
         self.answer_timeout_seconds = float(os.getenv("ASSISTANT_API_TIMEOUT_SECONDS", "60"))
         self.summary_timeout_seconds = float(os.getenv("ASSISTANT_SUMMARY_TIMEOUT_SECONDS", "120"))
         self.title_timeout_seconds = float(os.getenv("ASSISTANT_TITLE_TIMEOUT_SECONDS", "30"))
+        self.custom_prompt_web_search_enabled = self._parse_bool_env(
+            os.getenv("ASSISTANT_ENABLE_WEB_SEARCH_FOR_CUSTOM_PROMPTS"),
+            default=True,
+        )
         logger.info("Assistant model: %s", self.model)
+        logger.info("Assistant custom-prompt web search enabled: %s", self.custom_prompt_web_search_enabled)
+
+    @staticmethod
+    def _parse_bool_env(raw: Optional[str], default: bool) -> bool:
+        if raw is None:
+            return default
+        value = raw.strip().lower()
+        if value in {"1", "true", "yes", "y", "on"}:
+            return True
+        if value in {"0", "false", "no", "n", "off"}:
+            return False
+        return default
+
+    def set_custom_prompt_web_search_enabled(self, enabled: bool) -> None:
+        self.custom_prompt_web_search_enabled = bool(enabled)
+        logger.info("Assistant custom-prompt web search set to: %s", self.custom_prompt_web_search_enabled)
 
     def _emit_status(self, message: str, level: str = "info") -> None:
         if self.status_callback:
@@ -458,8 +478,8 @@ The user is in a live meeting and shares raw transcript snippets. Treat earlier 
         if mode == "get_facts":
             tools.append({"type": "web_search"})
         
-        # For custom prompts, enable web search to provide comprehensive answers
-        if mode == "custom_prompt":
+        # For custom prompts, optionally enable web search to provide comprehensive answers
+        if mode == "custom_prompt" and self.custom_prompt_web_search_enabled:
             tools.append({"type": "web_search"})
 
         if tools:
