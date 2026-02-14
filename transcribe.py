@@ -18,13 +18,14 @@ from dotenv import load_dotenv
 import numpy as np
 import struct
 
-if sys.platform == "win32":
-    from pywinauto import Application
-import re
 import assistant
 #import fastwhisper_transcribe
 import openai_transcribe
+import audio_capture as audio_capture_module
+import ui as ui_module
 from logging_utils import setup_logging
+from transcript_store import TranscriptStore
+from speaker_detection import TeamsSpeakerDetector
 
 setup_logging(app_name="meeting-transcriptions", log_dir=os.path.join("output", "logs"))
 logger = logging.getLogger("transcribe")
@@ -97,7 +98,10 @@ def _print_startup_summary() -> None:
     logger.info("OpenAI API key configured: %s", 'yes' if g_open_api_key else 'no')
     logger.info("Assistant enabled: %s", 'yes' if g_assistant else 'no')
     logger.info("Vector store configured: %s", 'yes' if g_vector_store_id else 'no')
-    logger.info("Teams integration available: %s", 'yes' if g_ms_teams_app is not None else 'no')
+    teams_available = False
+    if g_speaker_detector is not None:
+        teams_available = g_speaker_detector.is_connected()
+    logger.info("Teams integration available: %s", 'yes' if teams_available else 'no')
     if g_startup_warnings:
         logger.warning("Startup warnings detected:")
         for warning in g_startup_warnings:
@@ -119,8 +123,7 @@ g_recordings_out = Queue()
 g_transcriptions_in = Queue()
 stop_event = Event()
 mute_mic_event = Event()  # Event to control microphone muting
-g_transcription = []
-g_transcription_lock = Lock()
+g_transcript_store = None
 g_status_lock = Lock()
 g_status_message = "Ready"
 g_status_level = "info"
@@ -133,10 +136,10 @@ g_sample_size = 0
 flush_letter_mic = None
 flush_letter_out = None
 flush_letter_lock = Lock()
-g_speaker_state_lock = Lock()
 
 root = None
 status_label = None
+g_speaker_detector = None
 
 
 def set_status(message: str, level: str = "info"):
@@ -158,12 +161,7 @@ def set_status(message: str, level: str = "info"):
             current_message = g_status_message
             current_level = g_status_level
 
-        color_by_level = {
-            "info": "#2d3436",
-            "warning": "#d35400",
-            "error": "#c0392b",
-        }
-        color = color_by_level.get(current_level, "#2d3436")
+        color = ui_module.status_color(current_level)
         status_label.config(text=f"Status: {current_message}", fg=color)
 
     try:
@@ -320,166 +318,46 @@ try:
 except Exception as e:
     g_startup_warnings.append(f"Failed to create transcription log file '{g_trans_file_name}': {e}")
 
+g_transcript_store = TranscriptStore(g_trans_file_name, AGENT_NAME, logger)
+
 global_audio = pyaudio.PyAudio()
+g_sample_size = global_audio.get_sample_size(pyaudio.paInt16)
 
 g_window_name = "Meeting compact view*"
-g_ms_teams_app = None
-if sys.platform == "win32":
-    try:
-        # Connect to Microsoft Teams by title, or you can use process ID or path
-        g_ms_teams_app = Application(backend="uia").connect(title_re=g_window_name)
-    except Exception as e:
-        g_startup_warnings.append(f"Teams integration not connected at startup: {e}")
+g_speaker_detector = TeamsSpeakerDetector(stop_event=stop_event, logger=logger, window_name=g_window_name)
+if not g_speaker_detector.is_connected() and sys.platform == "win32":
+    g_startup_warnings.append("Teams integration not connected at startup.")
 
 _print_startup_summary()
 
-g_previous_speaker = None
-g_current_speaker = None
-g_meeting_title = None
-
-
 def _get_speaker_snapshot():
-    """Return a thread-safe snapshot of speaker state (previous, current)."""
-    with g_speaker_state_lock:
-        return g_previous_speaker, g_current_speaker
+    return g_speaker_detector.get_speaker_snapshot()
 
 
 def _set_current_speaker(new_speaker: str | None):
-    """Update speaker state atomically and return (previous, current)."""
-    global g_previous_speaker, g_current_speaker
-    with g_speaker_state_lock:
-        g_previous_speaker = g_current_speaker
-        g_current_speaker = new_speaker
-        return g_previous_speaker, g_current_speaker
+    return g_speaker_detector.set_current_speaker(new_speaker)
 
 
 def _get_meeting_title_snapshot() -> str | None:
-    with g_speaker_state_lock:
-        return g_meeting_title
+    return g_speaker_detector.get_meeting_title_snapshot()
 
 def get_ms_teams_window_title():
-    '''Get the MS Teams window title which usually contains the meeting name.'''
-    global g_ms_teams_app, g_meeting_title
-    if sys.platform != "win32":
-        return None
-    try:
-        if g_ms_teams_app==None:
-            g_ms_teams_app = Application(backend="uia").connect(title_re=g_window_name)
-        
-        teams_window = g_ms_teams_app.window(title_re=g_window_name)
-        window_title = teams_window.window_text()
-        
-        # Clean up the title - remove "Meeting compact view" or similar suffixes
-        if window_title:
-            # Remove common Teams window suffixes
-            title = window_title.replace("Meeting compact view", "").strip()
-            title = title.replace(" | Microsoft Teams", "").strip()
-            title = title.replace("|", "").strip()
-            
-            # Remove leading/trailing separators
-            title = title.strip(" -|")
-            
-            with g_speaker_state_lock:
-                previous_title = g_meeting_title
-
-            if title and title != previous_title:
-                # Only update and log if we got a new non-empty title
-                old_title = previous_title
-                with g_speaker_state_lock:
-                    g_meeting_title = title
-                if old_title is None:
-                    logger.info("[Teams] Meeting title detected: '%s'", title)
-                else:
-                    logger.info("[Teams] Meeting title updated: '%s' -> '%s'", old_title, title)
-                return title
-            elif title:
-                # Same title as before, don't log but return it
-                return title
-    except Exception as e:
-        # Don't log every error, only when debugging
-        pass
-    
-    # Return the last known title even if we can't detect it now
-    return _get_meeting_title_snapshot()
+    return g_speaker_detector.get_ms_teams_window_title()
 
 def inspect_ms_teams():
-    global g_ms_teams_app
-    if sys.platform != "win32":
-        return None
-    try:
-        if g_ms_teams_app==None:
-            g_ms_teams_app = Application(backend="uia").connect(title_re=g_window_name)
-
-        # Grab the main Teams window (regex to match partial titles)
-        teams_window = g_ms_teams_app.window(title_re=g_window_name)
-
-        # Print the hierarchy of controls for debugging
-        teams_window.print_control_identifiers(filename="teams_controls.txt")
-        with open("teams_controls.txt", "r") as f:
-            data = f.read()
-            return data
-    except:
-        pass
-    return None
+    return g_speaker_detector.inspect_ms_teams()
 
 def get_speaker_name():
     '''Get the current speaker's name from the MS Teams window.'''
     global flush_letter_mic, flush_letter_out
-    
-    title_check_counter = 0
-    TITLE_CHECK_INTERVAL = 50  # Check for title every 50 iterations (5 seconds)
-    
-    while not stop_event.is_set():
-        # Periodically check for meeting title (it's only available when Teams is minimized)
-        title_check_counter += 1
-        if title_check_counter >= TITLE_CHECK_INTERVAL:
-            title_check_counter = 0
-            new_title = get_ms_teams_window_title()
-            previous_title = _get_meeting_title_snapshot()
-            if new_title and new_title != previous_title:
-                logger.info("[Teams] Detected new meeting: %s", new_title)
-        
-        data = inspect_ms_teams()
-        if data:
-            # Use regex to find the line with the speaker's information.
-            # This pattern looks for a line with "MenuItem - '...video is on..." and captures the content within quotes.
-            # Regex pattern: look for "Recording started by" followed by the name (letters and spaces) ending with a dot.
-            patterns = [r"MenuItem\s*-\s*'([^']*video is on[^']*)'",
-                        r"MenuItem\s+-\s+'([^,]+), Context menu is available'"]
 
-            match = False
-            name_parts=[]
+    def on_speaker_changed(previous_speaker, current_speaker):
+        if previous_speaker:
+            with flush_letter_lock:
+                flush_letter_mic = '_'
+                flush_letter_out = '_'
 
-            for pattern in patterns:
-                match = re.search(pattern, data)
-                if match:
-                    # Extract the full string e.g. "Mathieu Cornille, video is on, Context menu is available"
-                    info = match.group(1)
-                    # The speaker's name is assumed to be the first comma-separated token.
-                    speaker = info.split(",")[0].strip()
-                    #print("Current speaker:", speaker)
-                    name_parts = speaker.split(" ")
-                    break
-
-            if match:
-                if len(name_parts)>1 and name_parts[1][0]!='(':
-                    detected_speaker = name_parts[0] + " " + name_parts[1][0]  # only the first name and first letter of the last name
-                else:
-                    detected_speaker = name_parts[0]
-            else:
-                detected_speaker = None
-        else:
-            detected_speaker = None
-
-        previous_speaker, current_speaker = _set_current_speaker(detected_speaker)
-        if previous_speaker != current_speaker:
-            logger.info("New speaker: %s (was %s)", current_speaker, previous_speaker)
-            if previous_speaker:
-                with flush_letter_lock:
-                    flush_letter_mic = '_'
-                    flush_letter_out = '_'
-        time.sleep(0.1)
-        #print("Speaker not found.")
+    g_speaker_detector.run_detection_loop(on_speaker_changed=on_speaker_changed)
 
 def toggle_mute():
     """Toggle the microphone mute state."""
@@ -497,7 +375,7 @@ def toggle_mute():
 
 def reset_log_file():
     """Reset the transcription log file with a new timestamp."""
-    global g_trans_file_name, g_transcription
+    global g_trans_file_name
     
     # Create new filename with current timestamp
     new_filename = f"{g_output_dir}/transcription-{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
@@ -510,8 +388,8 @@ def reset_log_file():
         logger.info("[UI] Reset log file to: %s", g_trans_file_name)
         
         # Clear current transcription display
-        with g_transcription_lock:
-            g_transcription = []
+        g_transcript_store.set_file_path(new_filename)
+        g_transcript_store.clear()
 
         if g_assistant:
             g_assistant.start_new_thread()
@@ -570,8 +448,7 @@ def generate_summary():
         logger.warning("[UI] Assistant is not available; cannot generate summary.")
         return
     
-    with g_transcription_lock:
-        transcription_snapshot = list(g_transcription)
+    transcription_snapshot = g_transcript_store.snapshot()
 
     if not transcription_snapshot:
         logger.info("[UI] No transcription available to summarize.")
@@ -737,183 +614,54 @@ def setup_ui():
     return root
 
 def update_chat():
-    with g_transcription_lock:
-        transcription_snapshot = list(g_transcription)
-
-    chat_window.config(state=tk.NORMAL)
-    chat_window.delete("1.0", tk.END)
-    last_user=''
-    for entry in transcription_snapshot:
-        user, text, start_time = entry
-        if user != last_user:
-            if user == g_my_name:
-                chat_window.insert(tk.END, f"\n# {user}:\n{text}\n", "microphone")
-            elif user == AGENT_NAME:
-                chat_window.insert(tk.END, f"\n# {user}:\n{text}\n", "agent")
-            else:
-                chat_window.insert(tk.END, f"\n# {user}:\n{text}\n", "output")
-
-            last_user=user
-        else:
-            if user == g_my_name:
-                chat_window.insert(tk.END, f"{text}\n", "microphone")
-            elif user == AGENT_NAME:
-                chat_window.insert(tk.END, f"{text}\n", "agent")
-            else:
-                chat_window.insert(tk.END, f"{text}\n", "output")
- 
-    chat_window.config(state=tk.DISABLED)
-    chat_window.yview(tk.END)
+    transcription_snapshot = g_transcript_store.snapshot()
+    ui_module.render_transcription(chat_window, transcription_snapshot, g_my_name, AGENT_NAME)
 
 # Audio Recording Functions
 def store_audio_stream(queue, filename_suffix, device_info, from_microphone):
-    logger.info("[%s] store_audio_stream started.", filename_suffix)
-    while not stop_event.is_set():
-        try:
-            #print(f"[{filename_suffix}] Waiting for frames from queue...")
-            frames, letter, start_time = queue.get(block=True, timeout=1)
-            logger.debug("[%s] Got %s frames.", filename_suffix, len(frames))
-        except Empty:
-            continue
-        except Exception as e:
-            logger.warning("[%s] Exception while getting frames: %s", filename_suffix, e)
-            continue
-        
-        filename = f'output/{start_time:.2f}-{filename_suffix}.wav'
-        try:
-            with wave.open(filename, 'wb') as wf:
-                wf.setnchannels(device_info["maxInputChannels"])
-                wf.setsampwidth(g_sample_size)
-                wf.setframerate(int(device_info["defaultSampleRate"]))
-                wf.writeframes(b"".join(frames))
-            logger.debug("[%s] Wrote audio to %s.", filename_suffix, filename)
-        except Exception as e:
-            logger.error("[%s] Error writing WAV file: %s", filename_suffix, e)
-            continue
-
-        transcribe_and_display(filename, filename_suffix == "in", letter)
-        try:
-            os.remove(filename)
-            logger.debug("[%s] Removed temporary file %s.", filename_suffix, filename)
-        except Exception as e:
-            logger.warning("[%s] Error removing file %s: %s", filename_suffix, filename, e)
-
-    logger.info("[%s] store_audio_stream exiting.", filename_suffix)
+    audio_capture_module.store_audio_stream(
+        queue=queue,
+        filename_suffix=filename_suffix,
+        device_info=device_info,
+        stop_event=stop_event,
+        sample_size_getter=lambda: g_sample_size,
+        transcribe_callback=transcribe_and_display,
+        logger=logger,
+    )
 
 def collect_from_stream(queue, input_device, p_instance, from_microphone):
-    global g_sample_size
     global flush_letter_mic, flush_letter_out
-    logger.info("[%s] Starting collect_from_stream...", input_device['name'])
-    try:
-        logger.info("[%s] About to open audio stream...", input_device['name'])
-        frame_rate = int(input_device["defaultSampleRate"])
-        logger.info("[%s] Opened audio stream at %s Hz.", input_device['name'], frame_rate)
-        logger.debug("[%s] Input channels: %s", input_device['name'], input_device['maxInputChannels'])
-        logger.debug("[%s] Sample size (bytes): %s", input_device['name'], p_instance.get_sample_size(pyaudio.paInt16))
-        logger.debug("[%s] Sample format: %s", input_device['name'], pyaudio.paInt16)
-        logger.debug("[%s] Chunk size: %s samples", input_device['name'], int(frame_rate * 0.1))
-        logger.debug("[%s] Frames per buffer: %s samples", input_device['name'], int(frame_rate * 0.1))
-        logger.debug("[%s] Input device index: %s", input_device['name'], input_device['index'])
-        chunk_size = int(frame_rate * FRAME_DURATION_MS / 1000)  # 20 ms worth of samples
-        if chunk_size <= 0:
-            chunk_size = 1
-        with p_instance.open(format=pyaudio.paInt16,
-                             channels=input_device["maxInputChannels"],
-                             rate=frame_rate,
-                             frames_per_buffer=chunk_size,
-                             input=True,
-                             input_device_index=input_device["index"]) as stream:
-            logger.info("[%s] Audio stream opened successfully.", input_device['name'])
-            g_sample_size = p_instance.get_sample_size(pyaudio.paInt16)
-            logger.debug("Global sample size: %s", g_sample_size)
-            frames = []
-            start_time = time.time()
-            logger.info("[%s] Starting to read data...", input_device['name'])
-            silence_start_time = None
-            silence_frame_count = 0
-            while not stop_event.is_set():
-                try:
-                    if len(frames) ==silence_frame_count:
-                        start_time = time.time()
-                    
-                    # Check if microphone is muted (only for microphone input)
-                    if from_microphone and mute_mic_event.is_set():
-                        # Skip reading audio data when muted, but keep the loop running
-                        time.sleep(0.001)  # Small sleep to prevent busy waiting
-                        continue
-                    
-                    data = stream.read(chunk_size, exception_on_overflow=False)
-                    frames.append(data)
-                    
-                    
-                    with flush_letter_lock:
-                        if from_microphone:
-                            current_letter = flush_letter_mic
-                            flush_letter_mic=None
-                        else:
-                            current_letter = flush_letter_out
-                            flush_letter_out=None
-                    if current_letter:
-                        last_letter=current_letter
-                        if len(frames)>0:
-                            if last_letter=='_' and from_microphone==False:
-                                SECONDS_TO_GO_BACK = 2.0
-                                frames_to_remove = int((1000/FRAME_DURATION_MS) * SECONDS_TO_GO_BACK)
-                                frames_to_proess = frames[:-frames_to_remove]
-                                previous_speaker_snapshot, _ = _get_speaker_snapshot()
-                                queue.put((frames_to_proess.copy(), previous_speaker_snapshot, start_time))
-                                frames = frames[-frames_to_remove:]
-                                start_time = time.time() - (frames_to_remove*FRAME_DURATION_MS)/1000
-                            elif last_letter != '_':
-                                logger.info("[%s] Manual split triggered; flushing %s frames.", input_device['name'], len(frames))
-                                _set_current_speaker(last_letter)
-                                queue.put((frames.copy(), last_letter, start_time))
-                                frames = []
-                            silence_frame_count=0
-              
-                    #-- Silence check
-                    # Convert raw bytes to numpy array
-                    audio_samples = np.array(struct.unpack(f"{len(data)//2}h", data))
-                    # Calculate the volume (RMS)
-                    volume = np.sqrt(np.mean(audio_samples**2))
 
-                    # Check if volume is below threshold
-                    if volume < SILENCE_THRESHOLD:
-                        silence_frame_count+=1
-                        if silence_start_time is None:
-                            silence_start_time = time.time()  # Mark when silence starts
-                        elif time.time() - silence_start_time >= SILENCE_DURATION:
-                            #print(f"[{input_device['name']}] Silence detected for {SILENCE_DURATION} seconds.")
-                            if len(frames) ==silence_frame_count:
-                                #print(f"[{input_device['name']}] No audio detected for {SILENCE_DURATION} seconds. Ignoring.")
-                                pass
-                            else:
-                                _, current_speaker_snapshot = _get_speaker_snapshot()
-                                queue.put((frames.copy(), current_speaker_snapshot, start_time))
-                            frames = []
-                            silence_frame_count=0
-                            silence_start_time = None  # Reset silence timer
-                    else:
-                        silence_start_time = None  # Reset if we detect sound
+    def get_flush_letters():
+        return flush_letter_mic, flush_letter_out
 
-                    #-- Time check
-                    # If we've reached the RECORD_SECONDS duration, flush automatically.
-                    if len(frames) >= int((frame_rate * RECORD_SECONDS) / chunk_size):
-                        logger.info("[%s] Auto split after reaching %s seconds; queueing %s frames.", input_device['name'], RECORD_SECONDS, len(frames))
-                        _, current_speaker_snapshot = _get_speaker_snapshot()
-                        queue.put((frames.copy(), current_speaker_snapshot, start_time))
-                        frames = []
-                        silence_frame_count=0
-                except Exception as e:
-                    logger.warning("[%s] Error reading from stream: %s", input_device['name'], e)
-                    break
-            logger.info("[%s] Exiting reading loop.", input_device['name'])
-    except Exception as e:
-        logger.error("[%s] Failed to open audio stream: %s", input_device.get('name', 'Unknown'), e)
-    logger.info("[%s] collect_from_stream exiting.", input_device.get('name', 'Unknown'))
+    def clear_flush_letters(is_microphone: bool):
+        global flush_letter_mic, flush_letter_out
+        if is_microphone:
+            flush_letter_mic = None
+        else:
+            flush_letter_out = None
+
+    audio_capture_module.collect_from_stream(
+        queue=queue,
+        input_device=input_device,
+        p_instance=p_instance,
+        from_microphone=from_microphone,
+        stop_event=stop_event,
+        mute_mic_event=mute_mic_event,
+        flush_lock=flush_letter_lock,
+        get_flush_letters=get_flush_letters,
+        clear_flush_letters=clear_flush_letters,
+        speaker_snapshot_getter=_get_speaker_snapshot,
+        speaker_setter=_set_current_speaker,
+        frame_duration_ms=FRAME_DURATION_MS,
+        silence_threshold=SILENCE_THRESHOLD,
+        silence_duration=SILENCE_DURATION,
+        record_seconds=RECORD_SECONDS,
+        logger=logger,
+    )
 
 def transcribe_and_display(file, from_microphone, letter):
-    global g_transcription
     if not letter:
         letter = "?"
     #print(f"[Transcribe] Starting transcription for {file}.")
@@ -959,7 +707,6 @@ def add_transcription(user, text, start_time):
         g_assistant.add_message(start_time+1,f"{user}: {text}")
 
 def update_screen_on_new_transcription():
-    global g_transcription
     """
     Update the transcription display in the chat window.
     """
@@ -968,15 +715,8 @@ def update_screen_on_new_transcription():
             user, text, start_time = g_transcriptions_in.get(block=True, timeout=1)
         except Empty:
             continue
-        try:
-            if user != AGENT_NAME:
-                with open(g_trans_file_name, "a") as f:
-                    f.write(f"{user}: {text}\n\n")
-        except Exception as e:
-            logger.warning("Failed to append transcription to log file %s: %s", g_trans_file_name, e)
-        with g_transcription_lock:
-            g_transcription.append([user, text, start_time])
-            g_transcription = sorted(g_transcription, key=lambda entry: entry[2])
+        g_transcript_store.append_to_file_if_user(user, text)
+        g_transcript_store.add(user, text, start_time)
         root.after(0, update_chat)
 
 # Stop Recording
@@ -1018,7 +758,7 @@ def handler(signum, frame):
     stop_recording()
     exit(1)
 
-if __name__ == "__main__":
+def main():
     logger.info("[Main] Starting application...")
     signal.signal(signal.SIGINT, handler)
     os.makedirs("output", exist_ok=True)
@@ -1050,3 +790,7 @@ if __name__ == "__main__":
         logger.info("[Main] All threads have finished. Exiting.")
     else:
         logger.error("[Main] Failed to initialize recording. Exiting...")
+
+
+if __name__ == "__main__":
+    main()
