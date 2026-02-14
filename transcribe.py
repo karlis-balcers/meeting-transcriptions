@@ -26,6 +26,7 @@ import ui as ui_module
 from logging_utils import setup_logging
 from transcript_store import TranscriptStore
 from transcript_filter import TranscriptFilter
+from summary_utils import sanitize_title_for_filename
 from speaker_detection import TeamsSpeakerDetector
 
 setup_logging(app_name="meeting-transcriptions", log_dir=os.path.join("output", "logs"))
@@ -488,8 +489,7 @@ def generate_summary():
                 # Create filename with timestamp and title
                 timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
                 # Sanitize title for filename
-                safe_title = "".join(c if c.isalnum() or c in (' ', '-', '_') else '' for c in title)
-                safe_title = safe_title.replace(' ', '_').lower()[:50]  # Limit length
+                safe_title = sanitize_title_for_filename(title, max_length=50, default="meeting_summary")
                 filename = f"{g_summaries_dir}/{timestamp}_{safe_title}.md"
                 
                 # Save to file
