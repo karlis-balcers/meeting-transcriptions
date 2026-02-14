@@ -26,7 +26,7 @@ class Assistant:
 
     def __init__(self, vector_store_id: str, your_name: str, agent_name: str = "Agent", answer_queue: Queue = None):
         self.vector_store_id = vector_store_id
-        self.your_name = your_name
+        self.your_name = your_name or "You"
         self.agent_name = agent_name
         self.answer_queue = answer_queue
         self.messages_in = Queue()
@@ -40,7 +40,12 @@ class Assistant:
         self.last_answer = None
         self.messages = []
         self.api_key = os.getenv("OPENAI_API_KEY")
-        self.model = "gpt-5.2"
+        if not self.api_key or not self.api_key.strip():
+            raise ValueError("OPENAI_API_KEY is required to initialize Assistant")
+
+        configured_model = os.getenv("OPENAI_MODEL_FOR_ASSISTANT")
+        self.model = configured_model.strip() if configured_model and configured_model.strip() else "gpt-5.2"
+        print(f"Assistant model: {self.model}")
 
     def start_new_thread(self):
         """
@@ -51,7 +56,38 @@ class Assistant:
             self.messages = []
             self.last_answer = None
             self.last_message_timestamp = None
-        self.messages_in = Queue()
+        # Keep the same queue instance to avoid races with the background reader thread.
+        # Instead, drain any pending items from the current queue.
+        self._drain_incoming_queue()
+
+    def _append_message(self, role: str, message: str, timestamp: float) -> None:
+        """Append one message to the in-memory conversation state."""
+        with self.messages_lock:
+            self.messages.append(Message(user=role, text=message))
+            self.last_message_timestamp = timestamp
+
+    def _drain_incoming_queue(self) -> int:
+        """Drain queued inbound messages into conversation state.
+
+        Returns:
+            Number of drained items.
+        """
+        drained = 0
+        while True:
+            try:
+                role, message, timestamp = self.messages_in.get_nowait()
+            except Empty:
+                break
+            except Exception as e:
+                print(f"Error draining Assistant queue: {e}")
+                break
+
+            try:
+                self._append_message(role, message, timestamp)
+                drained += 1
+            except Exception as e:
+                print(f"Error storing drained message in Assistant thread: {e}")
+        return drained
 
     def add_message(self, timestamp: float, message: str, role: str = "user"):
         """
@@ -68,7 +104,11 @@ class Assistant:
 
     def _process_messages(self):
         """
-        Process inbound messages and dispatch up to 5 answer computations concurrently.
+        Process inbound messages and store them for later analysis.
+
+        NOTE: This assistant is intentionally manual-trigger only; no answers are
+        generated from this background loop. Answers are created only when
+        trigger_answer()/trigger_custom_prompt_answer() is called from UI actions.
         """
         while not self.stop_event.is_set():
             try:
@@ -79,21 +119,19 @@ class Assistant:
 
             # Collect a small batch (up to 5 total including the first), non-blocking
             batch = [first]
-            try:
-                for _ in range(4):
-                    try:
-                        batch.append(self.messages_in.get_nowait())
-                    except Empty:
-                        break
-            except Exception as e:
-                print(f"Batch collection error: {e}")
+            for _ in range(4):
+                try:
+                    batch.append(self.messages_in.get_nowait())
+                except Empty:
+                    break
+                except Exception as e:
+                    print(f"Batch collection error: {e}")
+                    break
 
             # Append messages in order
             for role, message, timestamp in batch:
                 try:
-                    with self.messages_lock:
-                        self.messages.append(Message(user=role, text=message))
-                        self.last_message_timestamp = timestamp
+                    self._append_message(role, message, timestamp)
                 except Exception as e:
                     print(f"Error storing message in Assistant thread: {e}")
                     continue
@@ -368,6 +406,12 @@ The user is in a live meeting and shares raw transcript snippets. Treat earlier 
         if self.stop_event.is_set():
             print("Assistant is stopped; cannot trigger answer.")
             return False
+
+        # Ensure very recent messages queued from other threads are included when
+        # the user presses the button.
+        drained = self._drain_incoming_queue()
+        if drained:
+            print(f"Drained {drained} pending message(s) before trigger.")
 
         normalized_mode = (mode or "answer_question").strip().lower()
 

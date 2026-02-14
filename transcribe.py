@@ -27,6 +27,66 @@ import openai_transcribe
 print("Loading configuration from '.env' file...")
 
 
+def _env_str(name: str, default: str | None = None) -> str | None:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    value = value.strip()
+    return value if value else default
+
+
+def _env_int(name: str, default: int, warnings: list[str]) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        warnings.append(f"Invalid integer for {name}='{raw}'. Using default {default}.")
+        return default
+
+
+def _env_bool(name: str, default: bool, warnings: list[str]) -> bool:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+
+    value = raw.strip().lower()
+    truthy = {"1", "true", "yes", "y", "on"}
+    falsy = {"0", "false", "no", "n", "off"}
+
+    if value in truthy:
+        return True
+    if value in falsy:
+        return False
+
+    warnings.append(
+        f"Invalid boolean for {name}='{raw}'. Using default {default}."
+    )
+    return default
+
+
+def _print_startup_summary() -> None:
+    print("\n=== Startup Configuration Summary ===")
+    print(f"Platform: {sys.platform}")
+    print(f"User name: {g_my_name}")
+    print(f"Language: {g_language}")
+    print(f"Manual interrupt enabled: {g_interupt_manually}")
+    print(f"Transcript model: {g_openai_model_for_transcript}")
+    print(f"Keywords configured: {'yes' if g_keywords else 'no'}")
+    print(f"OpenAI API key configured: {'yes' if g_open_api_key else 'no'}")
+    print(f"Assistant enabled: {'yes' if g_assistant else 'no'}")
+    print(f"Vector store configured: {'yes' if g_vector_store_id else 'no'}")
+    print(f"Teams integration available: {'yes' if g_ms_teams_app is not None else 'no'}")
+    if g_startup_warnings:
+        print("Warnings:")
+        for warning in g_startup_warnings:
+            print(f"  - {warning}")
+    else:
+        print("Warnings: none")
+    print("=====================================\n")
+
+
 # Constants
 RECORD_SECONDS = 300 
 #RECORD_SECONDS = 120  # Updated from 5 to 60 seconds (5 minutes = 55 MB, OpenAPI only support up to 25 MB files)
@@ -41,7 +101,7 @@ g_transcriptions_in = Queue()
 stop_event = Event()
 mute_mic_event = Event()  # Event to control microphone muting
 g_transcription = []
-#g_transcription_lock = Lock()
+g_transcription_lock = Lock()
 
 g_device_in = {}
 g_device_out = {}
@@ -51,40 +111,48 @@ g_sample_size = 0
 flush_letter_mic = None
 flush_letter_out = None
 flush_letter_lock = Lock()
+g_speaker_state_lock = Lock()
 
 load_dotenv()  # Load variables from .env file
 
-g_my_name = os.getenv("YOUR_NAME")
+g_startup_warnings: list[str] = []
+
+g_my_name = _env_str("YOUR_NAME", "You")
+if g_my_name == "You":
+    g_startup_warnings.append("YOUR_NAME is missing in .env. Using fallback name 'You'.")
 print(f"Your name is: {g_my_name}")
 AGENT_NAME="Agent"
 
-g_language='en'
-try:
-    g_language = os.getenv("LANGUAGE")
-except:
-    pass
+g_language = _env_str("LANGUAGE", "en")
 print(f"Language: {g_language}")
 
-g_open_api_key=None
-try:
-    g_open_api_key=os.environ.get("OPENAI_API_KEY")
-except:
-    pass
+g_open_api_key = _env_str("OPENAI_API_KEY")
+if not g_open_api_key:
+    g_startup_warnings.append(
+        "OPENAI_API_KEY is not configured. Transcription/assistant calls to OpenAI may fail."
+    )
 
-g_interupt_manually = True
-#try:
-#    g_interupt_manually = True if os.environ.get("INTERUPT_MANUALLY")=='True' else False
-#except:
-#    pass
-#print(f"Interupt manually: {g_interupt_manually}")
+g_interupt_manually = _env_bool("INTERUPT_MANUALLY", True, g_startup_warnings)
 
-g_assistant=None
-try:
-    vector_store_id=os.environ.get("OPENAI_VECTOR_STORE_ID_FOR_ANSWERS")
-    g_assistant = assistant.Assistant(vector_store_id, g_my_name, agent_name=AGENT_NAME, answer_queue=g_transcriptions_in)
-    print(f"Assistant configured with vector store ID: {vector_store_id}")
-except:
-    pass
+g_assistant = None
+g_vector_store_id = _env_str("OPENAI_VECTOR_STORE_ID_FOR_ANSWERS")
+
+if g_open_api_key:
+    try:
+        g_assistant = assistant.Assistant(
+            g_vector_store_id,
+            g_my_name,
+            agent_name=AGENT_NAME,
+            answer_queue=g_transcriptions_in,
+        )
+        if g_vector_store_id:
+            print(f"Assistant configured with vector store ID: {g_vector_store_id}")
+        else:
+            print("Assistant configured without vector store.")
+    except Exception as e:
+        g_startup_warnings.append(f"Assistant initialization failed: {e}")
+else:
+    g_startup_warnings.append("Assistant disabled because OPENAI_API_KEY is missing.")
 
 assistant_buttons: dict[str, tk.Button] = {}
 custom_prompt_entry = None
@@ -92,35 +160,38 @@ send_prompt_button = None
 summary_button = None
 
 g_keywords = None
-try:
-    g_keywords = os.environ.get("KEYWORDS")
-    if g_keywords:
-        print(f"Using keywords for initial prompt: {g_keywords}")  
-except:
-    pass
+g_keywords = _env_str("KEYWORDS")
+if g_keywords:
+    print(f"Using keywords for initial prompt: {g_keywords}")
 
-g_agent_font_size = 14
-try:
-    g_agent_font_size = int(os.environ.get("AGENT_FONT_SIZE", "14"))
-    print(f"Agent font size: {g_agent_font_size}")
-except:
-    pass
+g_agent_font_size = _env_int("AGENT_FONT_SIZE", 14, g_startup_warnings)
+print(f"Agent font size: {g_agent_font_size}")
 
-g_default_font_size = 10
-try:
-    g_default_font_size = int(os.environ.get("DEFAULT_FONT_SIZE", "10"))
-    print(f"Default font size: {g_default_font_size}")
-except:
-    pass
+g_default_font_size = _env_int("DEFAULT_FONT_SIZE", 10, g_startup_warnings)
+print(f"Default font size: {g_default_font_size}")
 
-g_transcript_ai=None
+g_transcript_ai = None
+g_openai_model_for_transcript = _env_str("OPENAI_MODEL_FOR_TRANSCRIPT", "gpt-4o-mini-transcribe")
+print(f"Using OpenAI model for transcript: {g_openai_model_for_transcript}")
 try:
-    g_openai_model_for_transcript = os.environ.get("OPENAI_MODEL_FOR_TRANSCRIPT")
-    print(f"Using OpenAI model for transcript: {g_openai_model_for_transcript}")
-    g_transcript_ai = openai_transcribe.OpenAITranscribe(model=g_openai_model_for_transcript, keywords=g_keywords, language=g_language)
-except:
+    g_transcript_ai = openai_transcribe.OpenAITranscribe(
+        model=g_openai_model_for_transcript,
+        keywords=g_keywords,
+        language=g_language,
+    )
+except Exception as e:
+    g_startup_warnings.append(
+        f"Failed to initialize OpenAI transcription model '{g_openai_model_for_transcript}': {e}"
+    )
     g_openai_model_for_transcript = "gpt-4o-mini-transcribe"
-    g_transcript_ai = openai_transcribe.OpenAITranscribe(model=g_openai_model_for_transcript, keywords=g_keywords, language=g_language)
+    g_transcript_ai = openai_transcribe.OpenAITranscribe(
+        model=g_openai_model_for_transcript,
+        keywords=g_keywords,
+        language=g_language,
+    )
+    g_startup_warnings.append(
+        f"Falling back to transcription model '{g_openai_model_for_transcript}'."
+    )
     #print(f"Using Fast Whisper running on your PC for transcript: large-v3")
     #try:
     #    local_transcribe_model = os.environ.get("LOCAL_TRANSCRIBE_MODEL")
@@ -157,8 +228,8 @@ g_trans_file_name = f"{g_output_dir}/transcription-{datetime.now().strftime('%Y%
 try:
     with open(g_trans_file_name, "w") as f:
         f.write(f"== Transcription Log ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')}) ==\n\n")
-except:
-    pass
+except Exception as e:
+    g_startup_warnings.append(f"Failed to create transcription log file '{g_trans_file_name}': {e}")
 
 global_audio = pyaudio.PyAudio()
 
@@ -168,12 +239,34 @@ if sys.platform == "win32":
     try:
         # Connect to Microsoft Teams by title, or you can use process ID or path
         g_ms_teams_app = Application(backend="uia").connect(title_re=g_window_name)
-    except:
-        pass
+    except Exception as e:
+        g_startup_warnings.append(f"Teams integration not connected at startup: {e}")
+
+_print_startup_summary()
 
 g_previous_speaker = None
 g_current_speaker = None
 g_meeting_title = None
+
+
+def _get_speaker_snapshot():
+    """Return a thread-safe snapshot of speaker state (previous, current)."""
+    with g_speaker_state_lock:
+        return g_previous_speaker, g_current_speaker
+
+
+def _set_current_speaker(new_speaker: str | None):
+    """Update speaker state atomically and return (previous, current)."""
+    global g_previous_speaker, g_current_speaker
+    with g_speaker_state_lock:
+        g_previous_speaker = g_current_speaker
+        g_current_speaker = new_speaker
+        return g_previous_speaker, g_current_speaker
+
+
+def _get_meeting_title_snapshot() -> str | None:
+    with g_speaker_state_lock:
+        return g_meeting_title
 
 def get_ms_teams_window_title():
     '''Get the MS Teams window title which usually contains the meeting name.'''
@@ -197,10 +290,14 @@ def get_ms_teams_window_title():
             # Remove leading/trailing separators
             title = title.strip(" -|")
             
-            if title and title != g_meeting_title:
+            with g_speaker_state_lock:
+                previous_title = g_meeting_title
+
+            if title and title != previous_title:
                 # Only update and log if we got a new non-empty title
-                old_title = g_meeting_title
-                g_meeting_title = title
+                old_title = previous_title
+                with g_speaker_state_lock:
+                    g_meeting_title = title
                 if old_title is None:
                     print(f"[Teams] Meeting title detected: '{title}'")
                 else:
@@ -214,7 +311,7 @@ def get_ms_teams_window_title():
         pass
     
     # Return the last known title even if we can't detect it now
-    return g_meeting_title
+    return _get_meeting_title_snapshot()
 
 def inspect_ms_teams():
     global g_ms_teams_app
@@ -238,7 +335,7 @@ def inspect_ms_teams():
 
 def get_speaker_name():
     '''Get the current speaker's name from the MS Teams window.'''
-    global flush_letter_mic, flush_letter_out, g_current_speaker, g_previous_speaker, g_meeting_title
+    global flush_letter_mic, flush_letter_out
     
     title_check_counter = 0
     TITLE_CHECK_INTERVAL = 50  # Check for title every 50 iterations (5 seconds)
@@ -249,7 +346,8 @@ def get_speaker_name():
         if title_check_counter >= TITLE_CHECK_INTERVAL:
             title_check_counter = 0
             new_title = get_ms_teams_window_title()
-            if new_title and new_title != g_meeting_title:
+            previous_title = _get_meeting_title_snapshot()
+            if new_title and new_title != previous_title:
                 print(f"[Teams] Detected new meeting: {new_title}")
         
         data = inspect_ms_teams()
@@ -275,18 +373,19 @@ def get_speaker_name():
                     break
 
             if match:
-                g_previous_speaker = g_current_speaker
                 if len(name_parts)>1 and name_parts[1][0]!='(':
-                    g_current_speaker = name_parts[0] + " " + name_parts[1][0]  # only the first name and first letter of the last name
+                    detected_speaker = name_parts[0] + " " + name_parts[1][0]  # only the first name and first letter of the last name
                 else:
-                    g_current_speaker = name_parts[0]
+                    detected_speaker = name_parts[0]
             else:
-                g_current_speaker = None
+                detected_speaker = None
         else:
-            g_current_speaker = None
-        if g_previous_speaker != g_current_speaker:
-            print(f"New speaker: {g_current_speaker} (was {g_previous_speaker})")
-            if g_previous_speaker:
+            detected_speaker = None
+
+        previous_speaker, current_speaker = _set_current_speaker(detected_speaker)
+        if previous_speaker != current_speaker:
+            print(f"New speaker: {current_speaker} (was {previous_speaker})")
+            if previous_speaker:
                 with flush_letter_lock:
                     flush_letter_mic = '_'
                     flush_letter_out = '_'
@@ -322,7 +421,8 @@ def reset_log_file():
         print(f"[UI] Reset log file to: {g_trans_file_name}")
         
         # Clear current transcription display
-        g_transcription = []
+        with g_transcription_lock:
+            g_transcription = []
 
         if g_assistant:
             g_assistant.start_new_thread()
@@ -381,7 +481,10 @@ def generate_summary():
         print("[UI] Assistant is not available; cannot generate summary.")
         return
     
-    if not g_transcription:
+    with g_transcription_lock:
+        transcription_snapshot = list(g_transcription)
+
+    if not transcription_snapshot:
         print("[UI] No transcription available to summarize.")
         return
     
@@ -393,7 +496,7 @@ def generate_summary():
         try:
             # Get the full transcript
             transcript = ""
-            for entry in g_transcription:
+            for entry in transcription_snapshot:
                 user, text, start_time = entry
                 transcript += f"{user}: {text}\n"
             
@@ -401,11 +504,12 @@ def generate_summary():
             context = load_context_file()
             
             # Generate summary with title
-            if g_meeting_title:
-                print(f"[UI] Passing meeting title to AI: '{g_meeting_title}'")
+            meeting_title_snapshot = _get_meeting_title_snapshot()
+            if meeting_title_snapshot:
+                print(f"[UI] Passing meeting title to AI: '{meeting_title_snapshot}'")
             else:
                 print("[UI] No meeting title detected, generating without title context")
-            summary_data = g_assistant.generate_meeting_summary(transcript, meeting_title=g_meeting_title, context=context)
+            summary_data = g_assistant.generate_meeting_summary(transcript, meeting_title=meeting_title_snapshot, context=context)
             
             if summary_data:
                 title = summary_data.get('title', 'Meeting Summary')
@@ -531,10 +635,13 @@ def setup_ui():
     return root
 
 def update_chat():
+    with g_transcription_lock:
+        transcription_snapshot = list(g_transcription)
+
     chat_window.config(state=tk.NORMAL)
     chat_window.delete("1.0", tk.END)
     last_user=''
-    for entry in g_transcription:
+    for entry in transcription_snapshot:
         user, text, start_time = entry
         if user != last_user:
             if user == g_my_name:
@@ -594,7 +701,6 @@ def store_audio_stream(queue, filename_suffix, device_info, from_microphone):
 def collect_from_stream(queue, input_device, p_instance, from_microphone):
     global g_sample_size
     global flush_letter_mic, flush_letter_out
-    global g_current_speaker
     print(f"[{input_device['name']}] Starting collect_from_stream...")
     try:
         print(f"[{input_device['name']}] About to open audio stream...")
@@ -651,12 +757,13 @@ def collect_from_stream(queue, input_device, p_instance, from_microphone):
                                 SECONDS_TO_GO_BACK = 2.0
                                 frames_to_remove = int((1000/FRAME_DURATION_MS) * SECONDS_TO_GO_BACK)
                                 frames_to_proess = frames[:-frames_to_remove]
-                                queue.put((frames_to_proess.copy(), g_previous_speaker, start_time))
+                                previous_speaker_snapshot, _ = _get_speaker_snapshot()
+                                queue.put((frames_to_proess.copy(), previous_speaker_snapshot, start_time))
                                 frames = frames[-frames_to_remove:]
                                 start_time = time.time() - (frames_to_remove*FRAME_DURATION_MS)/1000
                             elif last_letter != '_':
                                 print(f"[{input_device['name']}] Manual split triggered; flushing {len(frames)} frames.")
-                                g_current_speaker = last_letter
+                                _set_current_speaker(last_letter)
                                 queue.put((frames.copy(), last_letter, start_time))
                                 frames = []
                             silence_frame_count=0
@@ -678,7 +785,8 @@ def collect_from_stream(queue, input_device, p_instance, from_microphone):
                                 #print(f"[{input_device['name']}] No audio detected for {SILENCE_DURATION} seconds. Ignoring.")
                                 pass
                             else:
-                                queue.put((frames.copy(), g_current_speaker, start_time))
+                                _, current_speaker_snapshot = _get_speaker_snapshot()
+                                queue.put((frames.copy(), current_speaker_snapshot, start_time))
                             frames = []
                             silence_frame_count=0
                             silence_start_time = None  # Reset silence timer
@@ -689,7 +797,8 @@ def collect_from_stream(queue, input_device, p_instance, from_microphone):
                     # If we've reached the RECORD_SECONDS duration, flush automatically.
                     if len(frames) >= int((frame_rate * RECORD_SECONDS) / chunk_size):
                         print(f"[{input_device['name']}] Auto split after reaching {RECORD_SECONDS} seconds; queueing {len(frames)} frames.")
-                        queue.put((frames.copy(), g_current_speaker, start_time))
+                        _, current_speaker_snapshot = _get_speaker_snapshot()
+                        queue.put((frames.copy(), current_speaker_snapshot, start_time))
                         frames = []
                         silence_frame_count=0
                 except Exception as e:
@@ -762,8 +871,9 @@ def update_screen_on_new_transcription():
                     f.write(f"{user}: {text}\n\n")
         except:
             pass
-        g_transcription.append([user, text, start_time])
-        g_transcription = sorted(g_transcription, key=lambda entry: entry[2])
+        with g_transcription_lock:
+            g_transcription.append([user, text, start_time])
+            g_transcription = sorted(g_transcription, key=lambda entry: entry[2])
         root.after(0, update_chat)
 
 # Stop Recording
