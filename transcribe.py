@@ -82,9 +82,14 @@ g_assistant=None
 try:
     vector_store_id=os.environ.get("OPENAI_VECTOR_STORE_ID_FOR_ANSWERS")
     g_assistant = assistant.Assistant(vector_store_id, g_my_name, agent_name=AGENT_NAME, answer_queue=g_transcriptions_in)
-    print(f"Using vector store ID to auto-answer: {vector_store_id}")
+    print(f"Assistant configured with vector store ID: {vector_store_id}")
 except:
     pass
+
+assistant_buttons: dict[str, tk.Button] = {}
+custom_prompt_entry = None
+send_prompt_button = None
+summary_button = None
 
 g_keywords = None
 try:
@@ -132,6 +137,11 @@ g_output_dir = "output"
 if not os.path.exists(g_output_dir):
     os.makedirs(g_output_dir)
 
+# Check if output_summaries dir exists
+g_summaries_dir = "output_summaries"
+if not os.path.exists(g_summaries_dir):
+    os.makedirs(g_summaries_dir)
+
 # Delete all wav files in the output directory
 for file in os.listdir(g_output_dir):
     if file.endswith(".wav"):
@@ -163,6 +173,48 @@ if sys.platform == "win32":
 
 g_previous_speaker = None
 g_current_speaker = None
+g_meeting_title = None
+
+def get_ms_teams_window_title():
+    '''Get the MS Teams window title which usually contains the meeting name.'''
+    global g_ms_teams_app, g_meeting_title
+    if sys.platform != "win32":
+        return None
+    try:
+        if g_ms_teams_app==None:
+            g_ms_teams_app = Application(backend="uia").connect(title_re=g_window_name)
+        
+        teams_window = g_ms_teams_app.window(title_re=g_window_name)
+        window_title = teams_window.window_text()
+        
+        # Clean up the title - remove "Meeting compact view" or similar suffixes
+        if window_title:
+            # Remove common Teams window suffixes
+            title = window_title.replace("Meeting compact view", "").strip()
+            title = title.replace(" | Microsoft Teams", "").strip()
+            title = title.replace("|", "").strip()
+            
+            # Remove leading/trailing separators
+            title = title.strip(" -|")
+            
+            if title and title != g_meeting_title:
+                # Only update and log if we got a new non-empty title
+                old_title = g_meeting_title
+                g_meeting_title = title
+                if old_title is None:
+                    print(f"[Teams] Meeting title detected: '{title}'")
+                else:
+                    print(f"[Teams] Meeting title updated: '{old_title}' -> '{title}'")
+                return title
+            elif title:
+                # Same title as before, don't log but return it
+                return title
+    except Exception as e:
+        # Don't log every error, only when debugging
+        pass
+    
+    # Return the last known title even if we can't detect it now
+    return g_meeting_title
 
 def inspect_ms_teams():
     global g_ms_teams_app
@@ -186,8 +238,20 @@ def inspect_ms_teams():
 
 def get_speaker_name():
     '''Get the current speaker's name from the MS Teams window.'''
-    global flush_letter_mic, flush_letter_out, g_current_speaker, g_previous_speaker
+    global flush_letter_mic, flush_letter_out, g_current_speaker, g_previous_speaker, g_meeting_title
+    
+    title_check_counter = 0
+    TITLE_CHECK_INTERVAL = 50  # Check for title every 50 iterations (5 seconds)
+    
     while not stop_event.is_set():
+        # Periodically check for meeting title (it's only available when Teams is minimized)
+        title_check_counter += 1
+        if title_check_counter >= TITLE_CHECK_INTERVAL:
+            title_check_counter = 0
+            new_title = get_ms_teams_window_title()
+            if new_title and new_title != g_meeting_title:
+                print(f"[Teams] Detected new meeting: {new_title}")
+        
         data = inspect_ms_teams()
         if data:
             # Use regex to find the line with the speaker's information.
@@ -268,9 +332,114 @@ def reset_log_file():
         print(f"[UI] Error creating new log file: {e}")
 
 
+def load_context_file():
+    """Load background context from context.md if it exists."""
+    context_file = "context.md"
+    if os.path.exists(context_file):
+        try:
+            with open(context_file, 'r', encoding='utf-8') as f:
+                context = f.read().strip()
+            if context:
+                print(f"[Context] Loaded {len(context)} characters from {context_file}")
+                return context
+        except Exception as e:
+            print(f"[Context] Error loading {context_file}: {e}")
+    else:
+        print(f"[Context] No context file found at {context_file}")
+    return None
+
+def send_custom_prompt():
+    """Send a custom prompt from the user to the assistant."""
+    if not g_assistant:
+        print("[UI] Assistant is not available; cannot send prompt.")
+        return
+    
+    prompt_text = custom_prompt_entry.get().strip()
+    if not prompt_text:
+        print("[UI] Empty prompt, nothing to send.")
+        return
+    
+    print(f"[UI] Sending custom prompt: {prompt_text}")
+    timestamp = time.time()
+    
+    # Add the custom prompt as a user message
+    g_assistant.add_custom_prompt(timestamp, prompt_text, g_my_name)
+    
+    # Clear the text field
+    custom_prompt_entry.delete(0, tk.END)
+    
+    # Trigger the assistant to answer
+    success = g_assistant.trigger_custom_prompt_answer()
+    if not success:
+        print("[UI] Assistant was unable to generate a response to custom prompt.")
+
+def generate_summary():
+    """Generate a detailed meeting summary using AI and save to markdown file."""
+    global summary_button
+    
+    if not g_assistant:
+        print("[UI] Assistant is not available; cannot generate summary.")
+        return
+    
+    if not g_transcription:
+        print("[UI] No transcription available to summarize.")
+        return
+    
+    print("[UI] Generating meeting summary...")
+    if summary_button:
+        summary_button.config(state=tk.DISABLED, text="Generating...")
+    
+    def generate_and_save():
+        try:
+            # Get the full transcript
+            transcript = ""
+            for entry in g_transcription:
+                user, text, start_time = entry
+                transcript += f"{user}: {text}\n"
+            
+            # Load context file
+            context = load_context_file()
+            
+            # Generate summary with title
+            if g_meeting_title:
+                print(f"[UI] Passing meeting title to AI: '{g_meeting_title}'")
+            else:
+                print("[UI] No meeting title detected, generating without title context")
+            summary_data = g_assistant.generate_meeting_summary(transcript, meeting_title=g_meeting_title, context=context)
+            
+            if summary_data:
+                title = summary_data.get('title', 'Meeting Summary')
+                summary = summary_data.get('summary', '')
+                
+                # Create filename with timestamp and title
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                # Sanitize title for filename
+                safe_title = "".join(c if c.isalnum() or c in (' ', '-', '_') else '' for c in title)
+                safe_title = safe_title.replace(' ', '_').lower()[:50]  # Limit length
+                filename = f"{g_summaries_dir}/{timestamp}_{safe_title}.md"
+                
+                # Save to file
+                with open(filename, 'w', encoding='utf-8') as f:
+                    f.write(f"# {title}\n\n")
+                    f.write(f"**Date:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                    f.write(summary)
+                
+                print(f"[UI] Summary saved to: {filename}")
+            else:
+                print("[UI] Failed to generate summary.")
+        except Exception as e:
+            print(f"[UI] Error generating summary: {e}")
+        finally:
+            if summary_button:
+                root.after(0, lambda: summary_button.config(state=tk.NORMAL, text="Generate Summary"))
+    
+    # Run in a separate thread to avoid blocking UI
+    Thread(target=generate_and_save, daemon=True).start()
+
+
 # GUI Setup
 def setup_ui():
-    global chat_window, root, mute_button
+    global chat_window, root, mute_button, assistant_buttons, custom_prompt_entry, send_prompt_button, summary_button
     
     root = tk.Tk()
     root.title("Live Audio Chat")
@@ -289,6 +458,35 @@ def setup_ui():
     reset_button = tk.Button(button_frame, text="Reset Log", command=reset_log_file,
                             bg="#4ecdc4", fg="white", font=("Arial", g_default_font_size, "bold"))
     reset_button.pack(side=tk.LEFT, padx=(0, 5))
+    
+    # Create Generate Summary button
+    if g_assistant:
+        summary_button = tk.Button(button_frame, text="Generate Summary", command=generate_summary,
+                                bg="#9b59b6", fg="white", font=("Arial", g_default_font_size, "bold"))
+        summary_button.pack(side=tk.LEFT, padx=(0, 5))
+
+    if g_assistant:
+        # Create custom prompt input field
+        prompt_frame = tk.Frame(button_frame)
+        prompt_frame.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(5, 0))
+        
+        custom_prompt_entry = tk.Entry(prompt_frame, font=("Arial", g_default_font_size))
+        custom_prompt_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+        custom_prompt_entry.bind('<Return>', lambda event: send_custom_prompt())
+        
+        send_prompt_button = tk.Button(
+            prompt_frame,
+            text="Send to AI",
+            command=send_custom_prompt,
+            bg="#1f8ef1",
+            fg="white",
+            font=("Arial", g_default_font_size, "bold"),
+        )
+        send_prompt_button.pack(side=tk.LEFT)
+        
+        assistant_buttons = {}  # Keep empty dict for compatibility
+    else:
+        assistant_buttons = {}
     
     chat_window = tk.Text(root, wrap=tk.WORD, state=tk.DISABLED)
     chat_window.pack(expand=True, fill=tk.BOTH, padx=5, pady=(0, 5))
@@ -314,6 +512,7 @@ def setup_ui():
     root.bind("<KeyPress-S>", on_split_key)
     '''
     # Bind key press events for any letter key a-z
+    # Only enable manual splits if assistant is not available (to avoid conflicts with text entry)
     def on_key_press(event):
         global flush_letter_mic, flush_letter_out
         with flush_letter_lock:
@@ -321,7 +520,7 @@ def setup_ui():
             flush_letter_out = event.char
         print(f"[UI] Key '{event.char}' pressed. Flushing current audio buffers.")
 
-    if g_interupt_manually:
+    if g_interupt_manually and not g_assistant:
         for key in "abcdefghijklmnopqrstuvwxyz":
             root.bind(f"<KeyPress-{key}>", on_key_press)
             root.bind(f"<KeyPress-{key.upper()}>", on_key_press)  # Also bind uppercase versions
@@ -400,6 +599,13 @@ def collect_from_stream(queue, input_device, p_instance, from_microphone):
     try:
         print(f"[{input_device['name']}] About to open audio stream...")
         frame_rate = int(input_device["defaultSampleRate"])
+        print(f"[{input_device['name']}] Opened audio stream at {frame_rate} Hz.")
+        print(f"[{input_device['name']}] Input channels: {input_device['maxInputChannels']}")
+        print(f"[{input_device['name']}] Sample size (bytes): {p_instance.get_sample_size(pyaudio.paInt16)}")
+        print(f"[{input_device['name']}] Sample format: {pyaudio.paInt16}")
+        print(f"[{input_device['name']}] Chunk size: {int(frame_rate * 0.1)} samples")
+        print(f"[{input_device['name']}] Frames per buffer: {int(frame_rate * 0.1)} samples")
+        print(f"[{input_device['name']}] Input device index: {input_device['index']}")
         FRAME_DURATION_MS = 100
         chunk_size = int(frame_rate * FRAME_DURATION_MS / 1000)  # 20 ms worth of samples
         with p_instance.open(format=pyaudio.paInt16,
@@ -586,7 +792,7 @@ def initialize_recording():
                 # Fallback: Pick default input/output devices
                 g_device_in = p.get_default_input_device_info()
                 g_device_out = p.get_default_output_device_info()
-        print("[Init] Devices initialized successfully.")
+        print("[Init] Devices initialized successfully. Recording device:", g_device_in["name"], "Output device:", g_device_out["name"])
     except Exception as e:
         print(f"[Init] Error initializing devices: {e}")
         return False

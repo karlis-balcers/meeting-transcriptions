@@ -100,6 +100,6 @@ cython_debug/
 # Temporary audio files
 output/*.wav
 output/*
-
+output_summaries/*
 # Microsoft Teams control files
 teams_controls*.txt
