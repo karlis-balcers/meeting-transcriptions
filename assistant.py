@@ -11,9 +11,12 @@ from threading import Thread, Event, Lock
 
 from dataclasses import dataclass
 import os
+import logging
 from typing import Iterable, Optional, Any
 import json
 import requests
+
+logger = logging.getLogger("assistant")
 
 
 @dataclass
@@ -45,13 +48,13 @@ class Assistant:
 
         configured_model = os.getenv("OPENAI_MODEL_FOR_ASSISTANT")
         self.model = configured_model.strip() if configured_model and configured_model.strip() else "gpt-5.2"
-        print(f"Assistant model: {self.model}")
+        logger.info("Assistant model: %s", self.model)
 
     def start_new_thread(self):
         """
         Start a new thread for the assistant.
         """
-        print("New conversation started")
+        logger.info("New conversation started")
         with self.messages_lock:
             self.messages = []
             self.last_answer = None
@@ -79,14 +82,14 @@ class Assistant:
             except Empty:
                 break
             except Exception as e:
-                print(f"Error draining Assistant queue: {e}")
+                logger.warning("Error draining Assistant queue: %s", e)
                 break
 
             try:
                 self._append_message(role, message, timestamp)
                 drained += 1
             except Exception as e:
-                print(f"Error storing drained message in Assistant thread: {e}")
+                logger.warning("Error storing drained message in Assistant thread: %s", e)
         return drained
 
     def add_message(self, timestamp: float, message: str, role: str = "user"):
@@ -125,7 +128,7 @@ class Assistant:
                 except Empty:
                     break
                 except Exception as e:
-                    print(f"Batch collection error: {e}")
+                    logger.warning("Batch collection error: %s", e)
                     break
 
             # Append messages in order
@@ -133,19 +136,19 @@ class Assistant:
                 try:
                     self._append_message(role, message, timestamp)
                 except Exception as e:
-                    print(f"Error storing message in Assistant thread: {e}")
+                    logger.warning("Error storing message in Assistant thread: %s", e)
                     continue
 
     def stop(self):
         """Stop the message-processing thread and executor."""
-        print("Stopping assistant thread...")
+        logger.info("Stopping assistant thread...")
         self.stop_event.set()
         self.message_thread.join()
         try:
             self.executor.shutdown(wait=True)
         except Exception as e:
-            print(f"Executor shutdown error: {e}")
-        print("Stopping assistant thread... DONE")
+            logger.warning("Executor shutdown error: %s", e)
+        logger.info("Stopping assistant thread... DONE")
 
 
     def _extract_text_from_response(self, data: dict[str, Any]) -> Optional[str]:
@@ -191,7 +194,7 @@ class Assistant:
 
     def _log_response_summary(self, data: dict[str, Any]) -> None:
         """Print a concise, informative summary of the Responses API result."""
-        print("RAW:", data)
+        logger.debug("RAW response payload: %s", data)
         try:
             rid = data.get("id")
             status = data.get("status")
@@ -284,9 +287,9 @@ class Assistant:
             lines.append(f"    {text if text else ''}")
             lines.append(f"  placeholder_answer={is_placeholder}")
 
-            print("\n".join(lines))
+            logger.info("%s", "\n".join(lines))
         except Exception as e:
-            print(f"Failed to print response summary: {e}")
+            logger.warning("Failed to print response summary: %s", e)
 
 
     def _build_system_prompt(self, mode: str) -> str:
@@ -309,12 +312,12 @@ The user is in a live meeting and shares raw transcript snippets. Treat earlier 
 
 
     def _answer(self, timestamp: float, messages_snapshot: Optional[list[Message]] = None, mode: str = "answer_question"):
-        print(f"Answering question... (mode={mode})")
+        logger.info("Answering question... (mode=%s)", mode)
         time_val = timestamp
         msgs = messages_snapshot if messages_snapshot is not None else self.messages
 
         if not msgs:
-            print("No messages available for assistant to process.")
+            logger.info("No messages available for assistant to process.")
             return
 
         system = self._build_system_prompt(mode)
@@ -375,9 +378,9 @@ The user is in a live meeting and shares raw transcript snippets. Treat earlier 
         if not (200 <= resp.status_code < 300):
             try:
                 err = resp.json()
-                print("Responses API error:", json.dumps(err, indent=2)[:2000])
+                    logger.error("Responses API error: %s", json.dumps(err, indent=2)[:2000])
             except Exception:
-                print("Responses API error (raw):", (resp.text or "")[:2000])
+                    logger.error("Responses API error (raw): %s", (resp.text or "")[:2000])
             return ":eyes:"
 
         try:
@@ -396,28 +399,28 @@ The user is in a live meeting and shares raw transcript snippets. Treat earlier 
                 self.messages.append(Message(user="assistant", text=text))
                 self.last_message_timestamp = timestamp
             if self.answer_queue:
-                print(f"Answered at {time_val}: {self.last_answer}")
+                logger.info("Answered at %s", time_val)
                 self.answer_queue.put((self.agent_name, self.last_answer, time_val))
 
-        print("Answering question... DONE")
+        logger.info("Answering question... DONE")
 
     def trigger_answer(self, mode: str = "answer_question") -> bool:
         """Manually request the assistant to craft a reply based on collected messages."""
         if self.stop_event.is_set():
-            print("Assistant is stopped; cannot trigger answer.")
+            logger.warning("Assistant is stopped; cannot trigger answer.")
             return False
 
         # Ensure very recent messages queued from other threads are included when
         # the user presses the button.
         drained = self._drain_incoming_queue()
         if drained:
-            print(f"Drained {drained} pending message(s) before trigger.")
+            logger.debug("Drained %s pending message(s) before trigger.", drained)
 
         normalized_mode = (mode or "answer_question").strip().lower()
 
         with self.messages_lock:
             if not self.messages:
-                print("Assistant has no messages to analyze yet.")
+                logger.info("Assistant has no messages to analyze yet.")
                 return False
             snapshot = list(self.messages)
 
@@ -427,7 +430,7 @@ The user is in a live meeting and shares raw transcript snippets. Treat earlier 
             self.executor.submit(self._answer, timestamp, snapshot, normalized_mode)
             return True
         except Exception as e:
-            print(f"Failed to trigger assistant answer: {e}")
+            logger.error("Failed to trigger assistant answer: %s", e)
             return False
     
     def trigger_custom_prompt_answer(self) -> bool:
@@ -445,11 +448,11 @@ The user is in a live meeting and shares raw transcript snippets. Treat earlier 
         Returns:
             Dictionary with 'title' and 'summary' keys, or None if generation fails
         """
-        print("Generating meeting summary...")
+        logger.info("Generating meeting summary...")
         if meeting_title:
-            print(f"Using meeting title from Teams: {meeting_title}")
+            logger.info("Using meeting title from Teams: %s", meeting_title)
         if context:
-            print(f"Using context information: {len(context)} characters")
+            logger.info("Using context information: %s characters", len(context))
         
         url = "https://api.openai.com/v1/responses"
         headers = {
@@ -488,11 +491,11 @@ The title should be professional and descriptive. Only return the title text, no
         input_text = f"{meeting_context}Meeting transcript:\n\n{transcript}"
         
         # Log what we're sending
-        print(f"Generating summary with input length: {len(input_text)} characters")
+        logger.info("Generating summary with input length: %s characters", len(input_text))
         if meeting_title:
-            print(f"Including meeting title in context: '{meeting_title}'")
+            logger.info("Including meeting title in context: '%s'", meeting_title)
         else:
-            print("No meeting title available from Teams window")
+            logger.info("No meeting title available from Teams window")
         
         summary_payload = {
             "model": self.model or "gpt-5.2",
@@ -518,9 +521,9 @@ The title should be professional and descriptive. Only return the title text, no
             if not (200 <= resp.status_code < 300):
                 try:
                     err = resp.json()
-                    print("Summary API error:", json.dumps(err, indent=2)[:2000])
+                        logger.error("Summary API error: %s", json.dumps(err, indent=2)[:2000])
                 except Exception:
-                    print("Summary API error (raw):", (resp.text or "")[:2000])
+                        logger.error("Summary API error (raw): %s", (resp.text or "")[:2000])
                 return None
             
             data = resp.json()
@@ -528,22 +531,22 @@ The title should be professional and descriptive. Only return the title text, no
             
             summary = self._extract_text_from_response(data)
             if not summary or not summary.strip():
-                print("No summary text extracted from response")
+                logger.warning("No summary text extracted from response")
                 return None
             
-            print("Meeting summary generated successfully")
+            logger.info("Meeting summary generated successfully")
                 
         except Exception as e:
-            print(f"Error generating summary: {e}")
+            logger.exception("Error generating summary: %s", e)
             return None
         
         # Use meeting title directly if available, otherwise generate with AI
         if meeting_title and meeting_title.strip():
             title = meeting_title.strip()
-            print(f"Using meeting title from Teams: {title}")
+            logger.info("Using meeting title from Teams: %s", title)
         else:
             # Generate a concise title based on the summary using a small/fast model
-            print("No meeting title detected, generating title from summary...")
+            logger.info("No meeting title detected, generating title from summary...")
             title_context_parts = []
             if context:
                 title_context_parts.append(f"Background context: {context[:500]}")  # Limit context for title
@@ -575,9 +578,9 @@ Only return the title text, nothing else. Do not use quotes."""
                         title = extracted_title.strip()
                         # Clean up quotes if AI added them
                         title = title.strip('"').strip("'").strip()
-                        print(f"Generated title from summary: {title}")
+                        logger.info("Generated title from summary: %s", title)
             except Exception as e:
-                print(f"Error generating title: {e}")
+                logger.warning("Error generating title: %s", e)
         
         return {
             "title": title,

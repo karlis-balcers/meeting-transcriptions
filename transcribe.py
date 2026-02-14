@@ -12,6 +12,7 @@ import tkinter as tk
 from threading import Thread, Event, Lock
 from queue import Queue, Empty
 import signal
+import logging
 from datetime import datetime
 from dotenv import load_dotenv
 import numpy as np
@@ -23,8 +24,12 @@ import re
 import assistant
 #import fastwhisper_transcribe
 import openai_transcribe
+from logging_utils import setup_logging
 
-print("Loading configuration from '.env' file...")
+setup_logging(app_name="meeting-transcriptions", log_dir=os.path.join("output", "logs"))
+logger = logging.getLogger("transcribe")
+
+logger.info("Loading configuration from '.env' file...")
 
 
 def _env_str(name: str, default: str | None = None) -> str | None:
@@ -67,24 +72,24 @@ def _env_bool(name: str, default: bool, warnings: list[str]) -> bool:
 
 
 def _print_startup_summary() -> None:
-    print("\n=== Startup Configuration Summary ===")
-    print(f"Platform: {sys.platform}")
-    print(f"User name: {g_my_name}")
-    print(f"Language: {g_language}")
-    print(f"Manual interrupt enabled: {g_interupt_manually}")
-    print(f"Transcript model: {g_openai_model_for_transcript}")
-    print(f"Keywords configured: {'yes' if g_keywords else 'no'}")
-    print(f"OpenAI API key configured: {'yes' if g_open_api_key else 'no'}")
-    print(f"Assistant enabled: {'yes' if g_assistant else 'no'}")
-    print(f"Vector store configured: {'yes' if g_vector_store_id else 'no'}")
-    print(f"Teams integration available: {'yes' if g_ms_teams_app is not None else 'no'}")
+    logger.info("=== Startup Configuration Summary ===")
+    logger.info("Platform: %s", sys.platform)
+    logger.info("User name: %s", g_my_name)
+    logger.info("Language: %s", g_language)
+    logger.info("Manual interrupt enabled: %s", g_interupt_manually)
+    logger.info("Transcript model: %s", g_openai_model_for_transcript)
+    logger.info("Keywords configured: %s", 'yes' if g_keywords else 'no')
+    logger.info("OpenAI API key configured: %s", 'yes' if g_open_api_key else 'no')
+    logger.info("Assistant enabled: %s", 'yes' if g_assistant else 'no')
+    logger.info("Vector store configured: %s", 'yes' if g_vector_store_id else 'no')
+    logger.info("Teams integration available: %s", 'yes' if g_ms_teams_app is not None else 'no')
     if g_startup_warnings:
-        print("Warnings:")
+        logger.warning("Startup warnings detected:")
         for warning in g_startup_warnings:
-            print(f"  - {warning}")
+            logger.warning("  - %s", warning)
     else:
-        print("Warnings: none")
-    print("=====================================\n")
+        logger.info("Warnings: none")
+    logger.info("=====================================")
 
 
 # Constants
@@ -120,11 +125,11 @@ g_startup_warnings: list[str] = []
 g_my_name = _env_str("YOUR_NAME", "You")
 if g_my_name == "You":
     g_startup_warnings.append("YOUR_NAME is missing in .env. Using fallback name 'You'.")
-print(f"Your name is: {g_my_name}")
+logger.info("Your name is: %s", g_my_name)
 AGENT_NAME="Agent"
 
 g_language = _env_str("LANGUAGE", "en")
-print(f"Language: {g_language}")
+logger.info("Language: %s", g_language)
 
 g_open_api_key = _env_str("OPENAI_API_KEY")
 if not g_open_api_key:
@@ -146,9 +151,9 @@ if g_open_api_key:
             answer_queue=g_transcriptions_in,
         )
         if g_vector_store_id:
-            print(f"Assistant configured with vector store ID: {g_vector_store_id}")
+            logger.info("Assistant configured with vector store ID: %s", g_vector_store_id)
         else:
-            print("Assistant configured without vector store.")
+            logger.info("Assistant configured without vector store.")
     except Exception as e:
         g_startup_warnings.append(f"Assistant initialization failed: {e}")
 else:
@@ -162,17 +167,17 @@ summary_button = None
 g_keywords = None
 g_keywords = _env_str("KEYWORDS")
 if g_keywords:
-    print(f"Using keywords for initial prompt: {g_keywords}")
+    logger.info("Using keywords for initial prompt: %s", g_keywords)
 
 g_agent_font_size = _env_int("AGENT_FONT_SIZE", 14, g_startup_warnings)
-print(f"Agent font size: {g_agent_font_size}")
+logger.info("Agent font size: %s", g_agent_font_size)
 
 g_default_font_size = _env_int("DEFAULT_FONT_SIZE", 10, g_startup_warnings)
-print(f"Default font size: {g_default_font_size}")
+logger.info("Default font size: %s", g_default_font_size)
 
 g_transcript_ai = None
 g_openai_model_for_transcript = _env_str("OPENAI_MODEL_FOR_TRANSCRIPT", "gpt-4o-mini-transcribe")
-print(f"Using OpenAI model for transcript: {g_openai_model_for_transcript}")
+logger.info("Using OpenAI model for transcript: %s", g_openai_model_for_transcript)
 try:
     g_transcript_ai = openai_transcribe.OpenAITranscribe(
         model=g_openai_model_for_transcript,
@@ -219,9 +224,9 @@ for file in os.listdir(g_output_dir):
         file_path = os.path.join(g_output_dir, file)
         try:
             os.remove(file_path)
-            print(f"Deleted old file: {file_path}")
+            logger.info("Deleted old file: %s", file_path)
         except Exception as e:
-            print(f"Error deleting file {file_path}: {e}")
+            logger.warning("Error deleting file %s: %s", file_path, e)
 
 # Clear the file and initialize the transcription log
 g_trans_file_name = f"{g_output_dir}/transcription-{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
@@ -299,9 +304,9 @@ def get_ms_teams_window_title():
                 with g_speaker_state_lock:
                     g_meeting_title = title
                 if old_title is None:
-                    print(f"[Teams] Meeting title detected: '{title}'")
+                    logger.info("[Teams] Meeting title detected: '%s'", title)
                 else:
-                    print(f"[Teams] Meeting title updated: '{old_title}' -> '{title}'")
+                    logger.info("[Teams] Meeting title updated: '%s' -> '%s'", old_title, title)
                 return title
             elif title:
                 # Same title as before, don't log but return it
@@ -348,7 +353,7 @@ def get_speaker_name():
             new_title = get_ms_teams_window_title()
             previous_title = _get_meeting_title_snapshot()
             if new_title and new_title != previous_title:
-                print(f"[Teams] Detected new meeting: {new_title}")
+                logger.info("[Teams] Detected new meeting: %s", new_title)
         
         data = inspect_ms_teams()
         if data:
@@ -384,7 +389,7 @@ def get_speaker_name():
 
         previous_speaker, current_speaker = _set_current_speaker(detected_speaker)
         if previous_speaker != current_speaker:
-            print(f"New speaker: {current_speaker} (was {previous_speaker})")
+            logger.info("New speaker: %s (was %s)", current_speaker, previous_speaker)
             if previous_speaker:
                 with flush_letter_lock:
                     flush_letter_mic = '_'
@@ -397,12 +402,12 @@ def toggle_mute():
     global mute_button
     if mute_mic_event.is_set():
         mute_mic_event.clear()
-        print("[UI] Microphone unmuted")
+        logger.info("[UI] Microphone unmuted")
         root.title("Live Audio Chat")
         mute_button.config(text="Mute Mic", bg="#ff6b6b")  # Red when ready to mute
     else:
         mute_mic_event.set()
-        print("[UI] Microphone muted")
+        logger.info("[UI] Microphone muted")
         root.title("Live Audio Chat - MIC MUTED")
         mute_button.config(text="Unmute Mic", bg="#2ecc40")  # Green when muted (ready to unmute)
 
@@ -418,7 +423,7 @@ def reset_log_file():
         with open(new_filename, "w") as f:
             f.write(f"== Transcription Log ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')}) ==\n\n")
         g_trans_file_name = new_filename
-        print(f"[UI] Reset log file to: {g_trans_file_name}")
+        logger.info("[UI] Reset log file to: %s", g_trans_file_name)
         
         # Clear current transcription display
         with g_transcription_lock:
@@ -429,7 +434,7 @@ def reset_log_file():
         root.after(0, update_chat)
         
     except Exception as e:
-        print(f"[UI] Error creating new log file: {e}")
+        logger.error("[UI] Error creating new log file: %s", e)
 
 
 def load_context_file():
@@ -440,26 +445,26 @@ def load_context_file():
             with open(context_file, 'r', encoding='utf-8') as f:
                 context = f.read().strip()
             if context:
-                print(f"[Context] Loaded {len(context)} characters from {context_file}")
+                logger.info("[Context] Loaded %s characters from %s", len(context), context_file)
                 return context
         except Exception as e:
-            print(f"[Context] Error loading {context_file}: {e}")
+            logger.warning("[Context] Error loading %s: %s", context_file, e)
     else:
-        print(f"[Context] No context file found at {context_file}")
+        logger.info("[Context] No context file found at %s", context_file)
     return None
 
 def send_custom_prompt():
     """Send a custom prompt from the user to the assistant."""
     if not g_assistant:
-        print("[UI] Assistant is not available; cannot send prompt.")
+        logger.warning("[UI] Assistant is not available; cannot send prompt.")
         return
     
     prompt_text = custom_prompt_entry.get().strip()
     if not prompt_text:
-        print("[UI] Empty prompt, nothing to send.")
+        logger.info("[UI] Empty prompt, nothing to send.")
         return
     
-    print(f"[UI] Sending custom prompt: {prompt_text}")
+    logger.info("[UI] Sending custom prompt.")
     timestamp = time.time()
     
     # Add the custom prompt as a user message
@@ -471,24 +476,24 @@ def send_custom_prompt():
     # Trigger the assistant to answer
     success = g_assistant.trigger_custom_prompt_answer()
     if not success:
-        print("[UI] Assistant was unable to generate a response to custom prompt.")
+        logger.warning("[UI] Assistant was unable to generate a response to custom prompt.")
 
 def generate_summary():
     """Generate a detailed meeting summary using AI and save to markdown file."""
     global summary_button
     
     if not g_assistant:
-        print("[UI] Assistant is not available; cannot generate summary.")
+        logger.warning("[UI] Assistant is not available; cannot generate summary.")
         return
     
     with g_transcription_lock:
         transcription_snapshot = list(g_transcription)
 
     if not transcription_snapshot:
-        print("[UI] No transcription available to summarize.")
+        logger.info("[UI] No transcription available to summarize.")
         return
     
-    print("[UI] Generating meeting summary...")
+    logger.info("[UI] Generating meeting summary...")
     if summary_button:
         summary_button.config(state=tk.DISABLED, text="Generating...")
     
@@ -506,9 +511,9 @@ def generate_summary():
             # Generate summary with title
             meeting_title_snapshot = _get_meeting_title_snapshot()
             if meeting_title_snapshot:
-                print(f"[UI] Passing meeting title to AI: '{meeting_title_snapshot}'")
+                logger.info("[UI] Passing meeting title to AI: '%s'", meeting_title_snapshot)
             else:
-                print("[UI] No meeting title detected, generating without title context")
+                logger.info("[UI] No meeting title detected, generating without title context")
             summary_data = g_assistant.generate_meeting_summary(transcript, meeting_title=meeting_title_snapshot, context=context)
             
             if summary_data:
@@ -528,11 +533,11 @@ def generate_summary():
                     f.write(f"**Date:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
                     f.write(summary)
                 
-                print(f"[UI] Summary saved to: {filename}")
+                logger.info("[UI] Summary saved to: %s", filename)
             else:
-                print("[UI] Failed to generate summary.")
+                logger.warning("[UI] Failed to generate summary.")
         except Exception as e:
-            print(f"[UI] Error generating summary: {e}")
+            logger.exception("[UI] Error generating summary: %s", e)
         finally:
             if summary_button:
                 root.after(0, lambda: summary_button.config(state=tk.NORMAL, text="Generate Summary"))
@@ -600,9 +605,9 @@ def setup_ui():
     
     # Bind extra events to see when the window is being hidden/destroyed.
     def on_destroy(event):
-        print("[Tkinter] Window destroy event triggered:", event)
+        logger.debug("[Tkinter] Window destroy event triggered: %s", event)
     def on_unmap(event):
-        print("[Tkinter] Window unmap (hidden) event triggered:", event)
+        logger.debug("[Tkinter] Window unmap (hidden) event triggered: %s", event)
     root.bind("<Destroy>", on_destroy)
     root.bind("<Unmap>", on_unmap)
     '''
@@ -622,7 +627,7 @@ def setup_ui():
         with flush_letter_lock:
             flush_letter_mic = event.char
             flush_letter_out = event.char
-        print(f"[UI] Key '{event.char}' pressed. Flushing current audio buffers.")
+        logger.debug("[UI] Key '%s' pressed. Flushing current audio buffers.", event.char)
 
     if g_interupt_manually and not g_assistant:
         for key in "abcdefghijklmnopqrstuvwxyz":
@@ -630,7 +635,7 @@ def setup_ui():
             root.bind(f"<KeyPress-{key.upper()}>", on_key_press)  # Also bind uppercase versions
     #--------------
     root.protocol("WM_DELETE_WINDOW", stop_recording)
-    print("[GUI] UI setup complete.")
+    logger.info("[GUI] UI setup complete.")
     
     return root
 
@@ -665,16 +670,16 @@ def update_chat():
 
 # Audio Recording Functions
 def store_audio_stream(queue, filename_suffix, device_info, from_microphone):
-    print(f"[{filename_suffix}] store_audio_stream started.")
+    logger.info("[%s] store_audio_stream started.", filename_suffix)
     while not stop_event.is_set():
         try:
             #print(f"[{filename_suffix}] Waiting for frames from queue...")
             frames, letter, start_time = queue.get(block=True, timeout=1)
-            print(f"[{filename_suffix}] Got {len(frames)} frames.")
+            logger.debug("[%s] Got %s frames.", filename_suffix, len(frames))
         except Empty:
             continue
         except Exception as e:
-            print(f"[{filename_suffix}] Exception while getting frames: {e}")
+            logger.warning("[%s] Exception while getting frames: %s", filename_suffix, e)
             continue
         
         filename = f'output/{start_time:.2f}-{filename_suffix}.wav'
@@ -684,34 +689,34 @@ def store_audio_stream(queue, filename_suffix, device_info, from_microphone):
                 wf.setsampwidth(g_sample_size)
                 wf.setframerate(int(device_info["defaultSampleRate"]))
                 wf.writeframes(b"".join(frames))
-            print(f"[{filename_suffix}] Wrote audio to {filename}.")
+            logger.debug("[%s] Wrote audio to %s.", filename_suffix, filename)
         except Exception as e:
-            print(f"[{filename_suffix}] Error writing WAV file: {e}")
+            logger.error("[%s] Error writing WAV file: %s", filename_suffix, e)
             continue
 
         transcribe_and_display(filename, filename_suffix == "in", letter)
         try:
             os.remove(filename)
-            print(f"[{filename_suffix}] Removed temporary file {filename}.")
+                logger.debug("[%s] Removed temporary file %s.", filename_suffix, filename)
         except Exception as e:
-            print(f"[{filename_suffix}] Error removing file {filename}: {e}")
+                logger.warning("[%s] Error removing file %s: %s", filename_suffix, filename, e)
 
-    print(f"[{filename_suffix}] store_audio_stream exiting.")
+            logger.info("[%s] store_audio_stream exiting.", filename_suffix)
 
 def collect_from_stream(queue, input_device, p_instance, from_microphone):
     global g_sample_size
     global flush_letter_mic, flush_letter_out
-    print(f"[{input_device['name']}] Starting collect_from_stream...")
+    logger.info("[%s] Starting collect_from_stream...", input_device['name'])
     try:
-        print(f"[{input_device['name']}] About to open audio stream...")
+        logger.info("[%s] About to open audio stream...", input_device['name'])
         frame_rate = int(input_device["defaultSampleRate"])
-        print(f"[{input_device['name']}] Opened audio stream at {frame_rate} Hz.")
-        print(f"[{input_device['name']}] Input channels: {input_device['maxInputChannels']}")
-        print(f"[{input_device['name']}] Sample size (bytes): {p_instance.get_sample_size(pyaudio.paInt16)}")
-        print(f"[{input_device['name']}] Sample format: {pyaudio.paInt16}")
-        print(f"[{input_device['name']}] Chunk size: {int(frame_rate * 0.1)} samples")
-        print(f"[{input_device['name']}] Frames per buffer: {int(frame_rate * 0.1)} samples")
-        print(f"[{input_device['name']}] Input device index: {input_device['index']}")
+        logger.info("[%s] Opened audio stream at %s Hz.", input_device['name'], frame_rate)
+        logger.debug("[%s] Input channels: %s", input_device['name'], input_device['maxInputChannels'])
+        logger.debug("[%s] Sample size (bytes): %s", input_device['name'], p_instance.get_sample_size(pyaudio.paInt16))
+        logger.debug("[%s] Sample format: %s", input_device['name'], pyaudio.paInt16)
+        logger.debug("[%s] Chunk size: %s samples", input_device['name'], int(frame_rate * 0.1))
+        logger.debug("[%s] Frames per buffer: %s samples", input_device['name'], int(frame_rate * 0.1))
+        logger.debug("[%s] Input device index: %s", input_device['name'], input_device['index'])
         FRAME_DURATION_MS = 100
         chunk_size = int(frame_rate * FRAME_DURATION_MS / 1000)  # 20 ms worth of samples
         with p_instance.open(format=pyaudio.paInt16,
@@ -720,12 +725,12 @@ def collect_from_stream(queue, input_device, p_instance, from_microphone):
                              frames_per_buffer=chunk_size,
                              input=True,
                              input_device_index=input_device["index"]) as stream:
-            print(f"[{input_device['name']}] Audio stream opened successfully.")
+            logger.info("[%s] Audio stream opened successfully.", input_device['name'])
             g_sample_size = p_instance.get_sample_size(pyaudio.paInt16)
-            print(f"Global sample size: {g_sample_size}")
+            logger.debug("Global sample size: %s", g_sample_size)
             frames = []
             start_time = time.time()
-            print(f"[{input_device['name']}] Starting to read data...")
+            logger.info("[%s] Starting to read data...", input_device['name'])
             silence_start_time = None
             silence_frame_count = 0
             while not stop_event.is_set():
@@ -762,7 +767,7 @@ def collect_from_stream(queue, input_device, p_instance, from_microphone):
                                 frames = frames[-frames_to_remove:]
                                 start_time = time.time() - (frames_to_remove*FRAME_DURATION_MS)/1000
                             elif last_letter != '_':
-                                print(f"[{input_device['name']}] Manual split triggered; flushing {len(frames)} frames.")
+                                logger.info("[%s] Manual split triggered; flushing %s frames.", input_device['name'], len(frames))
                                 _set_current_speaker(last_letter)
                                 queue.put((frames.copy(), last_letter, start_time))
                                 frames = []
@@ -796,18 +801,18 @@ def collect_from_stream(queue, input_device, p_instance, from_microphone):
                     #-- Time check
                     # If we've reached the RECORD_SECONDS duration, flush automatically.
                     if len(frames) >= int((frame_rate * RECORD_SECONDS) / chunk_size):
-                        print(f"[{input_device['name']}] Auto split after reaching {RECORD_SECONDS} seconds; queueing {len(frames)} frames.")
+                        logger.info("[%s] Auto split after reaching %s seconds; queueing %s frames.", input_device['name'], RECORD_SECONDS, len(frames))
                         _, current_speaker_snapshot = _get_speaker_snapshot()
                         queue.put((frames.copy(), current_speaker_snapshot, start_time))
                         frames = []
                         silence_frame_count=0
                 except Exception as e:
-                    print(f"[{input_device['name']}] Error reading from stream: {e}")
+                    logger.warning("[%s] Error reading from stream: %s", input_device['name'], e)
                     break
-            print(f"[{input_device['name']}] Exiting reading loop.")
+            logger.info("[%s] Exiting reading loop.", input_device['name'])
     except Exception as e:
-        print(f"[{input_device.get('name', 'Unknown')}] Failed to open audio stream: {e}")
-    print(f"[{input_device.get('name', 'Unknown')}] collect_from_stream exiting.")
+        logger.error("[%s] Failed to open audio stream: %s", input_device.get('name', 'Unknown'), e)
+    logger.info("[%s] collect_from_stream exiting.", input_device.get('name', 'Unknown'))
 
 def transcribe_and_display(file, from_microphone, letter):
     global g_transcription
@@ -815,7 +820,7 @@ def transcribe_and_display(file, from_microphone, letter):
         letter = "?"
     #print(f"[Transcribe] Starting transcription for {file}.")
     file_size = os.path.getsize(file)  # Size in bytes
-    print(f"[Transcribe] File size: {file_size / (1024 * 1024):.2f} MB")
+    logger.debug("[Transcribe] File size: %.2f MB", file_size / (1024 * 1024))
     try:
         start_time = float(file.split("/")[-1].split("-")[0])
         segments = g_transcript_ai.transcribe(file)
@@ -834,7 +839,7 @@ def transcribe_and_display(file, from_microphone, letter):
                     continue
                 converted_time = datetime.fromtimestamp(segment.start)
                 #print(converted_time)  # Outputs in a readable format
-                print(f"[{converted_time} -> {segment.end:.2f}] {segment.text}")
+                logger.info("[%s -> %.2f] %s", converted_time, segment.end, segment.text)
                 #root.after(0, update_chat, transcription, letter, from_microphone)
                 if from_microphone:
                     add_transcription(g_my_name, text, start_time + segment.start)
@@ -845,7 +850,7 @@ def transcribe_and_display(file, from_microphone, letter):
                         add_transcription(f"{letter}", text, start_time + segment.start)
 
     except Exception as e:
-        print(f"[Transcribe] Transcription error for {file}: {e}")
+        logger.exception("[Transcribe] Transcription error for %s: %s", file, e)
 
 def add_transcription(user, text, start_time):
     """
@@ -869,8 +874,8 @@ def update_screen_on_new_transcription():
             if user != AGENT_NAME:
                 with open(g_trans_file_name, "a") as f:
                     f.write(f"{user}: {text}\n\n")
-        except:
-            pass
+        except Exception as e:
+            logger.warning("Failed to append transcription to log file %s: %s", g_trans_file_name, e)
         with g_transcription_lock:
             g_transcription.append([user, text, start_time])
             g_transcription = sorted(g_transcription, key=lambda entry: entry[2])
@@ -878,7 +883,7 @@ def update_screen_on_new_transcription():
 
 # Stop Recording
 def stop_recording():
-    print("[Stop] Stop recording triggered!")
+    logger.info("[Stop] Stop recording triggered!")
     stop_event.set()
     global_audio.terminate()
     root.destroy()
@@ -902,26 +907,26 @@ def initialize_recording():
                 # Fallback: Pick default input/output devices
                 g_device_in = p.get_default_input_device_info()
                 g_device_out = p.get_default_output_device_info()
-        print("[Init] Devices initialized successfully. Recording device:", g_device_in["name"], "Output device:", g_device_out["name"])
+        logger.info("[Init] Devices initialized successfully. Recording device: %s Output device: %s", g_device_in["name"], g_device_out["name"])
     except Exception as e:
-        print(f"[Init] Error initializing devices: {e}")
+        logger.error("[Init] Error initializing devices: %s", e)
         return False
     return True
 
 def handler(signum, frame):
-    print("Ctrl-C was pressed.", flush=True)
+    logger.info("Ctrl-C was pressed.")
     if g_assistant:
         g_assistant.stop()
     stop_recording()
     exit(1)
 
 if __name__ == "__main__":
-    print("[Main] Starting application...")
+    logger.info("[Main] Starting application...")
     signal.signal(signal.SIGINT, handler)
     os.makedirs("output", exist_ok=True)
     root = setup_ui()
     if initialize_recording():
-        print("[Main] Recording initialized. Launching UI.")
+        logger.info("[Main] Recording initialized. Launching UI.")
         threads = [
             Thread(target=store_audio_stream, args=(g_recordings_in, "in", g_device_in, True)),
             Thread(target=store_audio_stream, args=(g_recordings_out, "out", g_device_out, False)),
@@ -932,18 +937,18 @@ if __name__ == "__main__":
         ]
         for thread in threads:
             thread.start()
-            print(f"[Main] Started thread: {thread.name}")
+            logger.info("[Main] Started thread: %s", thread.name)
 
         try:
-            print("[Main] Starting Tkinter main loop...")
+            logger.info("[Main] Starting Tkinter main loop...")
             root.mainloop()
-            print("[Main] Tkinter loop has exited.")
+            logger.info("[Main] Tkinter loop has exited.")
         except Exception as e:
-            print(f"[Main] Error in Tkinter loop: {e}")
+            logger.exception("[Main] Error in Tkinter loop: %s", e)
 
         for thread in threads:
             thread.join()
-            print(f"[Main] Thread {thread.name} joined.")
-        print("[Main] All threads have finished. Exiting.")
+            logger.info("[Main] Thread %s joined.", thread.name)
+        logger.info("[Main] All threads have finished. Exiting.")
     else:
-        print("[Main] Failed to initialize recording. Exiting...")
+        logger.error("[Main] Failed to initialize recording. Exiting...")
