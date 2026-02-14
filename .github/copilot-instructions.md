@@ -10,10 +10,12 @@ This is a real-time meeting transcription and AI assistant application designed 
 - Speaker identification from Microsoft Teams windows
 - AI assistant integration with knowledge base (vector store)
 - Tkinter-based GUI for displaying transcriptions
+- Start/Stop-based recording lifecycle where each Start creates a fresh transcript session
 - Automatic silence detection and audio segmentation
 - Multi-threaded architecture for concurrent processing
 - AI-powered meeting summary generation with auto-generated titles
 - Context-aware summaries using background information from context.md
+- Configurable internet search usage for assistant answers to user-entered prompts
 
 ## Technology Stack
 
@@ -50,6 +52,7 @@ The application uses a producer-consumer pattern with multiple threads:
 - Queue-based communication between threads
 - GUI management and event handling
 - Speaker name extraction from Teams
+- Settings dialog that persists configuration into `.env`
 
 #### `openai_transcribe.py` (Transcription)
 - OpenAI Whisper API integration
@@ -58,12 +61,13 @@ The application uses a producer-consumer pattern with multiple threads:
 - Fake keywords (`LAMPA`, `MEMMEE`) for quality control
 
 #### `assistant.py` (AI Assistant)
-- OpenAI chat completions integration
+- OpenAI Responses API integration
 - Vector store knowledge base queries
 - Concurrent answer computation (ThreadPoolExecutor)
 - Message batching and processing
 - Custom prompt handling for user-initiated questions
 - Meeting summary generation with AI-generated titles
+- Optional web search tool for custom prompts (`ASSISTANT_ENABLE_WEB_SEARCH_FOR_CUSTOM_PROMPTS`)
 
 #### `segment.py` (Data Model)
 - Simple data class for transcription segments
@@ -76,9 +80,15 @@ The application uses a producer-consumer pattern with multiple threads:
 YOUR_NAME=<Your name for speaker identification>
 LANGUAGE=en
 INTERUPT_MANUALLY=True
+AUTO_START_TRANSCRIPTION=False
+AUTO_SUMMARIZE_ON_STOP=False
+ASSISTANT_ENABLE_WEB_SEARCH_FOR_CUSTOM_PROMPTS=True
 OPENAI_API_KEY=<Your OpenAI API key>
+OPENAI_MODEL_FOR_ASSISTANT=gpt-5.2
 OPENAI_VECTOR_STORE_ID_FOR_ANSWERS=vs_* # Optional, for assistant
 OPENAI_MODEL_FOR_TRANSCRIPT=gpt-4o-mini-transcribe # or gpt-4o-transcribe
+OUTPUT_DIR=output
+SUMMARIES_DIR=output_summaries
 KEYWORDS="Cat, Mouse, Dog" # Domain-specific terms for better transcription
 ```
 
@@ -93,7 +103,7 @@ KEYWORDS="Cat, Mouse, Dog" # Domain-specific terms for better transcription
 1. **Follow existing patterns** - Match the threading and queue-based architecture
 2. **Platform-aware code** - Use `sys.platform == "win32"` checks for Windows-specific features
 3. **Error handling** - Wrap API calls and file operations in try-except blocks
-4. **Logging** - Use `print()` for key events (consider moving to proper logging module)
+4. **Logging** - Use structured `logging` (do not add new `print()` diagnostics unless temporary)
 5. **Thread safety** - Use `Lock()` for shared state, prefer queue-based communication
 
 ### Naming Conventions
@@ -110,9 +120,9 @@ KEYWORDS="Cat, Mouse, Dog" # Domain-specific terms for better transcription
 
 ### Audio File Handling
 - Store temporary files in `output/` directory
-- Use ISO timestamp format: `transcription-YYYYMMDD_HHMMSS.txt`
+- Use timestamp format: `transcription-YYYYMMDD_HHMMSS.md`
 - Clean up WAV files after transcription
-- Keep text transcripts for future reference
+- Keep Markdown transcripts for future reference
 - Store meeting summaries in `output_summaries/` as Markdown files
 - Summary filenames format: `YYYYMMDD_HHMMSS_ai_generated_title.md`
 - Load context from `context.md` for enhanced summary generation
@@ -141,6 +151,8 @@ KEYWORDS="Cat, Mouse, Dog" # Domain-specific terms for better transcription
 3. Update UI from threads using `text.after()` or queue-based updates
 4. Test responsiveness during heavy transcription workloads
 5. The GUI includes a custom prompt entry field for user questions during meetings
+6. Keep the main window minimal: no separate reset action; Start already creates a new transcript session
+7. Keep summary generation out of the main toolbar button set; use auto-summary settings/flows
 
 ## API Integration Notes
 
@@ -150,11 +162,12 @@ KEYWORDS="Cat, Mouse, Dog" # Domain-specific terms for better transcription
 - **Prompt engineering**: Use `keywords` parameter for domain-specific terms
 - **Filtering**: Remove artifacts using fake keywords and special patterns
 
-### OpenAI Chat Completions (Assistant)
-- **Model**: Currently hardcoded to `gpt-5-mini` in `assistant.py`
+### OpenAI Responses API (Assistant)
+- **Model**: Configurable via `OPENAI_MODEL_FOR_ASSISTANT` (default sample value: `gpt-5.2`)
 - **Vector stores**: Optional knowledge base integration
 - **Concurrency**: Up to 5 concurrent answer computations
 - **Message batching**: Groups up to 5 messages for efficiency
+- **Custom prompt web search**: Controlled by `ASSISTANT_ENABLE_WEB_SEARCH_FOR_CUSTOM_PROMPTS`
 
 ## Testing & Debugging
 
@@ -221,8 +234,8 @@ KEYWORDS="Cat, Mouse, Dog" # Domain-specific terms for better transcription
 3. **Speaker diarization** - Implement ML-based speaker identification
 4. **Export formats** - Add JSON, SRT, VTT export options
 5. **Cloud storage** - Integration with S3, OneDrive, etc.
-6. **Logging** - Replace print statements with proper logging framework
-7. **Configuration UI** - GUI for editing settings instead of .env file
+6. **Logging polish** - Further enrich structured logs and telemetry
+7. **Configuration UX** - Expand settings UI coverage and validation
 8. **Multi-language support** - Better handling of non-English meetings
 
 ### Known Limitations
