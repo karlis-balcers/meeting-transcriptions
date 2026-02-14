@@ -9,6 +9,7 @@ import time
 import wave
 import os
 import tkinter as tk
+from tkinter import ttk, filedialog
 from threading import Thread, Event, Lock
 from queue import Queue, Empty
 import signal
@@ -96,6 +97,10 @@ def _print_startup_summary() -> None:
     logger.info("Silence threshold: %s", SILENCE_THRESHOLD)
     logger.info("Silence duration: %s", SILENCE_DURATION)
     logger.info("Frame duration (ms): %s", FRAME_DURATION_MS)
+    logger.info("Auto-start transcription: %s", g_auto_start_transcription)
+    logger.info("Auto-summarize on stop: %s", g_auto_summarize_on_stop)
+    logger.info("Transcription output dir: %s", g_output_dir)
+    logger.info("Summary output dir: %s", g_summaries_dir)
     logger.info("Keywords configured: %s", 'yes' if g_keywords else 'no')
     logger.info("OpenAI API key configured: %s", 'yes' if g_open_api_key else 'no')
     logger.info("Assistant enabled: %s", 'yes' if g_assistant else 'no')
@@ -143,6 +148,30 @@ flush_letter_lock = Lock()
 root = None
 status_label = None
 g_speaker_detector = None
+g_recording_threads: list[Thread] = []
+g_is_recording = False
+g_devices_initialized = False
+
+start_stop_button = None
+settings_button = None
+
+g_auto_start_transcription = False
+g_auto_summarize_on_stop = False
+
+g_auto_start_var = None
+g_auto_summarize_var = None
+
+mic_icon_on = None
+mic_icon_off = None
+
+
+def _normalize_transcription_text(text: str) -> str:
+    """Convert escaped newline sequences to real newlines and normalize line endings."""
+    if text is None:
+        return ""
+    normalized = str(text).replace("\\r\\n", "\\n").replace("\\r", "\\n")
+    normalized = normalized.replace("\\\\n", "\n")
+    return normalized
 
 
 def set_status(message: str, level: str = "info"):
@@ -179,6 +208,65 @@ def _assistant_status_callback(message: str, level: str = "info"):
 
 def _transcription_status_callback(message: str, level: str = "info"):
     set_status(f"Transcription: {message}", level)
+
+
+def _save_env_updates(updates: dict[str, str]) -> None:
+    env_path = ".env"
+    lines: list[str] = []
+    if os.path.exists(env_path):
+        with open(env_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+
+    remaining = dict(updates)
+    new_lines: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in line:
+            new_lines.append(line)
+            continue
+
+        key = line.split("=", 1)[0].strip()
+        if key in remaining:
+            value = str(remaining.pop(key))
+            new_lines.append(f"{key}={value}\n")
+        else:
+            new_lines.append(line)
+
+    for key, value in remaining.items():
+        new_lines.append(f"{key}={value}\n")
+
+    with open(env_path, "w", encoding="utf-8") as f:
+        f.writelines(new_lines)
+
+    for key, value in updates.items():
+        os.environ[key] = str(value)
+
+
+def _drain_queue(q: Queue) -> None:
+    while True:
+        try:
+            q.get_nowait()
+        except Empty:
+            break
+
+
+def _create_transcript_ai() -> openai_transcribe.OpenAITranscribe:
+    return openai_transcribe.OpenAITranscribe(
+        model=g_openai_model_for_transcript,
+        keywords=g_keywords,
+        language=g_language,
+        status_callback=_transcription_status_callback,
+    )
+
+
+def _reinitialize_transcript_ai() -> None:
+    global g_transcript_ai
+    try:
+        g_transcript_ai = _create_transcript_ai()
+        logger.info("Transcription model reinitialized with language=%s model=%s", g_language, g_openai_model_for_transcript)
+    except Exception as e:
+        logger.error("Failed to reinitialize transcription model: %s", e)
+        set_status("Transcription reinit failed", "error")
 
 load_dotenv()  # Load variables from .env file
 
@@ -220,6 +308,8 @@ if not g_open_api_key:
     )
 
 g_interupt_manually = _env_bool("INTERUPT_MANUALLY", True, g_startup_warnings)
+g_auto_start_transcription = _env_bool("AUTO_START_TRANSCRIPTION", False, g_startup_warnings)
+g_auto_summarize_on_stop = _env_bool("AUTO_SUMMARIZE_ON_STOP", False, g_startup_warnings)
 
 g_assistant = None
 g_vector_store_id = _env_str("OPENAI_VECTOR_STORE_ID_FOR_ANSWERS")
@@ -264,23 +354,13 @@ g_transcript_ai = None
 g_openai_model_for_transcript = _env_str("OPENAI_MODEL_FOR_TRANSCRIPT", "gpt-4o-mini-transcribe")
 logger.info("Using OpenAI model for transcript: %s", g_openai_model_for_transcript)
 try:
-    g_transcript_ai = openai_transcribe.OpenAITranscribe(
-        model=g_openai_model_for_transcript,
-        keywords=g_keywords,
-        language=g_language,
-        status_callback=_transcription_status_callback,
-    )
+    g_transcript_ai = _create_transcript_ai()
 except Exception as e:
     g_startup_warnings.append(
         f"Failed to initialize OpenAI transcription model '{g_openai_model_for_transcript}': {e}"
     )
     g_openai_model_for_transcript = "gpt-4o-mini-transcribe"
-    g_transcript_ai = openai_transcribe.OpenAITranscribe(
-        model=g_openai_model_for_transcript,
-        keywords=g_keywords,
-        language=g_language,
-        status_callback=_transcription_status_callback,
-    )
+    g_transcript_ai = _create_transcript_ai()
     g_startup_warnings.append(
         f"Falling back to transcription model '{g_openai_model_for_transcript}'."
     )
@@ -296,12 +376,12 @@ except Exception as e:
     #g_transcript_ai = fastwhisper_transcribe.FastWhisperTranscribe(model_name=local_transcribe_model, device=local_transcribe_device, keywords=g_keywords, language=g_language)
 
 # Check if output dir exists
-g_output_dir = "output"
+g_output_dir = _env_str("OUTPUT_DIR", "output")
 if not os.path.exists(g_output_dir):
     os.makedirs(g_output_dir)
 
 # Check if output_summaries dir exists
-g_summaries_dir = "output_summaries"
+g_summaries_dir = _env_str("SUMMARIES_DIR", "output_summaries")
 if not os.path.exists(g_summaries_dir):
     os.makedirs(g_summaries_dir)
 
@@ -316,10 +396,11 @@ for file in os.listdir(g_output_dir):
             logger.warning("Error deleting file %s: %s", file_path, e)
 
 # Clear the file and initialize the transcription log
-g_trans_file_name = f"{g_output_dir}/transcription-{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+g_trans_file_name = f"{g_output_dir}/transcription-{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
 try:
     with open(g_trans_file_name, "w") as f:
-        f.write(f"== Transcription Log ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')}) ==\n\n")
+        f.write(f"# Transcription Log\n\n")
+        f.write(f"**Created:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
 except Exception as e:
     g_startup_warnings.append(f"Failed to create transcription log file '{g_trans_file_name}': {e}")
 
@@ -364,6 +445,253 @@ def get_speaker_name():
 
     g_speaker_detector.run_detection_loop(on_speaker_changed=on_speaker_changed)
 
+
+def _create_mic_icons():
+    bg = "#f0f0f0"
+    if root:
+        try:
+            raw_bg = root.cget("bg")
+            try:
+                # Convert Tk theme/system color names (e.g., SystemButtonFace) to #RRGGBB.
+                r, g, b = root.winfo_rgb(raw_bg)
+                bg = f"#{r // 256:02x}{g // 256:02x}{b // 256:02x}"
+            except Exception:
+                # If conversion fails, try raw value as-is.
+                bg = raw_bg
+        except Exception:
+            bg = "#f0f0f0"
+
+    on_icon = tk.PhotoImage(width=18, height=18)
+    off_icon = tk.PhotoImage(width=18, height=18)
+    try:
+        on_icon.put(bg, to=(0, 0, 18, 18))
+        off_icon.put(bg, to=(0, 0, 18, 18))
+    except Exception:
+        # Last-resort fallback for environments that reject symbolic colors.
+        on_icon.put("#f0f0f0", to=(0, 0, 18, 18))
+        off_icon.put("#f0f0f0", to=(0, 0, 18, 18))
+
+    # microphone body
+    for x in range(6, 12):
+        for y in range(3, 10):
+            on_icon.put("#1f2937", (x, y))
+            off_icon.put("#1f2937", (x, y))
+    # rounded top hint
+    for x in range(7, 11):
+        on_icon.put("#1f2937", (x, 2))
+        off_icon.put("#1f2937", (x, 2))
+    # stem and base
+    for y in range(10, 14):
+        on_icon.put("#1f2937", (8, y))
+        on_icon.put("#1f2937", (9, y))
+        off_icon.put("#1f2937", (8, y))
+        off_icon.put("#1f2937", (9, y))
+    for x in range(5, 13):
+        on_icon.put("#1f2937", (x, 14))
+        off_icon.put("#1f2937", (x, 14))
+
+    # mute cross line
+    for i in range(3, 15):
+        off_icon.put("#dc2626", (i, i))
+        if i + 1 < 18:
+            off_icon.put("#dc2626", (i + 1, i))
+
+    return on_icon, off_icon
+
+
+def _update_start_stop_button():
+    if not start_stop_button:
+        return
+    if g_is_recording:
+        start_stop_button.config(text="Stop", bg="#e74c3c")
+    else:
+        start_stop_button.config(text="Start", bg="#2ecc71")
+
+
+def _sync_auto_start_var():
+    global g_auto_start_transcription
+    if g_auto_start_var is not None:
+        g_auto_start_transcription = bool(g_auto_start_var.get())
+        _save_env_updates({"AUTO_START_TRANSCRIPTION": "True" if g_auto_start_transcription else "False"})
+
+
+def _open_settings():
+    global g_language, g_auto_summarize_on_stop, g_output_dir, g_summaries_dir
+
+    win = tk.Toplevel(root)
+    win.title("Settings")
+    win.geometry("700x300")
+    win.transient(root)
+    win.grab_set()
+
+    frame = tk.Frame(win)
+    frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+    auto_start_var = tk.BooleanVar(value=g_auto_start_transcription)
+    auto_sum_var = tk.BooleanVar(value=g_auto_summarize_on_stop)
+    lang_var = tk.StringVar(value=g_language or "en")
+    out_var = tk.StringVar(value=g_output_dir)
+    sum_var = tk.StringVar(value=g_summaries_dir)
+
+    row = 0
+    tk.Checkbutton(frame, text="Auto-start transcription when app starts", variable=auto_start_var).grid(row=row, column=0, columnspan=3, sticky="w", pady=4)
+    row += 1
+
+    tk.Label(frame, text="Transcription language").grid(row=row, column=0, sticky="w", pady=4)
+    languages = ["en", "lv", "ru", "de", "fr", "es", "it", "pt", "nl", "pl", "sv", "fi", "et", "lt", "ja", "zh", "ko", "ar", "tr"]
+    lang_combo = ttk.Combobox(frame, values=languages, textvariable=lang_var, state="readonly", width=12)
+    lang_combo.grid(row=row, column=1, sticky="w", pady=4)
+    row += 1
+
+    tk.Checkbutton(frame, text="Automatically summarize transcription when stopped", variable=auto_sum_var).grid(row=row, column=0, columnspan=3, sticky="w", pady=4)
+    row += 1
+
+    tk.Label(frame, text="Transcriptions folder").grid(row=row, column=0, sticky="w", pady=4)
+    tk.Entry(frame, textvariable=out_var, width=60).grid(row=row, column=1, sticky="we", pady=4)
+    tk.Button(frame, text="Browse", command=lambda: out_var.set(filedialog.askdirectory(initialdir=out_var.get() or ".") or out_var.get())).grid(row=row, column=2, padx=4)
+    row += 1
+
+    tk.Label(frame, text="Summaries folder").grid(row=row, column=0, sticky="w", pady=4)
+    tk.Entry(frame, textvariable=sum_var, width=60).grid(row=row, column=1, sticky="we", pady=4)
+    tk.Button(frame, text="Browse", command=lambda: sum_var.set(filedialog.askdirectory(initialdir=sum_var.get() or ".") or sum_var.get())).grid(row=row, column=2, padx=4)
+    row += 1
+
+    frame.grid_columnconfigure(1, weight=1)
+
+    def on_save():
+        global g_language, g_auto_summarize_on_stop, g_output_dir, g_summaries_dir
+        g_language = (lang_var.get() or "en").strip()
+        g_auto_summarize_on_stop = bool(auto_sum_var.get())
+        g_output_dir = out_var.get().strip() or "output"
+        g_summaries_dir = sum_var.get().strip() or "output_summaries"
+
+        os.makedirs(g_output_dir, exist_ok=True)
+        os.makedirs(g_summaries_dir, exist_ok=True)
+
+        if g_auto_start_var is not None:
+            g_auto_start_var.set(bool(auto_start_var.get()))
+        _sync_auto_start_var()
+
+        _save_env_updates(
+            {
+                "AUTO_START_TRANSCRIPTION": "True" if bool(auto_start_var.get()) else "False",
+                "LANGUAGE": g_language,
+                "AUTO_SUMMARIZE_ON_STOP": "True" if g_auto_summarize_on_stop else "False",
+                "OUTPUT_DIR": g_output_dir,
+                "SUMMARIES_DIR": g_summaries_dir,
+            }
+        )
+
+        _reinitialize_transcript_ai()
+        reset_log_file()
+        set_status("Settings saved", "info")
+        win.destroy()
+
+    button_row = tk.Frame(frame)
+    button_row.grid(row=row, column=0, columnspan=3, sticky="e", pady=(10, 0))
+    tk.Button(button_row, text="Save", command=on_save, bg="#2ecc71", fg="white").pack(side=tk.RIGHT, padx=(5, 0))
+    tk.Button(button_row, text="Cancel", command=win.destroy).pack(side=tk.RIGHT)
+
+
+def start_transcription():
+    global g_is_recording, g_recording_threads, g_devices_initialized
+    global flush_letter_mic, flush_letter_out
+    if g_is_recording:
+        return
+
+    if not g_devices_initialized:
+        g_devices_initialized = initialize_recording()
+        if not g_devices_initialized:
+            set_status("Failed to initialize recording devices", "error")
+            return
+
+    stop_event.clear()
+    mute_mic_event.clear()
+    _drain_queue(g_recordings_in)
+    _drain_queue(g_recordings_out)
+    _drain_queue(g_transcriptions_in)
+    with flush_letter_lock:
+        flush_letter_mic = None
+        flush_letter_out = None
+
+    # Every Start begins a brand-new transcript session and file.
+    reset_log_file()
+
+    g_recording_threads = [
+        Thread(target=store_audio_stream, args=(g_recordings_in, "in", g_device_in, True), daemon=True),
+        Thread(target=store_audio_stream, args=(g_recordings_out, "out", g_device_out, False), daemon=True),
+        Thread(target=collect_from_stream, args=(g_recordings_in, g_device_in, global_audio, True), daemon=True),
+        Thread(target=collect_from_stream, args=(g_recordings_out, g_device_out, global_audio, False), daemon=True),
+        Thread(target=get_speaker_name, daemon=True),
+        Thread(target=update_screen_on_new_transcription, daemon=True),
+    ]
+    for t in g_recording_threads:
+        t.start()
+
+    g_is_recording = True
+    _update_start_stop_button()
+    set_status("Transcription started", "info")
+
+
+def stop_transcription(trigger_auto_summary: bool = True):
+    global g_is_recording, g_recording_threads
+    if not g_is_recording:
+        return
+
+    stop_event.set()
+    for t in g_recording_threads:
+        t.join(timeout=2.0)
+    g_recording_threads = []
+    g_is_recording = False
+    _update_start_stop_button()
+    set_status("Transcription stopped", "info")
+
+    if trigger_auto_summary and g_auto_summarize_on_stop and g_assistant:
+        root.after(0, generate_summary)
+
+
+def toggle_start_stop():
+    if g_is_recording:
+        stop_transcription()
+    else:
+        start_transcription()
+
+
+def close_app():
+    logger.info("[UI] Closing application")
+    was_recording = g_is_recording
+    try:
+        stop_transcription(trigger_auto_summary=False)
+    except Exception as e:
+        logger.warning("Failed to stop transcription during close: %s", e)
+
+    if was_recording and g_auto_summarize_on_stop and g_assistant:
+        try:
+            set_status("Summarising transcript...", "info")
+            try:
+                root.update_idletasks()
+                root.update()
+            except Exception:
+                pass
+
+            transcription_snapshot = g_transcript_store.snapshot()
+            if transcription_snapshot:
+                _generate_and_save_summary(transcription_snapshot)
+            else:
+                logger.info("[UI] No transcript to summarize during close.")
+        except Exception as e:
+            logger.warning("Failed to auto-summarize during close: %s", e)
+    try:
+        if g_assistant:
+            g_assistant.stop()
+    except Exception as e:
+        logger.warning("Failed to stop assistant during close: %s", e)
+    try:
+        global_audio.terminate()
+    except Exception:
+        pass
+    root.destroy()
+
 def toggle_mute():
     """Toggle the microphone mute state."""
     global mute_button
@@ -371,24 +699,25 @@ def toggle_mute():
         mute_mic_event.clear()
         logger.info("[UI] Microphone unmuted")
         root.title("Live Audio Chat")
-        mute_button.config(text="Mute Mic", bg="#ff6b6b")  # Red when ready to mute
+        mute_button.config(image=mic_icon_on, bg="#ff6b6b")
     else:
         mute_mic_event.set()
         logger.info("[UI] Microphone muted")
         root.title("Live Audio Chat - MIC MUTED")
-        mute_button.config(text="Unmute Mic", bg="#2ecc40")  # Green when muted (ready to unmute)
+        mute_button.config(image=mic_icon_off, bg="#2ecc40")
 
 def reset_log_file():
     """Reset the transcription log file with a new timestamp."""
     global g_trans_file_name
     
     # Create new filename with current timestamp
-    new_filename = f"{g_output_dir}/transcription-{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    new_filename = f"{g_output_dir}/transcription-{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
     
     # Initialize the new transcription log
     try:
         with open(new_filename, "w") as f:
-            f.write(f"== Transcription Log ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')}) ==\n\n")
+            f.write(f"# Transcription Log\n\n")
+            f.write(f"**Created:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
         g_trans_file_name = new_filename
         logger.info("[UI] Reset log file to: %s", g_trans_file_name)
         
@@ -462,47 +791,10 @@ def generate_summary():
     logger.info("[UI] Generating meeting summary...")
     if summary_button:
         summary_button.config(state=tk.DISABLED, text="Generating...")
-    
+
     def generate_and_save():
         try:
-            # Get the full transcript
-            transcript = ""
-            for entry in transcription_snapshot:
-                user, text, start_time = entry
-                transcript += f"{user}: {text}\n"
-            
-            # Load context file
-            context = load_context_file()
-            
-            # Generate summary with title
-            meeting_title_snapshot = _get_meeting_title_snapshot()
-            if meeting_title_snapshot:
-                logger.info("[UI] Passing meeting title to AI: '%s'", meeting_title_snapshot)
-            else:
-                logger.info("[UI] No meeting title detected, generating without title context")
-            summary_data = g_assistant.generate_meeting_summary(transcript, meeting_title=meeting_title_snapshot, context=context)
-            
-            if summary_data:
-                title = summary_data.get('title', 'Meeting Summary')
-                summary = summary_data.get('summary', '')
-                
-                # Create filename with timestamp and title
-                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                # Sanitize title for filename
-                safe_title = sanitize_title_for_filename(title, max_length=50, default="meeting_summary")
-                filename = f"{g_summaries_dir}/{timestamp}_{safe_title}.md"
-                
-                # Save to file
-                with open(filename, 'w', encoding='utf-8') as f:
-                    f.write(f"# {title}\n\n")
-                    f.write(f"**Date:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-                    f.write(summary)
-                
-                logger.info("[UI] Summary saved to: %s", filename)
-            else:
-                logger.warning("[UI] Failed to generate summary.")
-        except Exception as e:
-            logger.exception("[UI] Error generating summary: %s", e)
+            _generate_and_save_summary(transcription_snapshot)
         finally:
             if summary_button:
                 root.after(0, lambda: summary_button.config(state=tk.NORMAL, text="Generate Summary"))
@@ -511,9 +803,55 @@ def generate_summary():
     Thread(target=generate_and_save, daemon=True).start()
 
 
+def _generate_and_save_summary(transcription_snapshot: list[list]) -> bool:
+    try:
+        # Get the full transcript
+        transcript = ""
+        for entry in transcription_snapshot:
+            user, text, start_time = entry
+            transcript += f"{user}: {text}\n"
+
+        # Load context file
+        context = load_context_file()
+
+        # Generate summary with title
+        meeting_title_snapshot = _get_meeting_title_snapshot()
+        if meeting_title_snapshot:
+            logger.info("[UI] Passing meeting title to AI: '%s'", meeting_title_snapshot)
+        else:
+            logger.info("[UI] No meeting title detected, generating without title context")
+        summary_data = g_assistant.generate_meeting_summary(transcript, meeting_title=meeting_title_snapshot, context=context)
+
+        if summary_data:
+            title = summary_data.get('title', 'Meeting Summary')
+            summary = summary_data.get('summary', '')
+
+            # Create filename with timestamp and title
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            # Sanitize title for filename
+            safe_title = sanitize_title_for_filename(title, max_length=50, default="meeting_summary")
+            filename = f"{g_summaries_dir}/{timestamp}_{safe_title}.md"
+
+            # Save to file
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write(f"# {title}\n\n")
+                f.write(f"**Date:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                f.write(summary)
+
+            logger.info("[UI] Summary saved to: %s", filename)
+            return True
+
+        logger.warning("[UI] Failed to generate summary.")
+        return False
+    except Exception as e:
+        logger.exception("[UI] Error generating summary: %s", e)
+        return False
+
+
 # GUI Setup
 def setup_ui():
     global chat_window, root, mute_button, assistant_buttons, custom_prompt_entry, send_prompt_button, summary_button, status_label
+    global start_stop_button, settings_button, g_auto_start_var, mic_icon_on, mic_icon_off
     
     root = tk.Tk()
     root.title("Live Audio Chat")
@@ -522,23 +860,35 @@ def setup_ui():
     # Create button frame at the top
     button_frame = tk.Frame(root)
     button_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
+
+    start_stop_button = tk.Button(
+        button_frame,
+        text="Start",
+        command=toggle_start_stop,
+        bg="#2ecc71",
+        fg="white",
+        font=("Arial", g_default_font_size, "bold"),
+    )
+    start_stop_button.pack(side=tk.LEFT, padx=(0, 5))
+
+    g_auto_start_var = tk.BooleanVar(value=g_auto_start_transcription)
+    settings_button = tk.Button(
+        button_frame,
+        text="Settings",
+        command=_open_settings,
+        bg="#6c5ce7",
+        fg="white",
+        font=("Arial", g_default_font_size, "bold"),
+    )
+    settings_button.pack(side=tk.LEFT, padx=(0, 5))
+
+    mic_icon_on, mic_icon_off = _create_mic_icons()
     
     # Create Mute button
-    mute_button = tk.Button(button_frame, text="Mute Mic", command=toggle_mute, 
+    mute_button = tk.Button(button_frame, image=mic_icon_on, command=toggle_mute,
                            bg="#ff6b6b", fg="white", font=("Arial", g_default_font_size, "bold"))
     mute_button.pack(side=tk.LEFT, padx=(0, 5))
     
-    # Create Reset button
-    reset_button = tk.Button(button_frame, text="Reset Log", command=reset_log_file,
-                            bg="#4ecdc4", fg="white", font=("Arial", g_default_font_size, "bold"))
-    reset_button.pack(side=tk.LEFT, padx=(0, 5))
-    
-    # Create Generate Summary button
-    if g_assistant:
-        summary_button = tk.Button(button_frame, text="Generate Summary", command=generate_summary,
-                                bg="#9b59b6", fg="white", font=("Arial", g_default_font_size, "bold"))
-        summary_button.pack(side=tk.LEFT, padx=(0, 5))
-
     if g_assistant:
         # Create custom prompt input field
         prompt_frame = tk.Frame(button_frame)
@@ -612,7 +962,7 @@ def setup_ui():
             root.bind(f"<KeyPress-{key}>", on_key_press)
             root.bind(f"<KeyPress-{key.upper()}>", on_key_press)  # Also bind uppercase versions
     #--------------
-    root.protocol("WM_DELETE_WINDOW", stop_recording)
+    root.protocol("WM_DELETE_WINDOW", close_app)
     logger.info("[GUI] UI setup complete.")
     
     return root
@@ -702,6 +1052,7 @@ def add_transcription(user, text, start_time):
     """
     Add a transcription entry to the global transcription list.
     """
+    text = _normalize_transcription_text(text)
     g_transcriptions_in.put((user, text, start_time))
     if g_assistant:
         g_assistant.add_message(start_time+1,f"{user}: {text}")
@@ -719,13 +1070,6 @@ def update_screen_on_new_transcription():
         g_transcript_store.add(user, text, start_time)
         root.after(0, update_chat)
 
-# Stop Recording
-def stop_recording():
-    logger.info("[Stop] Stop recording triggered!")
-    stop_event.set()
-    global_audio.terminate()
-    root.destroy()
-    
 # Initialize Recording
 def initialize_recording():
     try:
@@ -753,43 +1097,29 @@ def initialize_recording():
 
 def handler(signum, frame):
     logger.info("Ctrl-C was pressed.")
-    if g_assistant:
-        g_assistant.stop()
-    stop_recording()
+    close_app()
     exit(1)
 
 def main():
+    global g_devices_initialized
     logger.info("[Main] Starting application...")
     signal.signal(signal.SIGINT, handler)
     os.makedirs("output", exist_ok=True)
     root = setup_ui()
-    if initialize_recording():
-        logger.info("[Main] Recording initialized. Launching UI.")
-        threads = [
-            Thread(target=store_audio_stream, args=(g_recordings_in, "in", g_device_in, True)),
-            Thread(target=store_audio_stream, args=(g_recordings_out, "out", g_device_out, False)),
-            Thread(target=collect_from_stream, args=(g_recordings_in, g_device_in, global_audio, True)),
-            Thread(target=collect_from_stream, args=(g_recordings_out, g_device_out, global_audio, False)),
-            Thread(target=get_speaker_name),
-            Thread(target=update_screen_on_new_transcription),
-        ]
-        for thread in threads:
-            thread.start()
-            logger.info("[Main] Started thread: %s", thread.name)
+    g_devices_initialized = initialize_recording()
+    if not g_devices_initialized:
+        logger.error("[Main] Failed to initialize recording devices. You can still open settings.")
 
-        try:
-            logger.info("[Main] Starting Tkinter main loop...")
-            root.mainloop()
-            logger.info("[Main] Tkinter loop has exited.")
-        except Exception as e:
-            logger.exception("[Main] Error in Tkinter loop: %s", e)
+    _update_start_stop_button()
+    if g_auto_start_transcription:
+        root.after(100, start_transcription)
 
-        for thread in threads:
-            thread.join()
-            logger.info("[Main] Thread %s joined.", thread.name)
-        logger.info("[Main] All threads have finished. Exiting.")
-    else:
-        logger.error("[Main] Failed to initialize recording. Exiting...")
+    try:
+        logger.info("[Main] Starting Tkinter main loop...")
+        root.mainloop()
+        logger.info("[Main] Tkinter loop has exited.")
+    except Exception as e:
+        logger.exception("[Main] Error in Tkinter loop: %s", e)
 
 
 if __name__ == "__main__":

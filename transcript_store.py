@@ -40,9 +40,11 @@ class TranscriptStore:
         if user == self._agent_name:
             return
 
+        normalized_text = str(text).replace("\\r\\n", "\\n").replace("\\r", "\\n").replace("\\\\n", "\n")
+
         try:
             with open(self._file_path, "a", encoding="utf-8") as f:
-                f.write(f"{user}: {text}\\n\\n")
+                f.write(f"{user}: {normalized_text}\n\n")
         except Exception as e:
             self._logger.warning("Failed to append transcript to %s: %s", self._file_path, e)
 
