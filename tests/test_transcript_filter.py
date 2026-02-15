@@ -17,8 +17,8 @@ class TranscriptFilterTests(unittest.TestCase):
         self.assertEqual(reason, "regex-rule")
 
     def test_keeps_text_with_keywords(self):
-        f = TranscriptFilter(keywords="Paymentology, Flexpay")
-        should_filter, reason = f.should_filter("We discussed Flexpay integration timelines")
+        f = TranscriptFilter(keywords="Acme, WidgetPro")
+        should_filter, reason = f.should_filter("We discussed WidgetPro integration timelines")
         self.assertFalse(should_filter)
         self.assertEqual(reason, "contains-keyword")
 
