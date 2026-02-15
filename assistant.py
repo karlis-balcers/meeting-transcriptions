@@ -18,6 +18,25 @@ import requests
 
 logger = logging.getLogger("assistant")
 
+DEFAULT_ASSISTANT_MODEL = "gpt-5.1-mini"
+DEFAULT_SYSTEM_PROMPT_BASE_TEMPLATE = """You are helping user with name '{your_name}'.
+The user is in a live meeting and shares raw transcript snippets. Treat earlier messages as context but focus your reply on the most recent entry. Keep responses in plain text (no Markdown) and limit yourself to at most three sentences. Do not include document references, filenames, or URLs. Avoid repeating previous guidance."""
+DEFAULT_MODE_DIRECTIVES: dict[str, str] = {
+    "answer_question": "Address the most recent message directly. When you need additional context, perform a file search before responding. If the message is not a question or you lack sufficient information, reply with '---'. Do not ask the user follow-up questions.",
+    "suggest_questions": "Produce one to three concise questions the user could ask next, each on its own line. Use available context and perform a file search first if it helps craft better prompts.",
+    "explain_it": "Explain key concepts, decisions, or reasoning referenced in the latest message so the user understands them quickly. Draw on file search when needed. Provide clear, practical insight within three sentences.",
+    "get_facts": "Investigate the latest message by performing an up-to-date internet search along with any relevant file search. Return a brief factual summary that highlights the most relevant information you find.",
+    "custom_prompt": "The user has asked a specific question during the meeting. Address their question directly and comprehensively. Perform a file search or web search if additional information would help. Provide a clear, actionable answer.",
+}
+PROMPT_ENV_KEYS: dict[str, str] = {
+    "base": "ASSISTANT_PROMPT_BASE",
+    "answer_question": "ASSISTANT_PROMPT_ANSWER_QUESTION",
+    "suggest_questions": "ASSISTANT_PROMPT_SUGGEST_QUESTIONS",
+    "explain_it": "ASSISTANT_PROMPT_EXPLAIN_IT",
+    "get_facts": "ASSISTANT_PROMPT_GET_FACTS",
+    "custom_prompt": "ASSISTANT_PROMPT_CUSTOM_PROMPT",
+}
+
 
 @dataclass
 class Message:
@@ -48,7 +67,7 @@ class Assistant:
             raise ValueError("OPENAI_API_KEY is required to initialize Assistant")
 
         configured_model = os.getenv("OPENAI_MODEL_FOR_ASSISTANT")
-        self.model = configured_model.strip() if configured_model and configured_model.strip() else "gpt-5.2"
+        self.model = configured_model.strip() if configured_model and configured_model.strip() else DEFAULT_ASSISTANT_MODEL
         self.api_max_retries = int(os.getenv("ASSISTANT_API_MAX_RETRIES", "3"))
         self.api_retry_base_seconds = float(os.getenv("ASSISTANT_API_RETRY_BASE_SECONDS", "1.0"))
         self.answer_timeout_seconds = float(os.getenv("ASSISTANT_API_TIMEOUT_SECONDS", "60"))
@@ -84,12 +103,29 @@ class Assistant:
         self.custom_prompt_web_search_enabled = bool(enabled)
         logger.info("Assistant custom-prompt web search set to: %s", self.custom_prompt_web_search_enabled)
 
+    def set_model(self, model: Optional[str]) -> None:
+        configured = (model or "").strip()
+        self.model = configured if configured else DEFAULT_ASSISTANT_MODEL
+        logger.info("Assistant model updated to: %s", self.model)
+
     def _emit_status(self, message: str, level: str = "info") -> None:
         if self.status_callback:
             try:
                 self.status_callback(message, level)
             except Exception as e:
                 logger.debug("Status callback failed: %s", e)
+
+    @staticmethod
+    def _decode_env_prompt(raw: Optional[str], default: str) -> str:
+        if raw is None:
+            return default
+        value = raw.strip()
+        if not value:
+            return default
+        return value.replace("\\r\\n", "\n").replace("\\n", "\n")
+
+    def _get_prompt_template(self, env_key: str, default: str) -> str:
+        return self._decode_env_prompt(os.getenv(env_key), default)
 
     def _compute_backoff(self, attempt: int) -> float:
         return self.api_retry_base_seconds * (2 ** max(0, attempt - 1))
@@ -424,15 +460,12 @@ class Assistant:
 
     def _build_system_prompt(self, mode: str) -> str:
         mode = (mode or "answer_question").strip().lower()
-        base = f"""You are helping user with name '{self.your_name}'.
-The user is in a live meeting and shares raw transcript snippets. Treat earlier messages as context but focus your reply on the most recent entry. Keep responses in plain text (no Markdown) and limit yourself to at most three sentences. Do not include document references, filenames, or URLs. Avoid repeating previous guidance; if there is nothing new or not enough information, respond with '---'."""
-
+        base_template = self._get_prompt_template(PROMPT_ENV_KEYS["base"], DEFAULT_SYSTEM_PROMPT_BASE_TEMPLATE)
+        base = base_template.replace("{your_name}", self.your_name)
         mode_directives = {
-            "answer_question": "Address the most recent message directly. When you need additional context, perform a file search before responding. If the message is not a question or you lack sufficient information, reply with '---'. Do not ask the user follow-up questions.",
-            "suggest_questions": "Produce one to three concise questions the user could ask next, each on its own line. Use available context and perform a file search first if it helps craft better prompts.",
-            "explain_it": "Explain key concepts, decisions, or reasoning referenced in the latest message so the user understands them quickly. Draw on file search when needed. Provide clear, practical insight within three sentences.",
-            "get_facts": "Investigate the latest message by performing an up-to-date internet search along with any relevant file search. Return a brief factual summary that highlights the most relevant information you find.",
-            "custom_prompt": "The user has asked a specific question during the meeting. Address their question directly and comprehensively using the meeting transcript as context. Perform a file search if additional information would help. Provide a clear, actionable answer."}
+            current_mode: self._get_prompt_template(PROMPT_ENV_KEYS[current_mode], default_text)
+            for current_mode, default_text in DEFAULT_MODE_DIRECTIVES.items()
+        }
 
         directive = mode_directives.get(mode)
         if directive is None:
@@ -446,13 +479,29 @@ The user is in a live meeting and shares raw transcript snippets. Treat earlier 
         return prompt
 
 
-    def _answer(self, timestamp: float, messages_snapshot: Optional[list[Message]] = None, mode: str = "answer_question"):
+    def _answer(
+        self,
+        timestamp: float,
+        messages_snapshot: Optional[list[Message]] = None,
+        mode: str = "answer_question",
+        result_callback: Optional[Callable[[Optional[str]], None]] = None,
+        append_response_to_messages: bool = True,
+        enqueue_response: bool = True,
+    ):
         logger.info("Answering question... (mode=%s)", mode)
         time_val = timestamp
         msgs = messages_snapshot if messages_snapshot is not None else self.messages
 
+        def _notify_result(result_text: Optional[str]) -> None:
+            if result_callback:
+                try:
+                    result_callback(result_text)
+                except Exception as e:
+                    logger.debug("Assistant result callback failed: %s", e)
+
         if not msgs:
             logger.info("No messages available for assistant to process.")
+            _notify_result(None)
             return
 
         system = self._build_system_prompt(mode)
@@ -477,7 +526,7 @@ The user is in a live meeting and shares raw transcript snippets. Treat earlier 
         }
 
         payload: dict[str, Any] = {
-            "model": self.model or "gpt-5-mini",
+            "model": self.model or DEFAULT_ASSISTANT_MODEL,
             "instructions": system,
             "input": [user_message],
             "max_output_tokens": 2000,
@@ -485,7 +534,6 @@ The user is in a live meeting and shares raw transcript snippets. Treat earlier 
 
         tools: list[dict[str, Any]] = []
         if self.vector_store_id:
-            payload["model"] = "gpt-5-mini"
             tools.append({"type": "file_search", "vector_store_ids": [self.vector_store_id]})
 
         if mode == "get_facts":
@@ -517,11 +565,13 @@ The user is in a live meeting and shares raw transcript snippets. Treat earlier 
         if resp is None:
             if is_hard_failure:
                 self._emit_status("Assistant disabled by API auth/permission error.", "error")
+            _notify_result(None)
             return ":eyes:"
 
         try:
             data = resp.json()
         except Exception:
+            _notify_result(None)
             return ":eyes:"
 
         self._log_response_summary(data)
@@ -530,19 +580,28 @@ The user is in a live meeting and shares raw transcript snippets. Treat earlier 
         if not text or text.strip() == "---":
             self.last_answer = None
             self._emit_status("Assistant: no actionable response.", "info")
+            _notify_result(None)
         else:
             self.last_answer = text
-            with self.messages_lock:
-                self.messages.append(Message(user="assistant", text=text))
-                self.last_message_timestamp = timestamp
-            if self.answer_queue:
+            if append_response_to_messages:
+                with self.messages_lock:
+                    self.messages.append(Message(user="assistant", text=text))
+                    self.last_message_timestamp = timestamp
+            if enqueue_response and self.answer_queue:
                 logger.info("Answered at %s", time_val)
                 self.answer_queue.put((self.agent_name, self.last_answer, time_val))
+            _notify_result(text)
             self._emit_status("Assistant response ready.", "info")
 
         logger.info("Answering question... DONE")
 
-    def trigger_answer(self, mode: str = "answer_question") -> bool:
+    def trigger_answer(
+        self,
+        mode: str = "answer_question",
+        result_callback: Optional[Callable[[Optional[str]], None]] = None,
+        append_response_to_messages: bool = True,
+        enqueue_response: bool = True,
+    ) -> bool:
         """Manually request the assistant to craft a reply based on collected messages."""
         if self.stop_event.is_set():
             logger.warning("Assistant is stopped; cannot trigger answer.")
@@ -565,7 +624,15 @@ The user is in a live meeting and shares raw transcript snippets. Treat earlier 
         timestamp = time.time()
 
         try:
-            self.executor.submit(self._answer, timestamp, snapshot, normalized_mode)
+            self.executor.submit(
+                self._answer,
+                timestamp,
+                snapshot,
+                normalized_mode,
+                result_callback,
+                append_response_to_messages,
+                enqueue_response,
+            )
             return True
         except Exception as e:
             logger.error("Failed to trigger assistant answer: %s", e)
@@ -636,7 +703,7 @@ The title should be professional and descriptive. Only return the title text, no
             logger.info("No meeting title available from Teams window")
         
         summary_payload = {
-            "model": self.model or "gpt-5.2",
+            "model": self.model or DEFAULT_ASSISTANT_MODEL,
             "instructions": system_prompt,
             "input": [{
                 "role": "user",

@@ -86,6 +86,28 @@ def _env_bool(name: str, default: bool, warnings: list[str]) -> bool:
     return default
 
 
+def _decode_env_multiline(raw: str | None, default: str = "") -> str:
+    if raw is None:
+        return default
+    value = raw.strip()
+    if not value:
+        return default
+    return value.replace("\\r\\n", "\n").replace("\\n", "\n")
+
+
+def _encode_env_multiline(value: str) -> str:
+    normalized = (value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    return normalized.replace("\n", "\\n")
+
+
+LIVE_ASSISTANT_PANEL_CONFIG: list[tuple[str, str, str]] = [
+    ("answer_question", "Anwers", "ASSISTANT_LIVE_ANSWERS_ENABLED"),
+    ("suggest_questions", "Suggested Questions", "ASSISTANT_LIVE_SUGGESTIONS_ENABLED"),
+    ("explain_it", "Explanation", "ASSISTANT_LIVE_EXPLANATION_ENABLED"),
+    ("get_facts", "Facts", "ASSISTANT_LIVE_FACTS_ENABLED"),
+]
+
+
 def _print_startup_summary() -> None:
     logger.info("=== Startup Configuration Summary ===")
     logger.info("Platform: %s", sys.platform)
@@ -100,6 +122,8 @@ def _print_startup_summary() -> None:
     logger.info("Auto-start transcription: %s", g_auto_start_transcription)
     logger.info("Auto-summarize on stop: %s", g_auto_summarize_on_stop)
     logger.info("Assistant web search for custom prompts: %s", g_assistant_web_search_for_custom_prompts)
+    for mode, label, _env_key in LIVE_ASSISTANT_PANEL_CONFIG:
+        logger.info("Live assistant %s enabled: %s", label, g_live_assistant_mode_enabled.get(mode, False))
     logger.info("Transcription output dir: %s", g_output_dir)
     logger.info("Temporary audio dir: %s", g_temp_dir)
     logger.info("Summary output dir: %s", g_summaries_dir)
@@ -338,6 +362,10 @@ g_interupt_manually = _env_bool("INTERUPT_MANUALLY", True, g_startup_warnings)
 g_auto_start_transcription = _env_bool("AUTO_START_TRANSCRIPTION", False, g_startup_warnings)
 g_auto_summarize_on_stop = _env_bool("AUTO_SUMMARIZE_ON_STOP", False, g_startup_warnings)
 g_assistant_web_search_for_custom_prompts = _env_bool("ASSISTANT_ENABLE_WEB_SEARCH_FOR_CUSTOM_PROMPTS", True, g_startup_warnings)
+g_live_assistant_mode_enabled = {
+    mode: _env_bool(env_key, False, g_startup_warnings)
+    for mode, _label, env_key in LIVE_ASSISTANT_PANEL_CONFIG
+}
 
 g_assistant = None
 g_vector_store_id = _env_str("OPENAI_VECTOR_STORE_ID_FOR_ANSWERS")
@@ -369,6 +397,8 @@ assistant_buttons: dict[str, tk.Button] = {}
 custom_prompt_entry = None
 send_prompt_button = None
 summary_button = None
+live_assistant_toggle_vars: dict[str, tk.BooleanVar] = {}
+live_assistant_text_boxes: dict[str, tk.Text] = {}
 
 g_keywords = None
 g_keywords = _env_str("KEYWORDS")
@@ -698,9 +728,18 @@ def _open_settings():
     row += 1
 
     tk.Label(frame, text="Assistant model", **_lbl_opts).grid(row=row, column=0, sticky="w", pady=3, **pad)
-    assistant_model_var = tk.StringVar(value=_env_str("OPENAI_MODEL_FOR_ASSISTANT", "gpt-5.2"))
-    tk.Entry(frame, textvariable=assistant_model_var, width=28, **_entry_opts).grid(
-        row=row, column=1, sticky="w", pady=3)
+    assistant_model_var = tk.StringVar(value=_env_str("OPENAI_MODEL_FOR_ASSISTANT", assistant.DEFAULT_ASSISTANT_MODEL))
+    ttk.Combobox(
+        frame,
+        values=[
+            "gpt-5.1-mini",
+            "gpt-5-mini",
+            "gpt-5.2",
+            "gpt-4.1-mini",
+        ],
+        textvariable=assistant_model_var,
+        width=28,
+    ).grid(row=row, column=1, sticky="w", pady=3)
     row += 1
 
     tk.Label(frame, text="Vector store ID", **_lbl_opts).grid(row=row, column=0, sticky="w", pady=3, **pad)
@@ -713,6 +752,42 @@ def _open_settings():
     tk.Checkbutton(frame, text="Enable internet search for custom prompts", variable=web_search_var, **_cb_opts).grid(
         row=row, column=0, columnspan=3, sticky="w", pady=3, **pad)
     row += 1
+
+    # ── Section: Assistant Prompts ────────────────────────────────────────
+    tk.Label(frame, text="Assistant Prompts", **_section_opts).grid(
+        row=row, column=0, columnspan=3, sticky="w", pady=(14, 4), **pad)
+    row += 1
+
+    prompt_fields = [
+        ("Base prompt", assistant.PROMPT_ENV_KEYS["base"], assistant.DEFAULT_SYSTEM_PROMPT_BASE_TEMPLATE, 4),
+        ("Answer prompt", assistant.PROMPT_ENV_KEYS["answer_question"], assistant.DEFAULT_MODE_DIRECTIVES["answer_question"], 3),
+        ("Suggestions prompt", assistant.PROMPT_ENV_KEYS["suggest_questions"], assistant.DEFAULT_MODE_DIRECTIVES["suggest_questions"], 3),
+        ("Explanation prompt", assistant.PROMPT_ENV_KEYS["explain_it"], assistant.DEFAULT_MODE_DIRECTIVES["explain_it"], 3),
+        ("Facts prompt", assistant.PROMPT_ENV_KEYS["get_facts"], assistant.DEFAULT_MODE_DIRECTIVES["get_facts"], 3),
+        ("Custom prompt mode", assistant.PROMPT_ENV_KEYS["custom_prompt"], assistant.DEFAULT_MODE_DIRECTIVES["custom_prompt"], 3),
+    ]
+    prompt_text_widgets: dict[str, tk.Text] = {}
+    for label_text, env_key, default_text, height in prompt_fields:
+        tk.Label(frame, text=label_text, **_lbl_opts).grid(row=row, column=0, sticky="nw", pady=3, **pad)
+        text_widget = tk.Text(
+            frame,
+            width=64,
+            height=height,
+            wrap=tk.WORD,
+            bg=theme["input_bg"],
+            fg=theme["input_fg"],
+            insertbackground=theme["text_primary"],
+            relief=tk.FLAT,
+            highlightbackground=theme["border"],
+            highlightcolor=theme["accent_blue"],
+            highlightthickness=1,
+            bd=4,
+            font=ui_module.get_font(max(8, g_default_font_size - 1)),
+        )
+        text_widget.grid(row=row, column=1, columnspan=2, sticky="we", pady=3)
+        text_widget.insert("1.0", _decode_env_multiline(os.getenv(env_key), default_text))
+        prompt_text_widgets[env_key] = text_widget
+        row += 1
 
     # ── Section: UI ────────────────────────────────────────────────────────
     tk.Label(frame, text="UI", **_section_opts).grid(
@@ -873,6 +948,7 @@ def _open_settings():
         global g_my_name, g_interupt_manually, g_keywords, g_openai_model_for_transcript
         global g_agent_font_size, g_default_font_size, g_temp_dir, g_context_file
         global RECORD_SECONDS, SILENCE_THRESHOLD, SILENCE_DURATION, FRAME_DURATION_MS
+        global g_live_assistant_mode_enabled
 
         g_my_name = name_var.get().strip() or "You"
         g_language = (lang_var.get() or "en").strip()
@@ -881,6 +957,7 @@ def _open_settings():
         g_auto_summarize_on_stop = bool(auto_sum_var.get())
         g_assistant_web_search_for_custom_prompts = bool(web_search_var.get())
         g_openai_model_for_transcript = transcript_model_var.get().strip() or "gpt-4o-mini-transcribe"
+        assistant_model_value = assistant_model_var.get().strip() or assistant.DEFAULT_ASSISTANT_MODEL
         g_agent_font_size = int(agent_fs_var.get())
         g_default_font_size = int(default_fs_var.get())
         g_output_dir = out_var.get().strip() or "output"
@@ -926,7 +1003,7 @@ def _open_settings():
             "AUTO_SUMMARIZE_ON_STOP": "True" if g_auto_summarize_on_stop else "False",
             "ASSISTANT_ENABLE_WEB_SEARCH_FOR_CUSTOM_PROMPTS": "True" if g_assistant_web_search_for_custom_prompts else "False",
             "OPENAI_MODEL_FOR_TRANSCRIPT": g_openai_model_for_transcript,
-            "OPENAI_MODEL_FOR_ASSISTANT": assistant_model_var.get().strip(),
+            "OPENAI_MODEL_FOR_ASSISTANT": assistant_model_value,
             "OPENAI_VECTOR_STORE_ID_FOR_ANSWERS": vs_var.get().strip(),
             "AGENT_FONT_SIZE": str(g_agent_font_size),
             "DEFAULT_FONT_SIZE": str(g_default_font_size),
@@ -945,6 +1022,12 @@ def _open_settings():
             "TRANSCRIPT_FILTER_MIN_CHARS": filter_min_var.get().strip(),
         }
 
+        for mode, _label, env_key in LIVE_ASSISTANT_PANEL_CONFIG:
+            mode_var = live_assistant_toggle_vars.get(mode)
+            enabled = bool(mode_var.get()) if mode_var is not None else bool(g_live_assistant_mode_enabled.get(mode, False))
+            g_live_assistant_mode_enabled[mode] = enabled
+            env_updates[env_key] = "True" if enabled else "False"
+
         # API key — only overwrite when the user typed something new
         new_key = api_key_var.get().strip()
         if new_key:
@@ -956,11 +1039,14 @@ def _open_settings():
                 env_updates[env_key] = val
         for env_key, var in filter_vars.items():
             env_updates[env_key] = var.get().strip()
+        for env_key, widget in prompt_text_widgets.items():
+            env_updates[env_key] = _encode_env_multiline(widget.get("1.0", tk.END))
 
         _save_env_updates(env_updates)
 
         if g_assistant:
             g_assistant.set_custom_prompt_web_search_enabled(g_assistant_web_search_for_custom_prompts)
+            g_assistant.set_model(assistant_model_value)
 
         _reinitialize_transcript_ai()
         reset_log_file()
@@ -1282,11 +1368,12 @@ def _generate_and_save_summary(transcription_snapshot: list[list]) -> bool:
 def setup_ui():
     global chat_window, root, mute_button, assistant_buttons, custom_prompt_entry, send_prompt_button, summary_button, status_label
     global start_stop_button, settings_button, g_auto_start_var, mic_icon_on, mic_icon_off
+    global live_assistant_toggle_vars, live_assistant_text_boxes
     
     root = tk.Tk()
     root.title("Live Audio Chat")
-    root.geometry("700x500")
-    root.minsize(600, 400)
+    root.geometry("2100x1500")
+    root.minsize(1800, 1200)
 
     theme = ui_module.THEME
     root.configure(bg=theme["bg"])
@@ -1421,6 +1508,83 @@ def setup_ui():
     chat_window.pack(expand=True, fill=tk.BOTH)
     ui_module.setup_chat_tags(chat_window, g_agent_font_size, g_default_font_size)
 
+    # ── Live assistant panels (below transcript) ───────────────────────────
+    live_assistant_toggle_vars = {}
+    live_assistant_text_boxes = {}
+
+    live_panels = tk.Frame(root, bg=theme["bg"], padx=8, pady=0)
+    live_panels.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 6))
+
+    for col_idx, (mode, label, env_key) in enumerate(LIVE_ASSISTANT_PANEL_CONFIG):
+        live_panels.grid_columnconfigure(col_idx, weight=1)
+        panel = tk.Frame(
+            live_panels,
+            bg=theme["surface"],
+            highlightthickness=1,
+            highlightbackground=theme["border"],
+            bd=0,
+            padx=8,
+            pady=6,
+        )
+        panel.grid(row=0, column=col_idx, sticky="nsew", padx=(0, 6) if col_idx < len(LIVE_ASSISTANT_PANEL_CONFIG) - 1 else 0)
+
+        header = tk.Frame(panel, bg=theme["surface"])
+        header.pack(fill=tk.X, pady=(0, 4))
+
+        tk.Label(
+            header,
+            text=label,
+            bg=theme["surface"],
+            fg=theme["text_primary"],
+            font=ui_module.get_font(max(8, g_default_font_size - 1), "bold"),
+        ).pack(side=tk.LEFT)
+
+        mode_var = tk.BooleanVar(value=bool(g_live_assistant_mode_enabled.get(mode, False)))
+        live_assistant_toggle_vars[mode] = mode_var
+
+        def _on_toggle(current_mode: str = mode, current_var: tk.BooleanVar = mode_var, current_env_key: str = env_key):
+            enabled = bool(current_var.get())
+            g_live_assistant_mode_enabled[current_mode] = enabled
+            _save_env_updates({current_env_key: "True" if enabled else "False"})
+
+        tk.Checkbutton(
+            header,
+            text="Enable",
+            variable=mode_var,
+            command=_on_toggle,
+            state=tk.NORMAL if g_assistant else tk.DISABLED,
+            bg=theme["surface"],
+            fg=theme["text_secondary"],
+            selectcolor=theme["surface_light"],
+            activebackground=theme["surface"],
+            activeforeground=theme["text_primary"],
+            highlightthickness=0,
+            font=ui_module.get_font(max(8, g_default_font_size - 1)),
+        ).pack(side=tk.RIGHT)
+
+        output_box = tk.Text(
+            panel,
+            wrap=tk.WORD,
+            height=8,
+            state=tk.DISABLED,
+            bg=theme["input_bg"],
+            fg=theme["text_primary"],
+            font=ui_module.get_font(max(8, g_default_font_size - 1)),
+            relief=tk.FLAT,
+            bd=0,
+            padx=6,
+            pady=5,
+            insertbackground=theme["text_primary"],
+            highlightthickness=1,
+            highlightbackground=theme["border"],
+            highlightcolor=theme["border"],
+            spacing1=1,
+            spacing3=1,
+        )
+        output_box.pack(fill=tk.BOTH, expand=True)
+        _set_readonly_text(output_box, "Waiting for output transcript..." if g_assistant else "Assistant is unavailable.")
+        live_assistant_text_boxes[mode] = output_box
+
     set_status("Ready", "info")
     
     # Bind extra events to see when the window is being hidden/destroyed.
@@ -1462,6 +1626,53 @@ def setup_ui():
 def update_chat():
     transcription_snapshot = g_transcript_store.snapshot()
     ui_module.render_transcription(chat_window, transcription_snapshot, g_my_name, AGENT_NAME)
+
+
+def _set_readonly_text(widget: tk.Text, value: str) -> None:
+    widget.config(state=tk.NORMAL)
+    widget.delete("1.0", tk.END)
+    widget.insert("1.0", value)
+    widget.config(state=tk.DISABLED)
+
+
+def _update_live_assistant_panel_text(mode: str, text: str | None) -> None:
+    widget = live_assistant_text_boxes.get(mode)
+    if not widget:
+        return
+    rendered = (text or "---").strip() or "---"
+    _set_readonly_text(widget, rendered)
+
+
+def _trigger_live_assistant_for_output_transcript() -> None:
+    if not g_assistant:
+        return
+
+    for mode, _label, _env_key in LIVE_ASSISTANT_PANEL_CONFIG:
+        mode_var = live_assistant_toggle_vars.get(mode)
+        enabled = bool(mode_var.get()) if mode_var is not None else bool(g_live_assistant_mode_enabled.get(mode, False))
+        if not enabled:
+            continue
+
+        def _callback(response_text: str | None, current_mode: str = mode) -> None:
+            if root is None:
+                return
+            try:
+                root.after(0, lambda: _update_live_assistant_panel_text(current_mode, response_text))
+            except Exception:
+                pass
+
+        success = g_assistant.trigger_answer(
+            mode=mode,
+            result_callback=_callback,
+            append_response_to_messages=False,
+            enqueue_response=False,
+        )
+        if not success and root is not None:
+            try:
+                root.after(0, lambda current_mode=mode: _update_live_assistant_panel_text(current_mode, "Failed to generate response."))
+            except Exception:
+                pass
+
 
 # Audio Recording Functions
 def store_audio_stream(queue, filename_suffix, device_info, from_microphone):
@@ -1530,17 +1741,17 @@ def transcribe_and_display(file, from_microphone, letter):
                 logger.info("[%s -> %.2f] %s", converted_time, segment.end, segment.text)
                 #root.after(0, update_chat, transcription, letter, from_microphone)
                 if from_microphone:
-                    add_transcription(g_my_name, text, start_time + segment.start)
+                    add_transcription(g_my_name, text, start_time + segment.start, from_microphone=True)
                 else:
                     if len(letter)==1:
-                        add_transcription(f"Person_{letter.upper()}", text, start_time + segment.start)
+                        add_transcription(f"Person_{letter.upper()}", text, start_time + segment.start, from_microphone=False)
                     else:
-                        add_transcription(f"{letter}", text, start_time + segment.start)
+                        add_transcription(f"{letter}", text, start_time + segment.start, from_microphone=False)
 
     except Exception as e:
         logger.exception("[Transcribe] Transcription error for %s: %s", file, e)
 
-def add_transcription(user, text, start_time):
+def add_transcription(user, text, start_time, from_microphone: bool):
     """
     Add a transcription entry to the global transcription list.
     """
@@ -1548,6 +1759,8 @@ def add_transcription(user, text, start_time):
     g_transcriptions_in.put((user, text, start_time))
     if g_assistant:
         g_assistant.add_message(start_time+1,f"{user}: {text}")
+        if not from_microphone:
+            _trigger_live_assistant_for_output_transcript()
 
 def update_screen_on_new_transcription():
     """
