@@ -458,54 +458,43 @@ def get_speaker_name():
 
 
 def _create_mic_icons():
-    bg = "#f0f0f0"
-    if root:
-        try:
-            raw_bg = root.cget("bg")
-            try:
-                # Convert Tk theme/system color names (e.g., SystemButtonFace) to #RRGGBB.
-                r, g, b = root.winfo_rgb(raw_bg)
-                bg = f"#{r // 256:02x}{g // 256:02x}{b // 256:02x}"
-            except Exception:
-                # If conversion fails, try raw value as-is.
-                bg = raw_bg
-        except Exception:
-            bg = "#f0f0f0"
+    theme = ui_module.THEME
+    on_bg = theme["accent_red"]
+    off_bg = theme["surface_light"]
+    size = 28
 
-    on_icon = tk.PhotoImage(width=18, height=18)
-    off_icon = tk.PhotoImage(width=18, height=18)
-    try:
-        on_icon.put(bg, to=(0, 0, 18, 18))
-        off_icon.put(bg, to=(0, 0, 18, 18))
-    except Exception:
-        # Last-resort fallback for environments that reject symbolic colors.
-        on_icon.put("#f0f0f0", to=(0, 0, 18, 18))
-        off_icon.put("#f0f0f0", to=(0, 0, 18, 18))
+    on_icon = tk.PhotoImage(width=size, height=size)
+    off_icon = tk.PhotoImage(width=size, height=size)
+    on_icon.put(on_bg, to=(0, 0, size, size))
+    off_icon.put(off_bg, to=(0, 0, size, size))
 
-    # microphone body
-    for x in range(6, 12):
-        for y in range(3, 10):
-            on_icon.put("#1f2937", (x, y))
-            off_icon.put("#1f2937", (x, y))
-    # rounded top hint
-    for x in range(7, 11):
-        on_icon.put("#1f2937", (x, 2))
-        off_icon.put("#1f2937", (x, 2))
-    # stem and base
-    for y in range(10, 14):
-        on_icon.put("#1f2937", (8, y))
-        on_icon.put("#1f2937", (9, y))
-        off_icon.put("#1f2937", (8, y))
-        off_icon.put("#1f2937", (9, y))
-    for x in range(5, 13):
-        on_icon.put("#1f2937", (x, 14))
-        off_icon.put("#1f2937", (x, 14))
+    mic_on_color = "#ffffff"
+    mic_off_color = theme["text_muted"]
 
-    # mute cross line
-    for i in range(3, 15):
-        off_icon.put("#dc2626", (i, i))
-        if i + 1 < 18:
-            off_icon.put("#dc2626", (i + 1, i))
+    # Microphone body (scaled)
+    for x in range(10, 18):
+        for y in range(4, 15):
+            on_icon.put(mic_on_color, (x, y))
+            off_icon.put(mic_off_color, (x, y))
+    # Rounded top hint
+    for x in range(11, 17):
+        on_icon.put(mic_on_color, (x, 3))
+        off_icon.put(mic_off_color, (x, 3))
+    # Stem and base
+    for y in range(15, 22):
+        for x in range(13, 15):
+            on_icon.put(mic_on_color, (x, y))
+            off_icon.put(mic_off_color, (x, y))
+    for x in range(8, 20):
+        on_icon.put(mic_on_color, (x, 22))
+        off_icon.put(mic_off_color, (x, 22))
+
+    # Mute cross-line
+    strike = theme["accent_red"]
+    for i in range(4, 24):
+        off_icon.put(strike, (i, i))
+        if i + 1 < size:
+            off_icon.put(strike, (i + 1, i))
 
     return on_icon, off_icon
 
@@ -513,10 +502,13 @@ def _create_mic_icons():
 def _update_start_stop_button():
     if not start_stop_button:
         return
+    theme = ui_module.THEME
     if g_is_recording:
-        start_stop_button.config(text="Stop", bg="#e74c3c")
+        start_stop_button.config(text="\u25A0  Stop", bg=theme["accent_red"])
+        ui_module.add_hover_effect(start_stop_button, theme["accent_red"], theme["accent_red_hover"])
     else:
-        start_stop_button.config(text="Start", bg="#2ecc71")
+        start_stop_button.config(text="\u25B6  Start", bg=theme["accent_green"])
+        ui_module.add_hover_effect(start_stop_button, theme["accent_green"], theme["accent_green_hover"])
 
 
 def _sync_auto_start_var():
@@ -529,81 +521,384 @@ def _sync_auto_start_var():
 def _open_settings():
     global g_language, g_auto_summarize_on_stop, g_output_dir, g_summaries_dir
     global g_assistant_web_search_for_custom_prompts
+    global g_my_name, g_interupt_manually, g_keywords, g_openai_model_for_transcript
+    global g_agent_font_size, g_default_font_size, g_temp_dir
 
     win = tk.Toplevel(root)
     win.title("Settings")
-    win.geometry("700x300")
+    win.geometry("720x620")
+    win.minsize(640, 500)
     win.transient(root)
     win.grab_set()
 
-    frame = tk.Frame(win)
-    frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+    theme = ui_module.THEME
+    win.configure(bg=theme["bg"])
+    ui_module.apply_dark_title_bar(win)
+
+    # -- shared style dicts --
+    _cb_opts = dict(bg=theme["bg"], fg=theme["text_primary"],
+                    selectcolor=theme["surface"], activebackground=theme["bg"],
+                    activeforeground=theme["text_primary"], highlightthickness=0,
+                    font=ui_module.get_font(g_default_font_size))
+    _lbl_opts = dict(bg=theme["bg"], fg=theme["text_secondary"],
+                     font=ui_module.get_font(g_default_font_size))
+    _entry_opts = dict(bg=theme["input_bg"], fg=theme["input_fg"],
+                       insertbackground=theme["text_primary"], relief=tk.FLAT,
+                       highlightbackground=theme["border"], highlightcolor=theme["accent_blue"],
+                       highlightthickness=1, bd=4,
+                       font=ui_module.get_font(g_default_font_size))
+    _section_opts = dict(bg=theme["bg"], fg=theme["accent_blue"],
+                         font=ui_module.get_font(g_default_font_size, "bold"))
+    _browse_opts = dict(bg=theme["surface_light"], fg=theme["text_primary"],
+                        relief=tk.FLAT, cursor="hand2", bd=0, highlightthickness=0,
+                        font=ui_module.get_font(max(8, g_default_font_size - 1)))
+    _spin_opts = dict(bg=theme["input_bg"], fg=theme["input_fg"],
+                      buttonbackground=theme["surface_light"],
+                      relief=tk.FLAT, highlightthickness=1, highlightbackground=theme["border"],
+                      font=ui_module.get_font(g_default_font_size))
+
+    # -- scrollable canvas --
+    outer = tk.Frame(win, bg=theme["bg"])
+    outer.pack(fill=tk.BOTH, expand=True)
+
+    canvas = tk.Canvas(outer, bg=theme["bg"], highlightthickness=0, bd=0)
+    scrollbar = tk.Scrollbar(outer, orient=tk.VERTICAL, command=canvas.yview,
+                             bg=theme["surface"], troughcolor=theme["bg"])
+    canvas.configure(yscrollcommand=scrollbar.set)
+    scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+    canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+    frame = tk.Frame(canvas, bg=theme["bg"])
+    canvas_window = canvas.create_window((0, 0), window=frame, anchor="nw")
+
+    def _on_frame_configure(_event=None):
+        canvas.configure(scrollregion=canvas.bbox("all"))
+    frame.bind("<Configure>", _on_frame_configure)
+
+    def _on_canvas_configure(event):
+        canvas.itemconfig(canvas_window, width=event.width)
+    canvas.bind("<Configure>", _on_canvas_configure)
+
+    def _on_mousewheel(event):
+        canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+    canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
+    pad = {"padx": (20, 20)}
+    row = 0
+
+    # ── Section: General ───────────────────────────────────────────────────
+    tk.Label(frame, text="General", **_section_opts).grid(
+        row=row, column=0, columnspan=3, sticky="w", pady=(14, 4), **pad)
+    row += 1
+
+    tk.Label(frame, text="Your name", **_lbl_opts).grid(row=row, column=0, sticky="w", pady=3, **pad)
+    name_var = tk.StringVar(value=g_my_name or "")
+    tk.Entry(frame, textvariable=name_var, width=30, **_entry_opts).grid(row=row, column=1, sticky="w", pady=3)
+    row += 1
+
+    tk.Label(frame, text="Language", **_lbl_opts).grid(row=row, column=0, sticky="w", pady=3, **pad)
+    lang_var = tk.StringVar(value=g_language or "en")
+    languages = ["en", "lv", "ru", "de", "fr", "es", "it", "pt", "nl", "pl", "sv", "fi", "et", "lt", "ja", "zh", "ko", "ar", "tr"]
+    ttk.Combobox(frame, values=languages, textvariable=lang_var, state="readonly", width=12).grid(
+        row=row, column=1, sticky="w", pady=3)
+    row += 1
+
+    tk.Label(frame, text="Keywords", **_lbl_opts).grid(row=row, column=0, sticky="w", pady=3, **pad)
+    kw_var = tk.StringVar(value=g_keywords or "")
+    tk.Entry(frame, textvariable=kw_var, width=60, **_entry_opts).grid(row=row, column=1, columnspan=2, sticky="we", pady=3)
+    row += 1
+
+    interrupt_var = tk.BooleanVar(value=g_interupt_manually)
+    tk.Checkbutton(frame, text="Enable manual interrupt (key-press splits audio)", variable=interrupt_var, **_cb_opts).grid(
+        row=row, column=0, columnspan=3, sticky="w", pady=3, **pad)
+    row += 1
 
     auto_start_var = tk.BooleanVar(value=g_auto_start_transcription)
+    tk.Checkbutton(frame, text="Auto-start transcription when app starts", variable=auto_start_var, **_cb_opts).grid(
+        row=row, column=0, columnspan=3, sticky="w", pady=3, **pad)
+    row += 1
+
     auto_sum_var = tk.BooleanVar(value=g_auto_summarize_on_stop)
-    web_search_custom_prompt_var = tk.BooleanVar(value=g_assistant_web_search_for_custom_prompts)
-    lang_var = tk.StringVar(value=g_language or "en")
+    tk.Checkbutton(frame, text="Automatically summarize transcription when stopped", variable=auto_sum_var, **_cb_opts).grid(
+        row=row, column=0, columnspan=3, sticky="w", pady=3, **pad)
+    row += 1
+
+    # ── Section: OpenAI ────────────────────────────────────────────────────
+    tk.Label(frame, text="OpenAI", **_section_opts).grid(
+        row=row, column=0, columnspan=3, sticky="w", pady=(14, 4), **pad)
+    row += 1
+
+    tk.Label(frame, text="API key", **_lbl_opts).grid(row=row, column=0, sticky="w", pady=3, **pad)
+    api_key_var = tk.StringVar(value="")
+    api_key_entry = tk.Entry(frame, textvariable=api_key_var, width=50, show="\u2022", **_entry_opts)
+    api_key_entry.grid(row=row, column=1, columnspan=2, sticky="we", pady=3)
+    _api_hint = "configured" if g_open_api_key else "not set"
+    tk.Label(frame, text=f"({_api_hint} \u2014 leave blank to keep current)",
+             bg=theme["bg"], fg=theme["text_muted"],
+             font=ui_module.get_font(max(8, g_default_font_size - 1))).grid(
+        row=row + 1, column=1, columnspan=2, sticky="w", **pad)
+    row += 2
+
+    tk.Label(frame, text="Transcript model", **_lbl_opts).grid(row=row, column=0, sticky="w", pady=3, **pad)
+    transcript_model_var = tk.StringVar(value=g_openai_model_for_transcript or "gpt-4o-mini-transcribe")
+    ttk.Combobox(frame, values=["gpt-4o-mini-transcribe", "gpt-4o-transcribe"],
+                 textvariable=transcript_model_var, width=28).grid(row=row, column=1, sticky="w", pady=3)
+    row += 1
+
+    tk.Label(frame, text="Assistant model", **_lbl_opts).grid(row=row, column=0, sticky="w", pady=3, **pad)
+    assistant_model_var = tk.StringVar(value=_env_str("OPENAI_MODEL_FOR_ASSISTANT", "gpt-5.2"))
+    tk.Entry(frame, textvariable=assistant_model_var, width=28, **_entry_opts).grid(
+        row=row, column=1, sticky="w", pady=3)
+    row += 1
+
+    tk.Label(frame, text="Vector store ID", **_lbl_opts).grid(row=row, column=0, sticky="w", pady=3, **pad)
+    vs_var = tk.StringVar(value=_env_str("OPENAI_VECTOR_STORE_ID_FOR_ANSWERS", "") or "")
+    tk.Entry(frame, textvariable=vs_var, width=50, **_entry_opts).grid(
+        row=row, column=1, columnspan=2, sticky="we", pady=3)
+    row += 1
+
+    web_search_var = tk.BooleanVar(value=g_assistant_web_search_for_custom_prompts)
+    tk.Checkbutton(frame, text="Enable internet search for custom prompts", variable=web_search_var, **_cb_opts).grid(
+        row=row, column=0, columnspan=3, sticky="w", pady=3, **pad)
+    row += 1
+
+    # ── Section: UI ────────────────────────────────────────────────────────
+    tk.Label(frame, text="UI", **_section_opts).grid(
+        row=row, column=0, columnspan=3, sticky="w", pady=(14, 4), **pad)
+    row += 1
+
+    tk.Label(frame, text="Default font size", **_lbl_opts).grid(row=row, column=0, sticky="w", pady=3, **pad)
+    default_fs_var = tk.IntVar(value=g_default_font_size)
+    tk.Spinbox(frame, from_=8, to=24, textvariable=default_fs_var, width=6, **_spin_opts).grid(
+        row=row, column=1, sticky="w", pady=3)
+    row += 1
+
+    tk.Label(frame, text="Agent font size", **_lbl_opts).grid(row=row, column=0, sticky="w", pady=3, **pad)
+    agent_fs_var = tk.IntVar(value=g_agent_font_size)
+    tk.Spinbox(frame, from_=8, to=30, textvariable=agent_fs_var, width=6, **_spin_opts).grid(
+        row=row, column=1, sticky="w", pady=3)
+    row += 1
+
+    # ── Section: Audio ─────────────────────────────────────────────────────
+    tk.Label(frame, text="Audio", **_section_opts).grid(
+        row=row, column=0, columnspan=3, sticky="w", pady=(14, 4), **pad)
+    row += 1
+
+    tk.Label(frame, text="Record seconds", **_lbl_opts).grid(row=row, column=0, sticky="w", pady=3, **pad)
+    rec_var = tk.IntVar(value=RECORD_SECONDS)
+    tk.Spinbox(frame, from_=10, to=3600, textvariable=rec_var, width=8, **_spin_opts).grid(
+        row=row, column=1, sticky="w", pady=3)
+    row += 1
+
+    tk.Label(frame, text="Silence threshold", **_lbl_opts).grid(row=row, column=0, sticky="w", pady=3, **pad)
+    sil_thresh_var = tk.DoubleVar(value=SILENCE_THRESHOLD)
+    tk.Spinbox(frame, from_=0, to=500, increment=5, textvariable=sil_thresh_var, width=8, **_spin_opts).grid(
+        row=row, column=1, sticky="w", pady=3)
+    row += 1
+
+    tk.Label(frame, text="Silence duration (s)", **_lbl_opts).grid(row=row, column=0, sticky="w", pady=3, **pad)
+    sil_dur_var = tk.DoubleVar(value=SILENCE_DURATION)
+    tk.Spinbox(frame, from_=0.1, to=10, increment=0.1, textvariable=sil_dur_var, width=8,
+               format="%.1f", **_spin_opts).grid(row=row, column=1, sticky="w", pady=3)
+    row += 1
+
+    tk.Label(frame, text="Frame duration (ms)", **_lbl_opts).grid(row=row, column=0, sticky="w", pady=3, **pad)
+    frame_dur_var = tk.IntVar(value=FRAME_DURATION_MS)
+    tk.Spinbox(frame, from_=10, to=1000, increment=10, textvariable=frame_dur_var, width=8, **_spin_opts).grid(
+        row=row, column=1, sticky="w", pady=3)
+    row += 1
+
+    # ── Section: Directories ───────────────────────────────────────────────
+    tk.Label(frame, text="Directories", **_section_opts).grid(
+        row=row, column=0, columnspan=3, sticky="w", pady=(14, 4), **pad)
+    row += 1
+
+    tk.Label(frame, text="Transcriptions", **_lbl_opts).grid(row=row, column=0, sticky="w", pady=3, **pad)
     out_var = tk.StringVar(value=g_output_dir)
+    tk.Entry(frame, textvariable=out_var, width=50, **_entry_opts).grid(row=row, column=1, sticky="we", pady=3)
+    tk.Button(frame, text="Browse", command=lambda: out_var.set(
+        filedialog.askdirectory(initialdir=out_var.get() or ".") or out_var.get()), **_browse_opts).grid(
+        row=row, column=2, padx=6)
+    row += 1
+
+    tk.Label(frame, text="Summaries", **_lbl_opts).grid(row=row, column=0, sticky="w", pady=3, **pad)
     sum_var = tk.StringVar(value=g_summaries_dir)
-
-    row = 0
-    tk.Checkbutton(frame, text="Auto-start transcription when app starts", variable=auto_start_var).grid(row=row, column=0, columnspan=3, sticky="w", pady=4)
+    tk.Entry(frame, textvariable=sum_var, width=50, **_entry_opts).grid(row=row, column=1, sticky="we", pady=3)
+    tk.Button(frame, text="Browse", command=lambda: sum_var.set(
+        filedialog.askdirectory(initialdir=sum_var.get() or ".") or sum_var.get()), **_browse_opts).grid(
+        row=row, column=2, padx=6)
     row += 1
 
-    tk.Label(frame, text="Transcription language").grid(row=row, column=0, sticky="w", pady=4)
-    languages = ["en", "lv", "ru", "de", "fr", "es", "it", "pt", "nl", "pl", "sv", "fi", "et", "lt", "ja", "zh", "ko", "ar", "tr"]
-    lang_combo = ttk.Combobox(frame, values=languages, textvariable=lang_var, state="readonly", width=12)
-    lang_combo.grid(row=row, column=1, sticky="w", pady=4)
+    tk.Label(frame, text="Temp audio", **_lbl_opts).grid(row=row, column=0, sticky="w", pady=3, **pad)
+    tmp_var = tk.StringVar(value=g_temp_dir)
+    tk.Entry(frame, textvariable=tmp_var, width=50, **_entry_opts).grid(row=row, column=1, sticky="we", pady=3)
+    tk.Button(frame, text="Browse", command=lambda: tmp_var.set(
+        filedialog.askdirectory(initialdir=tmp_var.get() or ".") or tmp_var.get()), **_browse_opts).grid(
+        row=row, column=2, padx=6)
     row += 1
 
-    tk.Checkbutton(frame, text="Automatically summarize transcription when stopped", variable=auto_sum_var).grid(row=row, column=0, columnspan=3, sticky="w", pady=4)
+    # ── Section: API Resilience ────────────────────────────────────────────
+    tk.Label(frame, text="API Resilience", **_section_opts).grid(
+        row=row, column=0, columnspan=3, sticky="w", pady=(14, 4), **pad)
     row += 1
 
-    tk.Checkbutton(
-        frame,
-        text="Enable internet search for assistant answers to custom prompts",
-        variable=web_search_custom_prompt_var,
-    ).grid(row=row, column=0, columnspan=3, sticky="w", pady=4)
+    _resilience_fields = [
+        ("Assistant timeout (s)", "ASSISTANT_API_TIMEOUT_SECONDS", 60),
+        ("Assistant max retries", "ASSISTANT_API_MAX_RETRIES", 3),
+        ("Assistant retry base (s)", "ASSISTANT_API_RETRY_BASE_SECONDS", 1.0),
+        ("Summary timeout (s)", "ASSISTANT_SUMMARY_TIMEOUT_SECONDS", 120),
+        ("Title timeout (s)", "ASSISTANT_TITLE_TIMEOUT_SECONDS", 30),
+        ("Transcribe timeout (s)", "TRANSCRIBE_API_TIMEOUT_SECONDS", 60),
+        ("Transcribe max retries", "TRANSCRIBE_API_MAX_RETRIES", 3),
+        ("Transcribe retry base (s)", "TRANSCRIBE_API_RETRY_BASE_SECONDS", 1.0),
+    ]
+    resilience_vars: dict[str, tk.StringVar] = {}
+    for label_text, env_key, default_val in _resilience_fields:
+        tk.Label(frame, text=label_text, **_lbl_opts).grid(row=row, column=0, sticky="w", pady=2, **pad)
+        var = tk.StringVar(value=_env_str(env_key, str(default_val)) or str(default_val))
+        resilience_vars[env_key] = var
+        tk.Entry(frame, textvariable=var, width=10, **_entry_opts).grid(row=row, column=1, sticky="w", pady=2)
+        row += 1
+
+    # ── Section: Transcript Filtering ──────────────────────────────────────
+    tk.Label(frame, text="Transcript Filtering", **_section_opts).grid(
+        row=row, column=0, columnspan=3, sticky="w", pady=(14, 4), **pad)
     row += 1
 
-    tk.Label(frame, text="Transcriptions folder").grid(row=row, column=0, sticky="w", pady=4)
-    tk.Entry(frame, textvariable=out_var, width=60).grid(row=row, column=1, sticky="we", pady=4)
-    tk.Button(frame, text="Browse", command=lambda: out_var.set(filedialog.askdirectory(initialdir=out_var.get() or ".") or out_var.get())).grid(row=row, column=2, padx=4)
+    tk.Label(frame, text="Min chars", **_lbl_opts).grid(row=row, column=0, sticky="w", pady=3, **pad)
+    filter_min_var = tk.StringVar(value=_env_str("TRANSCRIPT_FILTER_MIN_CHARS", "2") or "2")
+    tk.Entry(frame, textvariable=filter_min_var, width=10, **_entry_opts).grid(row=row, column=1, sticky="w", pady=3)
     row += 1
 
-    tk.Label(frame, text="Summaries folder").grid(row=row, column=0, sticky="w", pady=4)
-    tk.Entry(frame, textvariable=sum_var, width=60).grid(row=row, column=1, sticky="we", pady=4)
-    tk.Button(frame, text="Browse", command=lambda: sum_var.set(filedialog.askdirectory(initialdir=sum_var.get() or ".") or sum_var.get())).grid(row=row, column=2, padx=4)
+    _filter_fields = [
+        ("Exact matches", "TRANSCRIPT_FILTER_EXACT"),
+        ("Prefix matches", "TRANSCRIPT_FILTER_PREFIXES"),
+        ("Contains matches", "TRANSCRIPT_FILTER_CONTAINS"),
+        ("Regex patterns", "TRANSCRIPT_FILTER_REGEX"),
+    ]
+    filter_vars: dict[str, tk.StringVar] = {}
+    for label_text, env_key in _filter_fields:
+        tk.Label(frame, text=label_text, **_lbl_opts).grid(row=row, column=0, sticky="w", pady=2, **pad)
+        var = tk.StringVar(value=_env_str(env_key, "") or "")
+        filter_vars[env_key] = var
+        tk.Entry(frame, textvariable=var, width=60, **_entry_opts).grid(row=row, column=1, columnspan=2, sticky="we", pady=2)
+        row += 1
+
+    # ── Section: Logging ───────────────────────────────────────────────────
+    tk.Label(frame, text="Logging", **_section_opts).grid(
+        row=row, column=0, columnspan=3, sticky="w", pady=(14, 4), **pad)
+    row += 1
+
+    tk.Label(frame, text="Log level", **_lbl_opts).grid(row=row, column=0, sticky="w", pady=3, **pad)
+    log_level_var = tk.StringVar(value=_env_str("LOG_LEVEL", "INFO") or "INFO")
+    ttk.Combobox(frame, values=["DEBUG", "INFO", "WARNING", "ERROR"], textvariable=log_level_var,
+                 state="readonly", width=12).grid(row=row, column=1, sticky="w", pady=3)
+    row += 1
+
+    tk.Label(frame, text="Log file max MB", **_lbl_opts).grid(row=row, column=0, sticky="w", pady=3, **pad)
+    log_max_var = tk.StringVar(value=_env_str("LOG_FILE_MAX_MB", "5") or "5")
+    tk.Entry(frame, textvariable=log_max_var, width=10, **_entry_opts).grid(row=row, column=1, sticky="w", pady=3)
+    row += 1
+
+    tk.Label(frame, text="Log backup count", **_lbl_opts).grid(row=row, column=0, sticky="w", pady=3, **pad)
+    log_backup_var = tk.StringVar(value=_env_str("LOG_FILE_BACKUP_COUNT", "5") or "5")
+    tk.Entry(frame, textvariable=log_backup_var, width=10, **_entry_opts).grid(row=row, column=1, sticky="w", pady=3)
+    row += 1
+
+    # bottom padding so scroll ends comfortably
+    tk.Label(frame, text="", bg=theme["bg"]).grid(row=row, column=0, pady=10)
     row += 1
 
     frame.grid_columnconfigure(1, weight=1)
 
+    # ── Save / Cancel (fixed at bottom) ────────────────────────────────────
+    btn_bar = tk.Frame(win, bg=theme["bg_secondary"], padx=20, pady=10)
+    btn_bar.pack(side=tk.BOTTOM, fill=tk.X)
+
     def on_save():
         global g_language, g_auto_summarize_on_stop, g_output_dir, g_summaries_dir
         global g_assistant_web_search_for_custom_prompts
+        global g_my_name, g_interupt_manually, g_keywords, g_openai_model_for_transcript
+        global g_agent_font_size, g_default_font_size, g_temp_dir
+        global RECORD_SECONDS, SILENCE_THRESHOLD, SILENCE_DURATION, FRAME_DURATION_MS
+
+        g_my_name = name_var.get().strip() or "You"
         g_language = (lang_var.get() or "en").strip()
+        g_keywords = kw_var.get().strip() or None
+        g_interupt_manually = bool(interrupt_var.get())
         g_auto_summarize_on_stop = bool(auto_sum_var.get())
-        g_assistant_web_search_for_custom_prompts = bool(web_search_custom_prompt_var.get())
+        g_assistant_web_search_for_custom_prompts = bool(web_search_var.get())
+        g_openai_model_for_transcript = transcript_model_var.get().strip() or "gpt-4o-mini-transcribe"
+        g_agent_font_size = int(agent_fs_var.get())
+        g_default_font_size = int(default_fs_var.get())
         g_output_dir = out_var.get().strip() or "output"
         g_summaries_dir = sum_var.get().strip() or "output_summaries"
+        g_temp_dir = tmp_var.get().strip() or "tmp"
+
+        try:
+            RECORD_SECONDS = int(rec_var.get())
+        except (ValueError, tk.TclError):
+            pass
+        try:
+            SILENCE_THRESHOLD = float(sil_thresh_var.get())
+        except (ValueError, tk.TclError):
+            pass
+        try:
+            SILENCE_DURATION = float(sil_dur_var.get())
+        except (ValueError, tk.TclError):
+            pass
+        try:
+            FRAME_DURATION_MS = int(frame_dur_var.get())
+        except (ValueError, tk.TclError):
+            pass
 
         os.makedirs(g_output_dir, exist_ok=True)
         os.makedirs(g_summaries_dir, exist_ok=True)
+        os.makedirs(g_temp_dir, exist_ok=True)
 
         if g_auto_start_var is not None:
             g_auto_start_var.set(bool(auto_start_var.get()))
         _sync_auto_start_var()
 
-        _save_env_updates(
-            {
-                "AUTO_START_TRANSCRIPTION": "True" if bool(auto_start_var.get()) else "False",
-                "LANGUAGE": g_language,
-                "AUTO_SUMMARIZE_ON_STOP": "True" if g_auto_summarize_on_stop else "False",
-                "ASSISTANT_ENABLE_WEB_SEARCH_FOR_CUSTOM_PROMPTS": "True" if g_assistant_web_search_for_custom_prompts else "False",
-                "OUTPUT_DIR": g_output_dir,
-                "SUMMARIES_DIR": g_summaries_dir,
-            }
-        )
+        env_updates = {
+            "YOUR_NAME": g_my_name,
+            "LANGUAGE": g_language,
+            "INTERUPT_MANUALLY": "True" if g_interupt_manually else "False",
+            "AUTO_START_TRANSCRIPTION": "True" if bool(auto_start_var.get()) else "False",
+            "AUTO_SUMMARIZE_ON_STOP": "True" if g_auto_summarize_on_stop else "False",
+            "ASSISTANT_ENABLE_WEB_SEARCH_FOR_CUSTOM_PROMPTS": "True" if g_assistant_web_search_for_custom_prompts else "False",
+            "OPENAI_MODEL_FOR_TRANSCRIPT": g_openai_model_for_transcript,
+            "OPENAI_MODEL_FOR_ASSISTANT": assistant_model_var.get().strip(),
+            "OPENAI_VECTOR_STORE_ID_FOR_ANSWERS": vs_var.get().strip(),
+            "AGENT_FONT_SIZE": str(g_agent_font_size),
+            "DEFAULT_FONT_SIZE": str(g_default_font_size),
+            "RECORD_SECONDS": str(RECORD_SECONDS),
+            "SILENCE_THRESHOLD": str(SILENCE_THRESHOLD),
+            "SILENCE_DURATION": str(SILENCE_DURATION),
+            "FRAME_DURATION_MS": str(FRAME_DURATION_MS),
+            "OUTPUT_DIR": g_output_dir,
+            "SUMMARIES_DIR": g_summaries_dir,
+            "TEMP_DIR": g_temp_dir,
+            "KEYWORDS": g_keywords or "",
+            "LOG_LEVEL": log_level_var.get().strip(),
+            "LOG_FILE_MAX_MB": log_max_var.get().strip(),
+            "LOG_FILE_BACKUP_COUNT": log_backup_var.get().strip(),
+            "TRANSCRIPT_FILTER_MIN_CHARS": filter_min_var.get().strip(),
+        }
+
+        # API key — only overwrite when the user typed something new
+        new_key = api_key_var.get().strip()
+        if new_key:
+            env_updates["OPENAI_API_KEY"] = new_key
+
+        for env_key, var in resilience_vars.items():
+            val = var.get().strip()
+            if val:
+                env_updates[env_key] = val
+        for env_key, var in filter_vars.items():
+            env_updates[env_key] = var.get().strip()
+
+        _save_env_updates(env_updates)
 
         if g_assistant:
             g_assistant.set_custom_prompt_web_search_enabled(g_assistant_web_search_for_custom_prompts)
@@ -611,12 +906,20 @@ def _open_settings():
         _reinitialize_transcript_ai()
         reset_log_file()
         set_status("Settings saved", "info")
+        canvas.unbind_all("<MouseWheel>")
         win.destroy()
 
-    button_row = tk.Frame(frame)
-    button_row.grid(row=row, column=0, columnspan=3, sticky="e", pady=(10, 0))
-    tk.Button(button_row, text="Save", command=on_save, bg="#2ecc71", fg="white").pack(side=tk.RIGHT, padx=(5, 0))
-    tk.Button(button_row, text="Cancel", command=win.destroy).pack(side=tk.RIGHT)
+    def on_cancel():
+        canvas.unbind_all("<MouseWheel>")
+        win.destroy()
+
+    ui_module.create_styled_button(btn_bar, text="Save", command=on_save,
+                                   bg=theme["accent_green"], hover_bg=theme["accent_green_hover"],
+                                   font_size=g_default_font_size).pack(side=tk.RIGHT, padx=(6, 0))
+    ui_module.create_styled_button(btn_bar, text="Cancel", command=on_cancel,
+                                   bg=theme["surface_light"], hover_bg=theme["surface"],
+                                   fg=theme["text_secondary"],
+                                   font_size=g_default_font_size).pack(side=tk.RIGHT)
 
 
 def start_transcription():
@@ -684,6 +987,7 @@ def toggle_start_stop():
 
 
 def _run_summary_before_close(transcription_snapshot: list[list]) -> None:
+    theme = ui_module.THEME
     dialog = tk.Toplevel(root)
     dialog.title("Closing")
     dialog.geometry("440x120")
@@ -691,12 +995,16 @@ def _run_summary_before_close(transcription_snapshot: list[list]) -> None:
     dialog.transient(root)
     dialog.grab_set()
     dialog.protocol("WM_DELETE_WINDOW", lambda: None)
+    dialog.configure(bg=theme["bg"])
+    ui_module.apply_dark_title_bar(dialog)
 
     tk.Label(
         dialog,
-        text="Generating summary before closing.\nPlease wait...",
+        text="Generating summary before closing.\nPlease wait\u2026",
         justify=tk.CENTER,
-        font=("Arial", max(9, g_default_font_size)),
+        font=ui_module.get_font(max(9, g_default_font_size)),
+        bg=theme["bg"],
+        fg=theme["text_primary"],
     ).pack(padx=12, pady=(16, 8))
 
     progress = ttk.Progressbar(dialog, mode="indeterminate", length=360)
@@ -773,16 +1081,19 @@ def close_app():
 def toggle_mute():
     """Toggle the microphone mute state."""
     global mute_button
+    theme = ui_module.THEME
     if mute_mic_event.is_set():
         mute_mic_event.clear()
         logger.info("[UI] Microphone unmuted")
         root.title("Live Audio Chat")
-        mute_button.config(image=mic_icon_on, bg="#ff6b6b")
+        mute_button.config(image=mic_icon_on, bg=theme["accent_red"])
+        ui_module.add_hover_effect(mute_button, theme["accent_red"], theme["accent_red_hover"])
     else:
         mute_mic_event.set()
         logger.info("[UI] Microphone muted")
-        root.title("Live Audio Chat - MIC MUTED")
-        mute_button.config(image=mic_icon_off, bg="#2ecc40")
+        root.title("Live Audio Chat \u2014 MIC MUTED")
+        mute_button.config(image=mic_icon_off, bg=theme["surface_light"])
+        ui_module.add_hover_effect(mute_button, theme["surface_light"], theme["surface"])
 
 def reset_log_file():
     """Reset the transcription log file with a new timestamp."""
@@ -933,80 +1244,140 @@ def setup_ui():
     
     root = tk.Tk()
     root.title("Live Audio Chat")
-    root.geometry("600x400")
-    
-    # Create button frame at the top
-    button_frame = tk.Frame(root)
-    button_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
+    root.geometry("700x500")
+    root.minsize(600, 400)
 
-    start_stop_button = tk.Button(
-        button_frame,
-        text="Start",
+    theme = ui_module.THEME
+    root.configure(bg=theme["bg"])
+    ui_module.apply_dark_title_bar(root)
+
+    # ── Toolbar ────────────────────────────────────────────────────────────
+    toolbar = tk.Frame(root, bg=theme["bg_secondary"], padx=10, pady=7)
+    toolbar.pack(side=tk.TOP, fill=tk.X)
+
+    left_group = tk.Frame(toolbar, bg=theme["bg_secondary"])
+    left_group.pack(side=tk.LEFT)
+
+    start_stop_button = ui_module.create_styled_button(
+        left_group,
+        text="\u25B6  Start",
         command=toggle_start_stop,
-        bg="#2ecc71",
-        fg="white",
-        font=("Arial", g_default_font_size, "bold"),
+        bg=theme["accent_green"],
+        hover_bg=theme["accent_green_hover"],
+        font_size=g_default_font_size,
     )
-    start_stop_button.pack(side=tk.LEFT, padx=(0, 5))
+    start_stop_button.pack(side=tk.LEFT, padx=(0, 6))
 
     g_auto_start_var = tk.BooleanVar(value=g_auto_start_transcription)
-    settings_button = tk.Button(
-        button_frame,
-        text="Settings",
+
+    settings_button = ui_module.create_styled_button(
+        left_group,
+        text="\u2699",
         command=_open_settings,
-        bg="#6c5ce7",
-        fg="white",
-        font=("Arial", g_default_font_size, "bold"),
+        bg=theme["accent_purple"],
+        hover_bg=theme["accent_purple_hover"],
+        font_size=g_default_font_size,
     )
-    settings_button.pack(side=tk.LEFT, padx=(0, 5))
+    settings_button.pack(side=tk.LEFT, padx=(0, 6))
 
     mic_icon_on, mic_icon_off = _create_mic_icons()
-    
-    # Create Mute button
-    mute_button = tk.Button(button_frame, image=mic_icon_on, command=toggle_mute,
-                           bg="#ff6b6b", fg="white", font=("Arial", g_default_font_size, "bold"))
-    mute_button.pack(side=tk.LEFT, padx=(0, 5))
-    
+
+    mute_button = tk.Button(
+        left_group,
+        image=mic_icon_on,
+        command=toggle_mute,
+        bg=theme["accent_red"],
+        activebackground=theme["accent_red_hover"],
+        relief=tk.FLAT,
+        bd=0,
+        highlightthickness=0,
+        cursor="hand2",
+        padx=8,
+        pady=5,
+    )
+    mute_button.pack(side=tk.LEFT, padx=(0, 6))
+    ui_module.add_hover_effect(mute_button, theme["accent_red"], theme["accent_red_hover"])
+
     if g_assistant:
-        # Create custom prompt input field
-        prompt_frame = tk.Frame(button_frame)
-        prompt_frame.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(5, 0))
-        
-        custom_prompt_entry = tk.Entry(prompt_frame, font=("Arial", g_default_font_size))
-        custom_prompt_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
-        custom_prompt_entry.bind('<Return>', lambda event: send_custom_prompt())
-        
-        send_prompt_button = tk.Button(
+        # ── Prompt entry (right side of toolbar) ──
+        prompt_frame = tk.Frame(toolbar, bg=theme["bg_secondary"])
+        prompt_frame.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(14, 0))
+
+        custom_prompt_entry = tk.Entry(
             prompt_frame,
-            text="Send to AI",
-            command=send_custom_prompt,
-            bg="#1f8ef1",
-            fg="white",
-            font=("Arial", g_default_font_size, "bold"),
+            font=ui_module.get_font(g_default_font_size),
+            bg=theme["input_bg"],
+            fg=theme["input_fg"],
+            insertbackground=theme["text_primary"],
+            relief=tk.FLAT,
+            highlightbackground=theme["border"],
+            highlightcolor=theme["accent_blue"],
+            highlightthickness=1,
+            bd=6,
         )
-        send_prompt_button.pack(side=tk.LEFT)
-        
-        assistant_buttons = {}  # Keep empty dict for compatibility
+        custom_prompt_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        custom_prompt_entry.bind('<Return>', lambda event: send_custom_prompt())
+
+        send_prompt_button = ui_module.create_styled_button(
+            prompt_frame,
+            text="Ask",
+            command=send_custom_prompt,
+            bg=theme["accent_blue"],
+            hover_bg=theme["accent_blue_hover"],
+            font_size=g_default_font_size,
+        )
+        send_prompt_button.pack(side=tk.RIGHT)
+
+        assistant_buttons = {}
     else:
         assistant_buttons = {}
-    
-    chat_window = tk.Text(root, wrap=tk.WORD, state=tk.DISABLED)
-    chat_window.pack(expand=True, fill=tk.BOTH, padx=5, pady=(0, 5))
-    chat_window.tag_config("microphone", foreground="blue")
-    chat_window.tag_config("output", foreground="green")
-    chat_window.tag_config("agent", foreground="gray", font=("Arial", g_agent_font_size, "bold"))
+
+    # ── Thin separator ─────────────────────────────────────────────────────
+    tk.Frame(root, bg=theme["border"], height=1).pack(side=tk.TOP, fill=tk.X)
+
+    # ── Status bar (pack before chat so it stays at the bottom) ────────────
+    status_bar = tk.Frame(root, bg=theme["status_bg"])
+    status_bar.pack(side=tk.BOTTOM, fill=tk.X)
 
     status_label = tk.Label(
-        root,
+        status_bar,
         text="Status: Ready",
         anchor="w",
-        bg="#ecf0f1",
-        fg="#2d3436",
-        font=("Arial", max(8, g_default_font_size - 1)),
-        padx=6,
-        pady=3,
+        bg=theme["status_bg"],
+        fg=theme["status_info"],
+        font=ui_module.get_font(max(8, g_default_font_size - 1)),
+        padx=10,
+        pady=4,
     )
-    status_label.pack(side=tk.BOTTOM, fill=tk.X)
+    status_label.pack(fill=tk.X)
+
+    # ── Chat area (fills remaining space) ──────────────────────────────────
+    chat_frame = tk.Frame(root, bg=theme["bg"], padx=8, pady=6)
+    chat_frame.pack(expand=True, fill=tk.BOTH)
+
+    chat_window = tk.Text(
+        chat_frame,
+        wrap=tk.WORD,
+        state=tk.DISABLED,
+        bg=theme["surface"],
+        fg=theme["text_primary"],
+        font=ui_module.get_font(g_default_font_size),
+        relief=tk.FLAT,
+        padx=12,
+        pady=10,
+        insertbackground=theme["text_primary"],
+        selectbackground=theme["accent_blue"],
+        selectforeground=theme["text_primary"],
+        highlightthickness=1,
+        highlightbackground=theme["border"],
+        highlightcolor=theme["border"],
+        bd=0,
+        spacing1=2,
+        spacing3=2,
+    )
+    chat_window.pack(expand=True, fill=tk.BOTH)
+    ui_module.setup_chat_tags(chat_window, g_agent_font_size, g_default_font_size)
+
     set_status("Ready", "info")
     
     # Bind extra events to see when the window is being hidden/destroyed.
