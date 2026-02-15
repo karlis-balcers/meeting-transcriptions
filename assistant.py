@@ -58,6 +58,7 @@ class Assistant:
             os.getenv("ASSISTANT_ENABLE_WEB_SEARCH_FOR_CUSTOM_PROMPTS"),
             default=True,
         )
+        self.background_context: Optional[str] = None
         logger.info("Assistant model: %s", self.model)
         logger.info("Assistant custom-prompt web search enabled: %s", self.custom_prompt_web_search_enabled)
 
@@ -71,6 +72,13 @@ class Assistant:
         if value in {"0", "false", "no", "n", "off"}:
             return False
         return default
+
+    def set_background_context(self, context: Optional[str]) -> None:
+        """Set background context that is included in every AI call."""
+        self.background_context = context.strip() if context else None
+        logger.info("Assistant background context %s (%s chars)",
+                    "loaded" if self.background_context else "cleared",
+                    len(self.background_context) if self.background_context else 0)
 
     def set_custom_prompt_web_search_enabled(self, enabled: bool) -> None:
         self.custom_prompt_web_search_enabled = bool(enabled)
@@ -430,7 +438,12 @@ The user is in a live meeting and shares raw transcript snippets. Treat earlier 
         if directive is None:
             directive = mode_directives["answer_question"]
 
-        return f"{base}\n\nMode directive: {directive}"
+        prompt = f"{base}\n\nMode directive: {directive}"
+
+        if self.background_context:
+            prompt += f"\n\n**Background Context:**\nUse this information to better understand meeting participants, terminology, and project context:\n\n{self.background_context}"
+
+        return prompt
 
 
     def _answer(self, timestamp: float, messages_snapshot: Optional[list[Message]] = None, mode: str = "answer_question"):

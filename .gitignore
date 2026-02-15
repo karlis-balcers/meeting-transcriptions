@@ -107,3 +107,4 @@ output/*
 output_summaries/*
 # Microsoft Teams control files
 teams_controls*.txt
+context.md

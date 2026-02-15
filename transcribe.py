@@ -272,6 +272,29 @@ def _reinitialize_transcript_ai() -> None:
         logger.error("Failed to reinitialize transcription model: %s", e)
         set_status("Transcription reinit failed", "error")
 
+
+def load_context_file():
+    """Load background context from the configured context file if it exists."""
+    try:
+        context_file = g_context_file
+    except NameError:
+        context_file = "context.md"
+    if not context_file:
+        context_file = "context.md"
+    if os.path.exists(context_file):
+        try:
+            with open(context_file, 'r', encoding='utf-8') as f:
+                context = f.read().strip()
+            if context:
+                logger.info("[Context] Loaded %s characters from %s", len(context), context_file)
+                return context
+        except Exception as e:
+            logger.warning("[Context] Error loading %s: %s", context_file, e)
+    else:
+        logger.info("[Context] No context file found at %s", context_file)
+    return None
+
+
 load_dotenv()  # Load variables from .env file
 
 g_startup_warnings: list[str] = []
@@ -329,6 +352,10 @@ if g_open_api_key:
             status_callback=_assistant_status_callback,
         )
         g_assistant.set_custom_prompt_web_search_enabled(g_assistant_web_search_for_custom_prompts)
+        # Load background context and push to assistant at startup
+        _startup_context = load_context_file()
+        if _startup_context:
+            g_assistant.set_background_context(_startup_context)
         if g_vector_store_id:
             logger.info("Assistant configured with vector store ID: %s", g_vector_store_id)
         else:
@@ -396,6 +423,9 @@ g_temp_dir = _env_str("TEMP_DIR", "tmp")
 if not os.path.exists(g_temp_dir):
     os.makedirs(g_temp_dir)
 
+# Context file for background information included in every AI call
+g_context_file = _env_str("CONTEXT_FILE", "context.md")
+
 # Delete all wav files in the temporary audio directory
 for file in os.listdir(g_temp_dir):
     if file.endswith(".wav"):
@@ -461,7 +491,7 @@ def _create_mic_icons():
     theme = ui_module.THEME
     on_bg = theme["accent_red"]
     off_bg = theme["surface_light"]
-    size = 28
+    size = 36
 
     on_icon = tk.PhotoImage(width=size, height=size)
     off_icon = tk.PhotoImage(width=size, height=size)
@@ -472,26 +502,26 @@ def _create_mic_icons():
     mic_off_color = theme["text_muted"]
 
     # Microphone body (scaled)
-    for x in range(10, 18):
-        for y in range(4, 15):
+    for x in range(13, 23):
+        for y in range(5, 19):
             on_icon.put(mic_on_color, (x, y))
             off_icon.put(mic_off_color, (x, y))
     # Rounded top hint
-    for x in range(11, 17):
-        on_icon.put(mic_on_color, (x, 3))
-        off_icon.put(mic_off_color, (x, 3))
+    for x in range(14, 22):
+        on_icon.put(mic_on_color, (x, 4))
+        off_icon.put(mic_off_color, (x, 4))
     # Stem and base
-    for y in range(15, 22):
-        for x in range(13, 15):
+    for y in range(19, 28):
+        for x in range(17, 19):
             on_icon.put(mic_on_color, (x, y))
             off_icon.put(mic_off_color, (x, y))
-    for x in range(8, 20):
-        on_icon.put(mic_on_color, (x, 22))
-        off_icon.put(mic_off_color, (x, 22))
+    for x in range(10, 26):
+        on_icon.put(mic_on_color, (x, 28))
+        off_icon.put(mic_off_color, (x, 28))
 
     # Mute cross-line
     strike = theme["accent_red"]
-    for i in range(4, 24):
+    for i in range(5, 31):
         off_icon.put(strike, (i, i))
         if i + 1 < size:
             off_icon.put(strike, (i + 1, i))
@@ -506,9 +536,21 @@ def _update_start_stop_button():
     if g_is_recording:
         start_stop_button.config(text="\u25A0  Stop", bg=theme["accent_red"])
         ui_module.add_hover_effect(start_stop_button, theme["accent_red"], theme["accent_red_hover"])
+        if send_prompt_button:
+            send_prompt_button.config(state=tk.NORMAL)
+        if custom_prompt_entry:
+            custom_prompt_entry.config(state=tk.NORMAL)
+        if settings_button:
+            settings_button.config(state=tk.DISABLED)
     else:
         start_stop_button.config(text="\u25B6  Start", bg=theme["accent_green"])
         ui_module.add_hover_effect(start_stop_button, theme["accent_green"], theme["accent_green_hover"])
+        if send_prompt_button:
+            send_prompt_button.config(state=tk.DISABLED)
+        if custom_prompt_entry:
+            custom_prompt_entry.config(state=tk.DISABLED)
+        if settings_button:
+            settings_button.config(state=tk.NORMAL)
 
 
 def _sync_auto_start_var():
@@ -522,7 +564,7 @@ def _open_settings():
     global g_language, g_auto_summarize_on_stop, g_output_dir, g_summaries_dir
     global g_assistant_web_search_for_custom_prompts
     global g_my_name, g_interupt_manually, g_keywords, g_openai_model_for_transcript
-    global g_agent_font_size, g_default_font_size, g_temp_dir
+    global g_agent_font_size, g_default_font_size, g_temp_dir, g_context_file
 
     win = tk.Toplevel(root)
     win.title("Settings")
@@ -606,6 +648,16 @@ def _open_settings():
     tk.Label(frame, text="Keywords", **_lbl_opts).grid(row=row, column=0, sticky="w", pady=3, **pad)
     kw_var = tk.StringVar(value=g_keywords or "")
     tk.Entry(frame, textvariable=kw_var, width=60, **_entry_opts).grid(row=row, column=1, columnspan=2, sticky="we", pady=3)
+    row += 1
+
+    tk.Label(frame, text="Context file", **_lbl_opts).grid(row=row, column=0, sticky="w", pady=3, **pad)
+    ctx_var = tk.StringVar(value=g_context_file or "")
+    tk.Entry(frame, textvariable=ctx_var, width=50, **_entry_opts).grid(row=row, column=1, sticky="we", pady=3)
+    tk.Button(frame, text="Browse", command=lambda: ctx_var.set(
+        filedialog.askopenfilename(
+            initialdir=os.path.dirname(ctx_var.get()) or ".",
+            filetypes=[("Markdown / Text", "*.md *.txt *.markdown"), ("All files", "*.*")],
+        ) or ctx_var.get()), **_browse_opts).grid(row=row, column=2, padx=6)
     row += 1
 
     interrupt_var = tk.BooleanVar(value=g_interupt_manually)
@@ -819,7 +871,7 @@ def _open_settings():
         global g_language, g_auto_summarize_on_stop, g_output_dir, g_summaries_dir
         global g_assistant_web_search_for_custom_prompts
         global g_my_name, g_interupt_manually, g_keywords, g_openai_model_for_transcript
-        global g_agent_font_size, g_default_font_size, g_temp_dir
+        global g_agent_font_size, g_default_font_size, g_temp_dir, g_context_file
         global RECORD_SECONDS, SILENCE_THRESHOLD, SILENCE_DURATION, FRAME_DURATION_MS
 
         g_my_name = name_var.get().strip() or "You"
@@ -834,6 +886,12 @@ def _open_settings():
         g_output_dir = out_var.get().strip() or "output"
         g_summaries_dir = sum_var.get().strip() or "output_summaries"
         g_temp_dir = tmp_var.get().strip() or "tmp"
+        g_context_file = ctx_var.get().strip() or ""
+
+        # Reload context and push to assistant
+        if g_assistant:
+            ctx_content = load_context_file()
+            g_assistant.set_background_context(ctx_content)
 
         try:
             RECORD_SECONDS = int(rec_var.get())
@@ -879,6 +937,7 @@ def _open_settings():
             "OUTPUT_DIR": g_output_dir,
             "SUMMARIES_DIR": g_summaries_dir,
             "TEMP_DIR": g_temp_dir,
+            "CONTEXT_FILE": g_context_file or "",
             "KEYWORDS": g_keywords or "",
             "LOG_LEVEL": log_level_var.get().strip(),
             "LOG_FILE_MAX_MB": log_max_var.get().strip(),
@@ -928,14 +987,12 @@ def start_transcription():
     if g_is_recording:
         return
 
+    g_devices_initialized = initialize_recording()
     if not g_devices_initialized:
-        g_devices_initialized = initialize_recording()
-        if not g_devices_initialized:
-            set_status("Failed to initialize recording devices", "error")
-            return
+        set_status("Failed to initialize recording devices", "error")
+        return
 
     stop_event.clear()
-    mute_mic_event.clear()
     _drain_queue(g_recordings_in)
     _drain_queue(g_recordings_out)
     _drain_queue(g_transcriptions_in)
@@ -1122,22 +1179,6 @@ def reset_log_file():
         logger.error("[UI] Error creating new log file: %s", e)
 
 
-def load_context_file():
-    """Load background context from context.md if it exists."""
-    context_file = "context.md"
-    if os.path.exists(context_file):
-        try:
-            with open(context_file, 'r', encoding='utf-8') as f:
-                context = f.read().strip()
-            if context:
-                logger.info("[Context] Loaded %s characters from %s", len(context), context_file)
-                return context
-        except Exception as e:
-            logger.warning("[Context] Error loading %s: %s", context_file, e)
-    else:
-        logger.info("[Context] No context file found at %s", context_file)
-    return None
-
 def send_custom_prompt():
     """Send a custom prompt from the user to the assistant."""
     if not g_assistant:
@@ -1292,7 +1333,7 @@ def setup_ui():
         bd=0,
         highlightthickness=0,
         cursor="hand2",
-        padx=8,
+        padx=14,
         pady=5,
     )
     mute_button.pack(side=tk.LEFT, padx=(0, 6))
@@ -1325,8 +1366,10 @@ def setup_ui():
             bg=theme["accent_blue"],
             hover_bg=theme["accent_blue_hover"],
             font_size=g_default_font_size,
+            state=tk.DISABLED,
         )
         send_prompt_button.pack(side=tk.RIGHT)
+        custom_prompt_entry.config(state=tk.DISABLED)
 
         assistant_buttons = {}
     else:
@@ -1556,9 +1599,6 @@ def main():
     os.makedirs(g_output_dir, exist_ok=True)
     os.makedirs(g_temp_dir, exist_ok=True)
     root = setup_ui()
-    g_devices_initialized = initialize_recording()
-    if not g_devices_initialized:
-        logger.error("[Main] Failed to initialize recording devices. You can still open settings.")
 
     _update_start_stop_button()
     if g_auto_start_transcription:
