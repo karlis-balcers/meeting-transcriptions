@@ -1,101 +1,176 @@
-# Live Audio Chat with Transcription and Speaker Identification
+# Meeting Transcription Service
 
-This Python application provides real-time audio recording, transcription, and chat integration. It is designed for use in virtual meetings, enabling users to capture audio streams, transcribe them, and display the results in a user-friendly GUI. The application also identifies speakers in Microsoft Teams and integrates with OpenAI's GPT model to generate intelligent responses or questions based on the transcript.
+Real-time meeting transcription desktop app with a built-in AI meeting assistant.
 
-## Features
+It captures microphone and system audio, transcribes speech, detects active speakers in Microsoft Teams (Windows), and can generate assistant replies or meeting summaries using OpenAI.
 
-- **Real-Time Audio Recording**:
-  - Captures audio from both the microphone and system output.
-  - Supports silence detection and manual splitting of audio streams.
+## What it does
 
-- **Transcription**:
-  - Utilizes the `faster_whisper` library for fast and accurate transcription.
-  - Supports transcription using OpenAI's API via the `openai_transcribe.py` module.
-  - Filters out irrelevant or unwanted segments during transcription.
+- Live transcription from:
+  - Microphone input
+  - System output (WASAPI loopback on Windows)
+- Speaker tracking from Microsoft Teams window metadata (Windows)
+- Tkinter UI with Start/Stop workflow and live status line
+- AI assistant answers to user-entered prompts during meetings
+- Optional internet search for assistant custom prompts (configurable)
+- Optional auto-summary generation when transcription stops
+- Transcript filtering to suppress common artifacts/hallucinations
+- Markdown output for transcripts and summaries
 
-- **Speaker Identification**:
-  - Connects to Microsoft Teams using `pywinauto` to identify the current speaker.
-  - Extracts speaker names using regex patterns.
+## Current UI behavior
 
-- **Chat Integration**:
-  - Displays transcriptions in a Tkinter-based GUI.
-  - Integrates with OpenAI's GPT model to generate responses or questions based on the transcript.
+- `Start` begins a **fully new transcription session**:
+  - clears in-memory transcript view
+  - creates a fresh transcript file
+  - resets pending queues/buffers
+- `Stop` ends active transcription.
+- There is **no "Reset Log" button** (Start already resets).
+- There is **no "Generate Summary" button** in the main window.
+  - Summaries are generated through auto-summary flow if enabled.
 
-- **Threaded Architecture**:
-  - Uses multiple threads for audio recording, transcription, and speaker identification to ensure real-time performance.
+## Architecture at a glance
 
-- **Environment Configuration**:
-  - Loads configuration variables (e.g., API keys, language settings) from a `.env` file.
-
-- **Output Management**:
-  - Stores temporary audio files in an `output` directory and deletes them after processing.
+- `transcribe.py` - app orchestration, UI lifecycle, settings dialog, thread startup/shutdown
+- `assistant.py` - assistant messaging, OpenAI Responses API calls, retries/backoff
+- `openai_transcribe.py` - OpenAI transcription integration with retry handling
+- `audio_capture.py` - audio stream capture and segmentation helpers
+- `speaker_detection.py` - Teams speaker/title detection (Windows)
+- `transcript_store.py` - thread-safe transcript storage + persistence
+- `transcript_filter.py` - configurable filtering logic
+- `ui.py` - transcript rendering + status color helpers
+- `summary_utils.py` - summary title filename sanitization
+- `env_utils.py` - reusable env parsing helpers
 
 ## Requirements
 
-- Python 3.8 or higher
-- CUDA-enabled GPU (for Whisper model)
-- Required Python libraries (see `pyproject.toml` or `poetry.lock`)
+- Python `3.11+`
+- Poetry
+- Windows recommended for full feature set:
+  - WASAPI loopback capture
+  - Teams speaker detection via `pywinauto`
+
+On Linux/macOS, transcription works with reduced feature set (no Teams speaker integration).
 
 ## Installation
 
-1. Clone the repository:
-   ```bash
-   git clone <repository-url>
-   cd meeting-transcriptions
-   ```
+1. Clone repository and enter project folder.
+2. Run first-time setup script for your OS:
+   - Windows: `first_time_install_win.bat`
+   - Linux: `first_time_install_linux.sh`
+   - macOS: `first_time_install_mac.sh`
+3. Create `.env` from `env.sample` and fill required values.
 
-2. Install dependencies using Poetry:
-   ```bash
-   first_time_install_<os>.bat|sh
-   ```
+## Running
 
-3. Create a `.env` file in the project root and add the following variables:
-   ```env
-    YOUR_NAME=John
-    LANGUAGE=en
-    INTERUPT_MANUALLY=True
-    OPENAI_API_KEY=<Your Open AI API Key - from the same organization as the Assistant, if you will use it>
-    # Comment out if you don't want answers from Assistant. Set the right vector store ID with the right knowledge (should start wtith vs_*)
-    OPENAI_VECTOR_STORE_ID_FOR_ANSWERS=
-    # Comment out if you don't want to use OpenAI for transcription, but use local model instead
-    OPENAI_MODEL_FOR_TRANSCRIPT=gpt-4o-mini-transcribe
-    #OPENAI_MODEL_FOR_TRANSCRIPT=gpt-4o-transcribe
-    # Complex words to transcribe:
-    KEYWORDS="Cat, Mouse, Dog"
-   ```
+- Windows: `run_transcribe_win.bat`
+- Linux: `run_transcribe_linux.sh`
+- macOS: `run_transcribe_mac.sh`
 
-## Usage
+## Configuration (`.env`)
 
-1. Run the application:
-   ```bash
-   run_transcribe_<os>.bat|sh
-   ```
+Use `env.sample` as the source of truth. Important settings:
 
-2. The GUI will launch, displaying the live transcription and chat interface.
+### Required
 
-3. Use the following key bindings for manual splitting:
-   - Press any letter key (`a-z`) to trigger a manual split.
+- `OPENAI_API_KEY` - required for OpenAI transcription and assistant features
 
-4. The application will automatically detect silence and split audio streams accordingly.
+### Identity and language
 
-## File Structure
+- `YOUR_NAME` - your speaker label in transcript
+- `LANGUAGE` - transcription language code (for example `en`, `lv`)
 
-- `transcribe.py`: Main application file.
-- `output/`: Directory for temporary audio files and transcription files.
-- `.env`: Configuration file for environment variables.
-- `pyproject.toml` and `poetry.lock`: Dependency management files.
+### Session behavior
 
-## Notes
+- `AUTO_START_TRANSCRIPTION` - auto-start on app launch
+- `AUTO_SUMMARIZE_ON_STOP` - generate summary when stopping transcription
 
-- The application is optimized for use with Microsoft Teams but can be adapted for other platforms.
+### Assistant behavior
 
-## License
+- `OPENAI_MODEL_FOR_ASSISTANT` - assistant model (default in sample: `gpt-5.2`)
+- `OPENAI_VECTOR_STORE_ID_FOR_ANSWERS` - optional file search source
+- `ASSISTANT_ENABLE_WEB_SEARCH_FOR_CUSTOM_PROMPTS` - enable/disable internet search tool for user-entered prompts
 
-This project is licensed under the MIT License. See the LICENSE file for details.
+### Transcription behavior
 
-## Acknowledgments
+- `OPENAI_MODEL_FOR_TRANSCRIPT` - OpenAI transcription model
+- `KEYWORDS` - domain keywords to improve recognition quality
 
-- [Faster Whisper](https://github.com/guillaumekln/faster-whisper)
-- [PyAudio](https://people.csail.mit.edu/hubert/pyaudio/)
-- [PyWinAuto](https://pywinauto.github.io/)
-- [OpenAI](https://openai.com/)
+### Audio segmentation
+
+- `RECORD_SECONDS`
+- `SILENCE_THRESHOLD`
+- `SILENCE_DURATION`
+- `FRAME_DURATION_MS`
+
+### Output paths
+
+- `OUTPUT_DIR` - transcript markdown output directory
+- `TEMP_DIR` - temporary WAV chunk directory (default `tmp`)
+- `SUMMARIES_DIR` - summary markdown output directory
+
+### Reliability and logging
+
+- `ASSISTANT_API_*` timeout/retry settings
+- `TRANSCRIBE_API_*` timeout/retry settings
+- `LOG_LEVEL`, `LOG_FILE_MAX_MB`, `LOG_FILE_BACKUP_COUNT`
+
+### Filtering
+
+- `TRANSCRIPT_FILTER_MIN_CHARS`
+- Optional extension lists: `TRANSCRIPT_FILTER_EXACT`, `TRANSCRIPT_FILTER_PREFIXES`, `TRANSCRIPT_FILTER_CONTAINS`, `TRANSCRIPT_FILTER_REGEX`
+
+## Settings window
+
+The app settings dialog allows runtime updates and persists them to `.env`:
+
+- Auto-start transcription
+- Transcription language
+- Auto-summarize on stop
+- Enable internet search for assistant custom prompts
+- Transcriptions folder
+- Summaries folder
+
+## Output files
+
+- Transcriptions are written as Markdown:
+  - `output/transcription-YYYYMMDD_HHMMSS.md` (or custom `OUTPUT_DIR`)
+- Summaries are written as Markdown:
+  - `output_summaries/YYYYMMDD_HHMMSS_<ai_title>.md` (or custom `SUMMARIES_DIR`)
+- Temporary `.wav` files are written to `tmp/` (or custom `TEMP_DIR`) and cleaned up.
+
+## Development and testing
+
+Run tests locally:
+
+- `python -m unittest discover -s tests -p "test_*.py"`
+
+CI:
+
+- GitHub Actions workflow at `.github/workflows/tests.yml`
+- Runs unit tests on Python `3.11` and `3.12`
+
+## Troubleshooting
+
+- No audio captured:
+  - verify input/output devices and OS audio permissions
+- Teams speaker name not detected:
+  - feature is Windows-only and depends on Teams window state/title patterns
+- API failures/timeouts:
+  - verify `OPENAI_API_KEY`
+  - tune retry/timeout env variables
+- Empty/low-value transcript fragments:
+  - tune filter settings and `KEYWORDS`
+
+## Security notes
+
+- Do not commit `.env`
+- Keep API keys in environment variables only
+- Review transcript and summary storage locations for sensitive meeting data
+
+## Project status notes
+
+- This project currently does not include a `LICENSE` file in the repository.
+
+---
+
+If you are actively iterating on features, keep `env.sample` and `README.md` updated together to avoid config drift.

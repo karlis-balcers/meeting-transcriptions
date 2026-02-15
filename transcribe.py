@@ -9,30 +9,146 @@ import time
 import wave
 import os
 import tkinter as tk
+from tkinter import ttk, filedialog
 from threading import Thread, Event, Lock
 from queue import Queue, Empty
 import signal
+import logging
 from datetime import datetime
 from dotenv import load_dotenv
 import numpy as np
 import struct
 
-if sys.platform == "win32":
-    from pywinauto import Application
-import re
 import assistant
 #import fastwhisper_transcribe
 import openai_transcribe
+import audio_capture as audio_capture_module
+import ui as ui_module
+from logging_utils import setup_logging
+from transcript_store import TranscriptStore
+from transcript_filter import TranscriptFilter
+from summary_utils import sanitize_title_for_filename
+from speaker_detection import TeamsSpeakerDetector
 
-print("Loading configuration from '.env' file...")
+setup_logging(app_name="meeting-transcriptions", log_dir=os.path.join("output", "logs"))
+logger = logging.getLogger("transcribe")
+
+logger.info("Loading configuration from '.env' file...")
 
 
-# Constants
-RECORD_SECONDS = 300 
-#RECORD_SECONDS = 120  # Updated from 5 to 60 seconds (5 minutes = 55 MB, OpenAPI only support up to 25 MB files)
+def _env_str(name: str, default: str | None = None) -> str | None:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    value = value.strip()
+    return value if value else default
 
-SILENCE_THRESHOLD = 50  # Adjust this based on your microphone sensitivity
-SILENCE_DURATION = 1.0  # seconds
+
+def _env_int(name: str, default: int, warnings: list[str]) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        warnings.append(f"Invalid integer for {name}='{raw}'. Using default {default}.")
+        return default
+
+
+def _env_float(name: str, default: float, warnings: list[str]) -> float:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        warnings.append(f"Invalid number for {name}='{raw}'. Using default {default}.")
+        return default
+
+
+def _env_bool(name: str, default: bool, warnings: list[str]) -> bool:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+
+    value = raw.strip().lower()
+    truthy = {"1", "true", "yes", "y", "on"}
+    falsy = {"0", "false", "no", "n", "off"}
+
+    if value in truthy:
+        return True
+    if value in falsy:
+        return False
+
+    warnings.append(
+        f"Invalid boolean for {name}='{raw}'. Using default {default}."
+    )
+    return default
+
+
+def _decode_env_multiline(raw: str | None, default: str = "") -> str:
+    if raw is None:
+        return default
+    value = raw.strip()
+    if not value:
+        return default
+    return value.replace("\\r\\n", "\n").replace("\\n", "\n")
+
+
+def _encode_env_multiline(value: str) -> str:
+    normalized = (value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    return normalized.replace("\n", "\\n")
+
+
+LIVE_ASSISTANT_PANEL_CONFIG: list[tuple[str, str, str]] = [
+    ("answer_question", "Anwers", "ASSISTANT_LIVE_ANSWERS_ENABLED"),
+    ("suggest_questions", "Suggested Questions", "ASSISTANT_LIVE_SUGGESTIONS_ENABLED"),
+    ("explain_it", "Explanation", "ASSISTANT_LIVE_EXPLANATION_ENABLED"),
+    ("get_facts", "Facts", "ASSISTANT_LIVE_FACTS_ENABLED"),
+]
+
+
+def _print_startup_summary() -> None:
+    logger.info("=== Startup Configuration Summary ===")
+    logger.info("Platform: %s", sys.platform)
+    logger.info("User name: %s", g_my_name)
+    logger.info("Language: %s", g_language)
+    logger.info("Manual interrupt enabled: %s", g_interupt_manually)
+    logger.info("Transcript model: %s", g_openai_model_for_transcript)
+    logger.info("Record seconds: %s", RECORD_SECONDS)
+    logger.info("Silence threshold: %s", SILENCE_THRESHOLD)
+    logger.info("Silence duration: %s", SILENCE_DURATION)
+    logger.info("Frame duration (ms): %s", FRAME_DURATION_MS)
+    logger.info("Auto-start transcription: %s", g_auto_start_transcription)
+    logger.info("Auto-summarize on stop: %s", g_auto_summarize_on_stop)
+    logger.info("Assistant web search for custom prompts: %s", g_assistant_web_search_for_custom_prompts)
+    for mode, label, _env_key in LIVE_ASSISTANT_PANEL_CONFIG:
+        logger.info("Live assistant %s enabled: %s", label, g_live_assistant_mode_enabled.get(mode, False))
+    logger.info("Transcription output dir: %s", g_output_dir)
+    logger.info("Temporary audio dir: %s", g_temp_dir)
+    logger.info("Summary output dir: %s", g_summaries_dir)
+    logger.info("Keywords configured: %s", 'yes' if g_keywords else 'no')
+    logger.info("OpenAI API key configured: %s", 'yes' if g_open_api_key else 'no')
+    logger.info("Assistant enabled: %s", 'yes' if g_assistant else 'no')
+    logger.info("Vector store configured: %s", 'yes' if g_vector_store_id else 'no')
+    teams_available = False
+    if g_speaker_detector is not None:
+        teams_available = g_speaker_detector.is_connected()
+    logger.info("Teams integration available: %s", 'yes' if teams_available else 'no')
+    if g_startup_warnings:
+        logger.warning("Startup warnings detected:")
+        for warning in g_startup_warnings:
+            logger.warning("  - %s", warning)
+    else:
+        logger.info("Warnings: none")
+    logger.info("=====================================")
+
+
+# Default constants (can be overridden by .env)
+DEFAULT_RECORD_SECONDS = 300
+DEFAULT_SILENCE_THRESHOLD = 50.0
+DEFAULT_SILENCE_DURATION = 1.0
+DEFAULT_FRAME_DURATION_MS = 100
 
 # Global Queues & Event
 g_recordings_in = Queue()
@@ -40,8 +156,11 @@ g_recordings_out = Queue()
 g_transcriptions_in = Queue()
 stop_event = Event()
 mute_mic_event = Event()  # Event to control microphone muting
-g_transcription = []
-#g_transcription_lock = Lock()
+g_transcript_store = None
+g_transcript_filter = None
+g_status_lock = Lock()
+g_status_message = "Ready"
+g_status_level = "info"
 
 g_device_in = {}
 g_device_out = {}
@@ -52,75 +171,262 @@ flush_letter_mic = None
 flush_letter_out = None
 flush_letter_lock = Lock()
 
+root = None
+status_label = None
+g_speaker_detector = None
+g_recording_threads: list[Thread] = []
+g_is_recording = False
+g_devices_initialized = False
+
+start_stop_button = None
+settings_button = None
+
+g_auto_start_transcription = False
+g_auto_summarize_on_stop = False
+g_assistant_web_search_for_custom_prompts = True
+
+g_auto_start_var = None
+g_auto_summarize_var = None
+
+mic_icon_on = None
+mic_icon_off = None
+g_is_closing = False
+
+
+def _normalize_transcription_text(text: str) -> str:
+    """Convert escaped newline sequences to real newlines and normalize line endings."""
+    if text is None:
+        return ""
+    normalized = str(text).replace("\\r\\n", "\\n").replace("\\r", "\\n")
+    normalized = normalized.replace("\\\\n", "\n")
+    return normalized
+
+
+def set_status(message: str, level: str = "info"):
+    """Update global status and refresh UI label if available."""
+    global g_status_message, g_status_level
+
+    if not message:
+        return
+
+    with g_status_lock:
+        g_status_message = message
+        g_status_level = (level or "info").lower()
+
+    if root is None or status_label is None:
+        return
+
+    def _apply_status():
+        with g_status_lock:
+            current_message = g_status_message
+            current_level = g_status_level
+
+        color = ui_module.status_color(current_level)
+        status_label.config(text=f"Status: {current_message}", fg=color)
+
+    try:
+        root.after(0, _apply_status)
+    except Exception:
+        pass
+
+
+def _assistant_status_callback(message: str, level: str = "info"):
+    set_status(f"Assistant: {message}", level)
+
+
+def _transcription_status_callback(message: str, level: str = "info"):
+    set_status(f"Transcription: {message}", level)
+
+
+def _save_env_updates(updates: dict[str, str]) -> None:
+    env_path = ".env"
+    lines: list[str] = []
+    if os.path.exists(env_path):
+        with open(env_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+
+    remaining = dict(updates)
+    new_lines: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in line:
+            new_lines.append(line)
+            continue
+
+        key = line.split("=", 1)[0].strip()
+        if key in remaining:
+            value = str(remaining.pop(key))
+            new_lines.append(f"{key}={value}\n")
+        else:
+            new_lines.append(line)
+
+    for key, value in remaining.items():
+        new_lines.append(f"{key}={value}\n")
+
+    with open(env_path, "w", encoding="utf-8") as f:
+        f.writelines(new_lines)
+
+    for key, value in updates.items():
+        os.environ[key] = str(value)
+
+
+def _drain_queue(q: Queue) -> None:
+    while True:
+        try:
+            q.get_nowait()
+        except Empty:
+            break
+
+
+def _create_transcript_ai() -> openai_transcribe.OpenAITranscribe:
+    return openai_transcribe.OpenAITranscribe(
+        model=g_openai_model_for_transcript,
+        keywords=g_keywords,
+        language=g_language,
+        status_callback=_transcription_status_callback,
+    )
+
+
+def _reinitialize_transcript_ai() -> None:
+    global g_transcript_ai
+    try:
+        g_transcript_ai = _create_transcript_ai()
+        logger.info("Transcription model reinitialized with language=%s model=%s", g_language, g_openai_model_for_transcript)
+    except Exception as e:
+        logger.error("Failed to reinitialize transcription model: %s", e)
+        set_status("Transcription reinit failed", "error")
+
+
+def load_context_file():
+    """Load background context from the configured context file if it exists."""
+    try:
+        context_file = g_context_file
+    except NameError:
+        context_file = "context.md"
+    if not context_file:
+        context_file = "context.md"
+    if os.path.exists(context_file):
+        try:
+            with open(context_file, 'r', encoding='utf-8') as f:
+                context = f.read().strip()
+            if context:
+                logger.info("[Context] Loaded %s characters from %s", len(context), context_file)
+                return context
+        except Exception as e:
+            logger.warning("[Context] Error loading %s: %s", context_file, e)
+    else:
+        logger.info("[Context] No context file found at %s", context_file)
+    return None
+
+
 load_dotenv()  # Load variables from .env file
 
-g_my_name = os.getenv("YOUR_NAME")
-print(f"Your name is: {g_my_name}")
+g_startup_warnings: list[str] = []
+
+RECORD_SECONDS = _env_int("RECORD_SECONDS", DEFAULT_RECORD_SECONDS, g_startup_warnings)
+if RECORD_SECONDS <= 0:
+    g_startup_warnings.append(f"RECORD_SECONDS must be > 0. Using default {DEFAULT_RECORD_SECONDS}.")
+    RECORD_SECONDS = DEFAULT_RECORD_SECONDS
+
+SILENCE_THRESHOLD = _env_float("SILENCE_THRESHOLD", DEFAULT_SILENCE_THRESHOLD, g_startup_warnings)
+if SILENCE_THRESHOLD < 0:
+    g_startup_warnings.append(f"SILENCE_THRESHOLD must be >= 0. Using default {DEFAULT_SILENCE_THRESHOLD}.")
+    SILENCE_THRESHOLD = DEFAULT_SILENCE_THRESHOLD
+
+SILENCE_DURATION = _env_float("SILENCE_DURATION", DEFAULT_SILENCE_DURATION, g_startup_warnings)
+if SILENCE_DURATION < 0:
+    g_startup_warnings.append(f"SILENCE_DURATION must be >= 0. Using default {DEFAULT_SILENCE_DURATION}.")
+    SILENCE_DURATION = DEFAULT_SILENCE_DURATION
+
+FRAME_DURATION_MS = _env_int("FRAME_DURATION_MS", DEFAULT_FRAME_DURATION_MS, g_startup_warnings)
+if FRAME_DURATION_MS <= 0:
+    g_startup_warnings.append(f"FRAME_DURATION_MS must be > 0. Using default {DEFAULT_FRAME_DURATION_MS}.")
+    FRAME_DURATION_MS = DEFAULT_FRAME_DURATION_MS
+
+g_my_name = _env_str("YOUR_NAME", "You")
+if g_my_name == "You":
+    g_startup_warnings.append("YOUR_NAME is missing in .env. Using fallback name 'You'.")
+logger.info("Your name is: %s", g_my_name)
 AGENT_NAME="Agent"
 
-g_language='en'
-try:
-    g_language = os.getenv("LANGUAGE")
-except:
-    pass
-print(f"Language: {g_language}")
+g_language = _env_str("LANGUAGE", "en")
+logger.info("Language: %s", g_language)
 
-g_open_api_key=None
-try:
-    g_open_api_key=os.environ.get("OPENAI_API_KEY")
-except:
-    pass
+g_open_api_key = _env_str("OPENAI_API_KEY")
+if not g_open_api_key:
+    g_startup_warnings.append(
+        "OPENAI_API_KEY is not configured. Transcription/assistant calls to OpenAI may fail."
+    )
 
-g_interupt_manually = True
-#try:
-#    g_interupt_manually = True if os.environ.get("INTERUPT_MANUALLY")=='True' else False
-#except:
-#    pass
-#print(f"Interupt manually: {g_interupt_manually}")
+g_interupt_manually = _env_bool("INTERUPT_MANUALLY", True, g_startup_warnings)
+g_auto_start_transcription = _env_bool("AUTO_START_TRANSCRIPTION", False, g_startup_warnings)
+g_auto_summarize_on_stop = _env_bool("AUTO_SUMMARIZE_ON_STOP", False, g_startup_warnings)
+g_assistant_web_search_for_custom_prompts = _env_bool("ASSISTANT_ENABLE_WEB_SEARCH_FOR_CUSTOM_PROMPTS", True, g_startup_warnings)
+g_live_assistant_mode_enabled = {
+    mode: _env_bool(env_key, False, g_startup_warnings)
+    for mode, _label, env_key in LIVE_ASSISTANT_PANEL_CONFIG
+}
 
-g_assistant=None
-try:
-    vector_store_id=os.environ.get("OPENAI_VECTOR_STORE_ID_FOR_ANSWERS")
-    g_assistant = assistant.Assistant(vector_store_id, g_my_name, agent_name=AGENT_NAME, answer_queue=g_transcriptions_in)
-    print(f"Assistant configured with vector store ID: {vector_store_id}")
-except:
-    pass
+g_assistant = None
+g_vector_store_id = _env_str("OPENAI_VECTOR_STORE_ID_FOR_ANSWERS")
+
+if g_open_api_key:
+    try:
+        g_assistant = assistant.Assistant(
+            g_vector_store_id,
+            g_my_name,
+            agent_name=AGENT_NAME,
+            answer_queue=g_transcriptions_in,
+            status_callback=_assistant_status_callback,
+        )
+        g_assistant.set_custom_prompt_web_search_enabled(g_assistant_web_search_for_custom_prompts)
+        # Load background context and push to assistant at startup
+        _startup_context = load_context_file()
+        if _startup_context:
+            g_assistant.set_background_context(_startup_context)
+        if g_vector_store_id:
+            logger.info("Assistant configured with vector store ID: %s", g_vector_store_id)
+        else:
+            logger.info("Assistant configured without vector store.")
+    except Exception as e:
+        g_startup_warnings.append(f"Assistant initialization failed: {e}")
+else:
+    g_startup_warnings.append("Assistant disabled because OPENAI_API_KEY is missing.")
 
 assistant_buttons: dict[str, tk.Button] = {}
 custom_prompt_entry = None
 send_prompt_button = None
 summary_button = None
+live_assistant_toggle_vars: dict[str, tk.BooleanVar] = {}
+live_assistant_text_boxes: dict[str, tk.Text] = {}
 
 g_keywords = None
-try:
-    g_keywords = os.environ.get("KEYWORDS")
-    if g_keywords:
-        print(f"Using keywords for initial prompt: {g_keywords}")  
-except:
-    pass
+g_keywords = _env_str("KEYWORDS")
+if g_keywords:
+    logger.info("Using keywords for initial prompt: %s", g_keywords)
 
-g_agent_font_size = 14
-try:
-    g_agent_font_size = int(os.environ.get("AGENT_FONT_SIZE", "14"))
-    print(f"Agent font size: {g_agent_font_size}")
-except:
-    pass
+g_transcript_filter = TranscriptFilter(keywords=g_keywords)
 
-g_default_font_size = 10
-try:
-    g_default_font_size = int(os.environ.get("DEFAULT_FONT_SIZE", "10"))
-    print(f"Default font size: {g_default_font_size}")
-except:
-    pass
+g_agent_font_size = _env_int("AGENT_FONT_SIZE", 14, g_startup_warnings)
+logger.info("Agent font size: %s", g_agent_font_size)
 
-g_transcript_ai=None
+g_default_font_size = _env_int("DEFAULT_FONT_SIZE", 10, g_startup_warnings)
+logger.info("Default font size: %s", g_default_font_size)
+
+g_transcript_ai = None
+g_openai_model_for_transcript = _env_str("OPENAI_MODEL_FOR_TRANSCRIPT", "gpt-4o-mini-transcribe")
+logger.info("Using OpenAI model for transcript: %s", g_openai_model_for_transcript)
 try:
-    g_openai_model_for_transcript = os.environ.get("OPENAI_MODEL_FOR_TRANSCRIPT")
-    print(f"Using OpenAI model for transcript: {g_openai_model_for_transcript}")
-    g_transcript_ai = openai_transcribe.OpenAITranscribe(model=g_openai_model_for_transcript, keywords=g_keywords, language=g_language)
-except:
+    g_transcript_ai = _create_transcript_ai()
+except Exception as e:
+    g_startup_warnings.append(
+        f"Failed to initialize OpenAI transcription model '{g_openai_model_for_transcript}': {e}"
+    )
     g_openai_model_for_transcript = "gpt-4o-mini-transcribe"
-    g_transcript_ai = openai_transcribe.OpenAITranscribe(model=g_openai_model_for_transcript, keywords=g_keywords, language=g_language)
+    g_transcript_ai = _create_transcript_ai()
+    g_startup_warnings.append(
+        f"Falling back to transcription model '{g_openai_model_for_transcript}'."
+    )
     #print(f"Using Fast Whisper running on your PC for transcript: large-v3")
     #try:
     #    local_transcribe_model = os.environ.get("LOCAL_TRANSCRIBE_MODEL")
@@ -133,233 +439,844 @@ except:
     #g_transcript_ai = fastwhisper_transcribe.FastWhisperTranscribe(model_name=local_transcribe_model, device=local_transcribe_device, keywords=g_keywords, language=g_language)
 
 # Check if output dir exists
-g_output_dir = "output"
+g_output_dir = _env_str("OUTPUT_DIR", "output")
 if not os.path.exists(g_output_dir):
     os.makedirs(g_output_dir)
 
 # Check if output_summaries dir exists
-g_summaries_dir = "output_summaries"
+g_summaries_dir = _env_str("SUMMARIES_DIR", "output_summaries")
 if not os.path.exists(g_summaries_dir):
     os.makedirs(g_summaries_dir)
 
-# Delete all wav files in the output directory
-for file in os.listdir(g_output_dir):
+# Check if temporary audio dir exists
+g_temp_dir = _env_str("TEMP_DIR", "tmp")
+if not os.path.exists(g_temp_dir):
+    os.makedirs(g_temp_dir)
+
+# Context file for background information included in every AI call
+g_context_file = _env_str("CONTEXT_FILE", "context.md")
+
+# Delete all wav files in the temporary audio directory
+for file in os.listdir(g_temp_dir):
     if file.endswith(".wav"):
-        file_path = os.path.join(g_output_dir, file)
+        file_path = os.path.join(g_temp_dir, file)
         try:
             os.remove(file_path)
-            print(f"Deleted old file: {file_path}")
+            logger.info("Deleted old file: %s", file_path)
         except Exception as e:
-            print(f"Error deleting file {file_path}: {e}")
+            logger.warning("Error deleting file %s: %s", file_path, e)
 
 # Clear the file and initialize the transcription log
-g_trans_file_name = f"{g_output_dir}/transcription-{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+g_trans_file_name = f"{g_output_dir}/transcription-{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
 try:
-    with open(g_trans_file_name, "w") as f:
-        f.write(f"== Transcription Log ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')}) ==\n\n")
-except:
-    pass
+    with open(g_trans_file_name, "w", encoding="utf-8") as f:
+        f.write(f"# Transcription Log\n\n")
+        f.write(f"**Created:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+except Exception as e:
+    g_startup_warnings.append(f"Failed to create transcription log file '{g_trans_file_name}': {e}")
+
+g_transcript_store = TranscriptStore(g_trans_file_name, AGENT_NAME, logger)
 
 global_audio = pyaudio.PyAudio()
+g_sample_size = global_audio.get_sample_size(pyaudio.paInt16)
 
 g_window_name = "Meeting compact view*"
-g_ms_teams_app = None
-if sys.platform == "win32":
-    try:
-        # Connect to Microsoft Teams by title, or you can use process ID or path
-        g_ms_teams_app = Application(backend="uia").connect(title_re=g_window_name)
-    except:
-        pass
+g_speaker_detector = TeamsSpeakerDetector(stop_event=stop_event, logger=logger, window_name=g_window_name)
+if not g_speaker_detector.is_connected() and sys.platform == "win32":
+    g_startup_warnings.append("Teams integration not connected at startup.")
 
-g_previous_speaker = None
-g_current_speaker = None
-g_meeting_title = None
+_print_startup_summary()
+
+def _get_speaker_snapshot():
+    return g_speaker_detector.get_speaker_snapshot()
+
+
+def _set_current_speaker(new_speaker: str | None):
+    return g_speaker_detector.set_current_speaker(new_speaker)
+
+
+def _get_meeting_title_snapshot() -> str | None:
+    return g_speaker_detector.get_meeting_title_snapshot()
 
 def get_ms_teams_window_title():
-    '''Get the MS Teams window title which usually contains the meeting name.'''
-    global g_ms_teams_app, g_meeting_title
-    if sys.platform != "win32":
-        return None
-    try:
-        if g_ms_teams_app==None:
-            g_ms_teams_app = Application(backend="uia").connect(title_re=g_window_name)
-        
-        teams_window = g_ms_teams_app.window(title_re=g_window_name)
-        window_title = teams_window.window_text()
-        
-        # Clean up the title - remove "Meeting compact view" or similar suffixes
-        if window_title:
-            # Remove common Teams window suffixes
-            title = window_title.replace("Meeting compact view", "").strip()
-            title = title.replace(" | Microsoft Teams", "").strip()
-            title = title.replace("|", "").strip()
-            
-            # Remove leading/trailing separators
-            title = title.strip(" -|")
-            
-            if title and title != g_meeting_title:
-                # Only update and log if we got a new non-empty title
-                old_title = g_meeting_title
-                g_meeting_title = title
-                if old_title is None:
-                    print(f"[Teams] Meeting title detected: '{title}'")
-                else:
-                    print(f"[Teams] Meeting title updated: '{old_title}' -> '{title}'")
-                return title
-            elif title:
-                # Same title as before, don't log but return it
-                return title
-    except Exception as e:
-        # Don't log every error, only when debugging
-        pass
-    
-    # Return the last known title even if we can't detect it now
-    return g_meeting_title
+    return g_speaker_detector.get_ms_teams_window_title()
 
 def inspect_ms_teams():
-    global g_ms_teams_app
-    if sys.platform != "win32":
-        return None
-    try:
-        if g_ms_teams_app==None:
-            g_ms_teams_app = Application(backend="uia").connect(title_re=g_window_name)
-
-        # Grab the main Teams window (regex to match partial titles)
-        teams_window = g_ms_teams_app.window(title_re=g_window_name)
-
-        # Print the hierarchy of controls for debugging
-        teams_window.print_control_identifiers(filename="teams_controls.txt")
-        with open("teams_controls.txt", "r") as f:
-            data = f.read()
-            return data
-    except:
-        pass
-    return None
+    return g_speaker_detector.inspect_ms_teams()
 
 def get_speaker_name():
     '''Get the current speaker's name from the MS Teams window.'''
-    global flush_letter_mic, flush_letter_out, g_current_speaker, g_previous_speaker, g_meeting_title
-    
-    title_check_counter = 0
-    TITLE_CHECK_INTERVAL = 50  # Check for title every 50 iterations (5 seconds)
-    
-    while not stop_event.is_set():
-        # Periodically check for meeting title (it's only available when Teams is minimized)
-        title_check_counter += 1
-        if title_check_counter >= TITLE_CHECK_INTERVAL:
-            title_check_counter = 0
-            new_title = get_ms_teams_window_title()
-            if new_title and new_title != g_meeting_title:
-                print(f"[Teams] Detected new meeting: {new_title}")
-        
-        data = inspect_ms_teams()
-        if data:
-            # Use regex to find the line with the speaker's information.
-            # This pattern looks for a line with "MenuItem - '...video is on..." and captures the content within quotes.
-            # Regex pattern: look for "Recording started by" followed by the name (letters and spaces) ending with a dot.
-            patterns = [r"MenuItem\s*-\s*'([^']*video is on[^']*)'",
-                        r"MenuItem\s+-\s+'([^,]+), Context menu is available'"]
+    global flush_letter_mic, flush_letter_out
 
-            match = False
-            name_parts=[]
+    def on_speaker_changed(previous_speaker, current_speaker):
+        if previous_speaker:
+            with flush_letter_lock:
+                flush_letter_mic = '_'
+                flush_letter_out = '_'
 
-            for pattern in patterns:
-                match = re.search(pattern, data)
-                if match:
-                    # Extract the full string e.g. "Mathieu Cornille, video is on, Context menu is available"
-                    info = match.group(1)
-                    # The speaker's name is assumed to be the first comma-separated token.
-                    speaker = info.split(",")[0].strip()
-                    #print("Current speaker:", speaker)
-                    name_parts = speaker.split(" ")
-                    break
+    g_speaker_detector.run_detection_loop(on_speaker_changed=on_speaker_changed)
 
-            if match:
-                g_previous_speaker = g_current_speaker
-                if len(name_parts)>1 and name_parts[1][0]!='(':
-                    g_current_speaker = name_parts[0] + " " + name_parts[1][0]  # only the first name and first letter of the last name
-                else:
-                    g_current_speaker = name_parts[0]
+
+def _create_mic_icons():
+    theme = ui_module.THEME
+    on_bg = theme["accent_red"]
+    off_bg = theme["surface_light"]
+    size = 36
+
+    on_icon = tk.PhotoImage(width=size, height=size)
+    off_icon = tk.PhotoImage(width=size, height=size)
+    on_icon.put(on_bg, to=(0, 0, size, size))
+    off_icon.put(off_bg, to=(0, 0, size, size))
+
+    mic_on_color = "#ffffff"
+    mic_off_color = theme["text_muted"]
+
+    # Microphone body (scaled)
+    for x in range(13, 23):
+        for y in range(5, 19):
+            on_icon.put(mic_on_color, (x, y))
+            off_icon.put(mic_off_color, (x, y))
+    # Rounded top hint
+    for x in range(14, 22):
+        on_icon.put(mic_on_color, (x, 4))
+        off_icon.put(mic_off_color, (x, 4))
+    # Stem and base
+    for y in range(19, 28):
+        for x in range(17, 19):
+            on_icon.put(mic_on_color, (x, y))
+            off_icon.put(mic_off_color, (x, y))
+    for x in range(10, 26):
+        on_icon.put(mic_on_color, (x, 28))
+        off_icon.put(mic_off_color, (x, 28))
+
+    # Mute cross-line
+    strike = theme["accent_red"]
+    for i in range(5, 31):
+        off_icon.put(strike, (i, i))
+        if i + 1 < size:
+            off_icon.put(strike, (i + 1, i))
+
+    return on_icon, off_icon
+
+
+def _update_start_stop_button():
+    if not start_stop_button:
+        return
+    theme = ui_module.THEME
+    if g_is_recording:
+        start_stop_button.config(text="\u25A0  Stop", bg=theme["accent_red"])
+        ui_module.add_hover_effect(start_stop_button, theme["accent_red"], theme["accent_red_hover"])
+        if send_prompt_button:
+            send_prompt_button.config(state=tk.NORMAL)
+        if custom_prompt_entry:
+            custom_prompt_entry.config(state=tk.NORMAL)
+        if settings_button:
+            settings_button.config(state=tk.DISABLED)
+    else:
+        start_stop_button.config(text="\u25B6  Start", bg=theme["accent_green"])
+        ui_module.add_hover_effect(start_stop_button, theme["accent_green"], theme["accent_green_hover"])
+        if send_prompt_button:
+            send_prompt_button.config(state=tk.DISABLED)
+        if custom_prompt_entry:
+            custom_prompt_entry.config(state=tk.DISABLED)
+        if settings_button:
+            settings_button.config(state=tk.NORMAL)
+
+
+def _sync_auto_start_var():
+    global g_auto_start_transcription
+    if g_auto_start_var is not None:
+        g_auto_start_transcription = bool(g_auto_start_var.get())
+        _save_env_updates({"AUTO_START_TRANSCRIPTION": "True" if g_auto_start_transcription else "False"})
+
+
+def _open_settings():
+    global g_language, g_auto_summarize_on_stop, g_output_dir, g_summaries_dir
+    global g_assistant_web_search_for_custom_prompts
+    global g_my_name, g_interupt_manually, g_keywords, g_openai_model_for_transcript
+    global g_agent_font_size, g_default_font_size, g_temp_dir, g_context_file
+
+    win = tk.Toplevel(root)
+    win.title("Settings")
+    win.geometry("720x620")
+    win.minsize(640, 500)
+    win.transient(root)
+    win.grab_set()
+
+    theme = ui_module.THEME
+    win.configure(bg=theme["bg"])
+    ui_module.apply_dark_title_bar(win)
+
+    # -- shared style dicts --
+    _cb_opts = dict(bg=theme["bg"], fg=theme["text_primary"],
+                    selectcolor=theme["surface"], activebackground=theme["bg"],
+                    activeforeground=theme["text_primary"], highlightthickness=0,
+                    font=ui_module.get_font(g_default_font_size))
+    _lbl_opts = dict(bg=theme["bg"], fg=theme["text_secondary"],
+                     font=ui_module.get_font(g_default_font_size))
+    _entry_opts = dict(bg=theme["input_bg"], fg=theme["input_fg"],
+                       insertbackground=theme["text_primary"], relief=tk.FLAT,
+                       highlightbackground=theme["border"], highlightcolor=theme["accent_blue"],
+                       highlightthickness=1, bd=4,
+                       font=ui_module.get_font(g_default_font_size))
+    _section_opts = dict(bg=theme["bg"], fg=theme["accent_blue"],
+                         font=ui_module.get_font(g_default_font_size, "bold"))
+    _browse_opts = dict(bg=theme["surface_light"], fg=theme["text_primary"],
+                        relief=tk.FLAT, cursor="hand2", bd=0, highlightthickness=0,
+                        font=ui_module.get_font(max(8, g_default_font_size - 1)))
+    _spin_opts = dict(bg=theme["input_bg"], fg=theme["input_fg"],
+                      buttonbackground=theme["surface_light"],
+                      relief=tk.FLAT, highlightthickness=1, highlightbackground=theme["border"],
+                      font=ui_module.get_font(g_default_font_size))
+
+    # -- scrollable canvas --
+    outer = tk.Frame(win, bg=theme["bg"])
+    outer.pack(fill=tk.BOTH, expand=True)
+
+    canvas = tk.Canvas(outer, bg=theme["bg"], highlightthickness=0, bd=0)
+    scrollbar = tk.Scrollbar(outer, orient=tk.VERTICAL, command=canvas.yview,
+                             bg=theme["surface"], troughcolor=theme["bg"])
+    canvas.configure(yscrollcommand=scrollbar.set)
+    scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+    canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+    frame = tk.Frame(canvas, bg=theme["bg"])
+    canvas_window = canvas.create_window((0, 0), window=frame, anchor="nw")
+
+    def _on_frame_configure(_event=None):
+        canvas.configure(scrollregion=canvas.bbox("all"))
+    frame.bind("<Configure>", _on_frame_configure)
+
+    def _on_canvas_configure(event):
+        canvas.itemconfig(canvas_window, width=event.width)
+    canvas.bind("<Configure>", _on_canvas_configure)
+
+    def _on_mousewheel(event):
+        canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+    canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
+    pad = {"padx": (20, 20)}
+    row = 0
+
+    # ── Section: General ───────────────────────────────────────────────────
+    tk.Label(frame, text="General", **_section_opts).grid(
+        row=row, column=0, columnspan=3, sticky="w", pady=(14, 4), **pad)
+    row += 1
+
+    tk.Label(frame, text="Your name", **_lbl_opts).grid(row=row, column=0, sticky="w", pady=3, **pad)
+    name_var = tk.StringVar(value=g_my_name or "")
+    tk.Entry(frame, textvariable=name_var, width=30, **_entry_opts).grid(row=row, column=1, sticky="w", pady=3)
+    row += 1
+
+    tk.Label(frame, text="Language", **_lbl_opts).grid(row=row, column=0, sticky="w", pady=3, **pad)
+    lang_var = tk.StringVar(value=g_language or "en")
+    languages = ["en", "lv", "ru", "de", "fr", "es", "it", "pt", "nl", "pl", "sv", "fi", "et", "lt", "ja", "zh", "ko", "ar", "tr"]
+    ttk.Combobox(frame, values=languages, textvariable=lang_var, state="readonly", width=12).grid(
+        row=row, column=1, sticky="w", pady=3)
+    row += 1
+
+    tk.Label(frame, text="Keywords", **_lbl_opts).grid(row=row, column=0, sticky="w", pady=3, **pad)
+    kw_var = tk.StringVar(value=g_keywords or "")
+    tk.Entry(frame, textvariable=kw_var, width=60, **_entry_opts).grid(row=row, column=1, columnspan=2, sticky="we", pady=3)
+    row += 1
+
+    tk.Label(frame, text="Context file", **_lbl_opts).grid(row=row, column=0, sticky="w", pady=3, **pad)
+    ctx_var = tk.StringVar(value=g_context_file or "")
+    tk.Entry(frame, textvariable=ctx_var, width=50, **_entry_opts).grid(row=row, column=1, sticky="we", pady=3)
+    tk.Button(frame, text="Browse", command=lambda: ctx_var.set(
+        filedialog.askopenfilename(
+            initialdir=os.path.dirname(ctx_var.get()) or ".",
+            filetypes=[("Markdown / Text", "*.md *.txt *.markdown"), ("All files", "*.*")],
+        ) or ctx_var.get()), **_browse_opts).grid(row=row, column=2, padx=6)
+    row += 1
+
+    interrupt_var = tk.BooleanVar(value=g_interupt_manually)
+    tk.Checkbutton(frame, text="Enable manual interrupt (key-press splits audio)", variable=interrupt_var, **_cb_opts).grid(
+        row=row, column=0, columnspan=3, sticky="w", pady=3, **pad)
+    row += 1
+
+    auto_start_var = tk.BooleanVar(value=g_auto_start_transcription)
+    tk.Checkbutton(frame, text="Auto-start transcription when app starts", variable=auto_start_var, **_cb_opts).grid(
+        row=row, column=0, columnspan=3, sticky="w", pady=3, **pad)
+    row += 1
+
+    auto_sum_var = tk.BooleanVar(value=g_auto_summarize_on_stop)
+    tk.Checkbutton(frame, text="Automatically summarize transcription when stopped", variable=auto_sum_var, **_cb_opts).grid(
+        row=row, column=0, columnspan=3, sticky="w", pady=3, **pad)
+    row += 1
+
+    # ── Section: OpenAI ────────────────────────────────────────────────────
+    tk.Label(frame, text="OpenAI", **_section_opts).grid(
+        row=row, column=0, columnspan=3, sticky="w", pady=(14, 4), **pad)
+    row += 1
+
+    tk.Label(frame, text="API key", **_lbl_opts).grid(row=row, column=0, sticky="w", pady=3, **pad)
+    api_key_var = tk.StringVar(value="")
+    api_key_entry = tk.Entry(frame, textvariable=api_key_var, width=50, show="\u2022", **_entry_opts)
+    api_key_entry.grid(row=row, column=1, columnspan=2, sticky="we", pady=3)
+    _api_hint = "configured" if g_open_api_key else "not set"
+    tk.Label(frame, text=f"({_api_hint} \u2014 leave blank to keep current)",
+             bg=theme["bg"], fg=theme["text_muted"],
+             font=ui_module.get_font(max(8, g_default_font_size - 1))).grid(
+        row=row + 1, column=1, columnspan=2, sticky="w", **pad)
+    row += 2
+
+    tk.Label(frame, text="Transcript model", **_lbl_opts).grid(row=row, column=0, sticky="w", pady=3, **pad)
+    transcript_model_var = tk.StringVar(value=g_openai_model_for_transcript or "gpt-4o-mini-transcribe")
+    ttk.Combobox(frame, values=["gpt-4o-mini-transcribe", "gpt-4o-transcribe"],
+                 textvariable=transcript_model_var, width=28).grid(row=row, column=1, sticky="w", pady=3)
+    row += 1
+
+    tk.Label(frame, text="Assistant model", **_lbl_opts).grid(row=row, column=0, sticky="w", pady=3, **pad)
+    assistant_model_var = tk.StringVar(value=_env_str("OPENAI_MODEL_FOR_ASSISTANT", assistant.DEFAULT_ASSISTANT_MODEL))
+    ttk.Combobox(
+        frame,
+        values=[
+            "gpt-5.1-mini",
+            "gpt-5-mini",
+            "gpt-5.2",
+            "gpt-4.1-mini",
+        ],
+        textvariable=assistant_model_var,
+        width=28,
+    ).grid(row=row, column=1, sticky="w", pady=3)
+    row += 1
+
+    tk.Label(frame, text="Vector store ID", **_lbl_opts).grid(row=row, column=0, sticky="w", pady=3, **pad)
+    vs_var = tk.StringVar(value=_env_str("OPENAI_VECTOR_STORE_ID_FOR_ANSWERS", "") or "")
+    tk.Entry(frame, textvariable=vs_var, width=50, **_entry_opts).grid(
+        row=row, column=1, columnspan=2, sticky="we", pady=3)
+    row += 1
+
+    web_search_var = tk.BooleanVar(value=g_assistant_web_search_for_custom_prompts)
+    tk.Checkbutton(frame, text="Enable internet search for custom prompts", variable=web_search_var, **_cb_opts).grid(
+        row=row, column=0, columnspan=3, sticky="w", pady=3, **pad)
+    row += 1
+
+    # ── Section: Assistant Prompts ────────────────────────────────────────
+    tk.Label(frame, text="Assistant Prompts", **_section_opts).grid(
+        row=row, column=0, columnspan=3, sticky="w", pady=(14, 4), **pad)
+    row += 1
+
+    prompt_fields = [
+        ("Base prompt", assistant.PROMPT_ENV_KEYS["base"], assistant.DEFAULT_SYSTEM_PROMPT_BASE_TEMPLATE, 4),
+        ("Answer prompt", assistant.PROMPT_ENV_KEYS["answer_question"], assistant.DEFAULT_MODE_DIRECTIVES["answer_question"], 3),
+        ("Suggestions prompt", assistant.PROMPT_ENV_KEYS["suggest_questions"], assistant.DEFAULT_MODE_DIRECTIVES["suggest_questions"], 3),
+        ("Explanation prompt", assistant.PROMPT_ENV_KEYS["explain_it"], assistant.DEFAULT_MODE_DIRECTIVES["explain_it"], 3),
+        ("Facts prompt", assistant.PROMPT_ENV_KEYS["get_facts"], assistant.DEFAULT_MODE_DIRECTIVES["get_facts"], 3),
+        ("Custom prompt mode", assistant.PROMPT_ENV_KEYS["custom_prompt"], assistant.DEFAULT_MODE_DIRECTIVES["custom_prompt"], 3),
+    ]
+    prompt_text_widgets: dict[str, tk.Text] = {}
+    for label_text, env_key, default_text, height in prompt_fields:
+        tk.Label(frame, text=label_text, **_lbl_opts).grid(row=row, column=0, sticky="nw", pady=3, **pad)
+        text_widget = tk.Text(
+            frame,
+            width=64,
+            height=height,
+            wrap=tk.WORD,
+            bg=theme["input_bg"],
+            fg=theme["input_fg"],
+            insertbackground=theme["text_primary"],
+            relief=tk.FLAT,
+            highlightbackground=theme["border"],
+            highlightcolor=theme["accent_blue"],
+            highlightthickness=1,
+            bd=4,
+            font=ui_module.get_font(max(8, g_default_font_size - 1)),
+        )
+        text_widget.grid(row=row, column=1, columnspan=2, sticky="we", pady=3)
+        text_widget.insert("1.0", _decode_env_multiline(os.getenv(env_key), default_text))
+        prompt_text_widgets[env_key] = text_widget
+        row += 1
+
+    # ── Section: UI ────────────────────────────────────────────────────────
+    tk.Label(frame, text="UI", **_section_opts).grid(
+        row=row, column=0, columnspan=3, sticky="w", pady=(14, 4), **pad)
+    row += 1
+
+    tk.Label(frame, text="Default font size", **_lbl_opts).grid(row=row, column=0, sticky="w", pady=3, **pad)
+    default_fs_var = tk.IntVar(value=g_default_font_size)
+    tk.Spinbox(frame, from_=8, to=24, textvariable=default_fs_var, width=6, **_spin_opts).grid(
+        row=row, column=1, sticky="w", pady=3)
+    row += 1
+
+    tk.Label(frame, text="Agent font size", **_lbl_opts).grid(row=row, column=0, sticky="w", pady=3, **pad)
+    agent_fs_var = tk.IntVar(value=g_agent_font_size)
+    tk.Spinbox(frame, from_=8, to=30, textvariable=agent_fs_var, width=6, **_spin_opts).grid(
+        row=row, column=1, sticky="w", pady=3)
+    row += 1
+
+    # ── Section: Audio ─────────────────────────────────────────────────────
+    tk.Label(frame, text="Audio", **_section_opts).grid(
+        row=row, column=0, columnspan=3, sticky="w", pady=(14, 4), **pad)
+    row += 1
+
+    tk.Label(frame, text="Record seconds", **_lbl_opts).grid(row=row, column=0, sticky="w", pady=3, **pad)
+    rec_var = tk.IntVar(value=RECORD_SECONDS)
+    tk.Spinbox(frame, from_=10, to=3600, textvariable=rec_var, width=8, **_spin_opts).grid(
+        row=row, column=1, sticky="w", pady=3)
+    row += 1
+
+    tk.Label(frame, text="Silence threshold", **_lbl_opts).grid(row=row, column=0, sticky="w", pady=3, **pad)
+    sil_thresh_var = tk.DoubleVar(value=SILENCE_THRESHOLD)
+    tk.Spinbox(frame, from_=0, to=500, increment=5, textvariable=sil_thresh_var, width=8, **_spin_opts).grid(
+        row=row, column=1, sticky="w", pady=3)
+    row += 1
+
+    tk.Label(frame, text="Silence duration (s)", **_lbl_opts).grid(row=row, column=0, sticky="w", pady=3, **pad)
+    sil_dur_var = tk.DoubleVar(value=SILENCE_DURATION)
+    tk.Spinbox(frame, from_=0.1, to=10, increment=0.1, textvariable=sil_dur_var, width=8,
+               format="%.1f", **_spin_opts).grid(row=row, column=1, sticky="w", pady=3)
+    row += 1
+
+    tk.Label(frame, text="Frame duration (ms)", **_lbl_opts).grid(row=row, column=0, sticky="w", pady=3, **pad)
+    frame_dur_var = tk.IntVar(value=FRAME_DURATION_MS)
+    tk.Spinbox(frame, from_=10, to=1000, increment=10, textvariable=frame_dur_var, width=8, **_spin_opts).grid(
+        row=row, column=1, sticky="w", pady=3)
+    row += 1
+
+    # ── Section: Directories ───────────────────────────────────────────────
+    tk.Label(frame, text="Directories", **_section_opts).grid(
+        row=row, column=0, columnspan=3, sticky="w", pady=(14, 4), **pad)
+    row += 1
+
+    tk.Label(frame, text="Transcriptions", **_lbl_opts).grid(row=row, column=0, sticky="w", pady=3, **pad)
+    out_var = tk.StringVar(value=g_output_dir)
+    tk.Entry(frame, textvariable=out_var, width=50, **_entry_opts).grid(row=row, column=1, sticky="we", pady=3)
+    tk.Button(frame, text="Browse", command=lambda: out_var.set(
+        filedialog.askdirectory(initialdir=out_var.get() or ".") or out_var.get()), **_browse_opts).grid(
+        row=row, column=2, padx=6)
+    row += 1
+
+    tk.Label(frame, text="Summaries", **_lbl_opts).grid(row=row, column=0, sticky="w", pady=3, **pad)
+    sum_var = tk.StringVar(value=g_summaries_dir)
+    tk.Entry(frame, textvariable=sum_var, width=50, **_entry_opts).grid(row=row, column=1, sticky="we", pady=3)
+    tk.Button(frame, text="Browse", command=lambda: sum_var.set(
+        filedialog.askdirectory(initialdir=sum_var.get() or ".") or sum_var.get()), **_browse_opts).grid(
+        row=row, column=2, padx=6)
+    row += 1
+
+    tk.Label(frame, text="Temp audio", **_lbl_opts).grid(row=row, column=0, sticky="w", pady=3, **pad)
+    tmp_var = tk.StringVar(value=g_temp_dir)
+    tk.Entry(frame, textvariable=tmp_var, width=50, **_entry_opts).grid(row=row, column=1, sticky="we", pady=3)
+    tk.Button(frame, text="Browse", command=lambda: tmp_var.set(
+        filedialog.askdirectory(initialdir=tmp_var.get() or ".") or tmp_var.get()), **_browse_opts).grid(
+        row=row, column=2, padx=6)
+    row += 1
+
+    # ── Section: API Resilience ────────────────────────────────────────────
+    tk.Label(frame, text="API Resilience", **_section_opts).grid(
+        row=row, column=0, columnspan=3, sticky="w", pady=(14, 4), **pad)
+    row += 1
+
+    _resilience_fields = [
+        ("Assistant timeout (s)", "ASSISTANT_API_TIMEOUT_SECONDS", 60),
+        ("Assistant max retries", "ASSISTANT_API_MAX_RETRIES", 3),
+        ("Assistant retry base (s)", "ASSISTANT_API_RETRY_BASE_SECONDS", 1.0),
+        ("Summary timeout (s)", "ASSISTANT_SUMMARY_TIMEOUT_SECONDS", 120),
+        ("Title timeout (s)", "ASSISTANT_TITLE_TIMEOUT_SECONDS", 30),
+        ("Transcribe timeout (s)", "TRANSCRIBE_API_TIMEOUT_SECONDS", 60),
+        ("Transcribe max retries", "TRANSCRIBE_API_MAX_RETRIES", 3),
+        ("Transcribe retry base (s)", "TRANSCRIBE_API_RETRY_BASE_SECONDS", 1.0),
+    ]
+    resilience_vars: dict[str, tk.StringVar] = {}
+    for label_text, env_key, default_val in _resilience_fields:
+        tk.Label(frame, text=label_text, **_lbl_opts).grid(row=row, column=0, sticky="w", pady=2, **pad)
+        var = tk.StringVar(value=_env_str(env_key, str(default_val)) or str(default_val))
+        resilience_vars[env_key] = var
+        tk.Entry(frame, textvariable=var, width=10, **_entry_opts).grid(row=row, column=1, sticky="w", pady=2)
+        row += 1
+
+    # ── Section: Transcript Filtering ──────────────────────────────────────
+    tk.Label(frame, text="Transcript Filtering", **_section_opts).grid(
+        row=row, column=0, columnspan=3, sticky="w", pady=(14, 4), **pad)
+    row += 1
+
+    tk.Label(frame, text="Min chars", **_lbl_opts).grid(row=row, column=0, sticky="w", pady=3, **pad)
+    filter_min_var = tk.StringVar(value=_env_str("TRANSCRIPT_FILTER_MIN_CHARS", "2") or "2")
+    tk.Entry(frame, textvariable=filter_min_var, width=10, **_entry_opts).grid(row=row, column=1, sticky="w", pady=3)
+    row += 1
+
+    _filter_fields = [
+        ("Exact matches", "TRANSCRIPT_FILTER_EXACT"),
+        ("Prefix matches", "TRANSCRIPT_FILTER_PREFIXES"),
+        ("Contains matches", "TRANSCRIPT_FILTER_CONTAINS"),
+        ("Regex patterns", "TRANSCRIPT_FILTER_REGEX"),
+    ]
+    filter_vars: dict[str, tk.StringVar] = {}
+    for label_text, env_key in _filter_fields:
+        tk.Label(frame, text=label_text, **_lbl_opts).grid(row=row, column=0, sticky="w", pady=2, **pad)
+        var = tk.StringVar(value=_env_str(env_key, "") or "")
+        filter_vars[env_key] = var
+        tk.Entry(frame, textvariable=var, width=60, **_entry_opts).grid(row=row, column=1, columnspan=2, sticky="we", pady=2)
+        row += 1
+
+    # ── Section: Logging ───────────────────────────────────────────────────
+    tk.Label(frame, text="Logging", **_section_opts).grid(
+        row=row, column=0, columnspan=3, sticky="w", pady=(14, 4), **pad)
+    row += 1
+
+    tk.Label(frame, text="Log level", **_lbl_opts).grid(row=row, column=0, sticky="w", pady=3, **pad)
+    log_level_var = tk.StringVar(value=_env_str("LOG_LEVEL", "INFO") or "INFO")
+    ttk.Combobox(frame, values=["DEBUG", "INFO", "WARNING", "ERROR"], textvariable=log_level_var,
+                 state="readonly", width=12).grid(row=row, column=1, sticky="w", pady=3)
+    row += 1
+
+    tk.Label(frame, text="Log file max MB", **_lbl_opts).grid(row=row, column=0, sticky="w", pady=3, **pad)
+    log_max_var = tk.StringVar(value=_env_str("LOG_FILE_MAX_MB", "5") or "5")
+    tk.Entry(frame, textvariable=log_max_var, width=10, **_entry_opts).grid(row=row, column=1, sticky="w", pady=3)
+    row += 1
+
+    tk.Label(frame, text="Log backup count", **_lbl_opts).grid(row=row, column=0, sticky="w", pady=3, **pad)
+    log_backup_var = tk.StringVar(value=_env_str("LOG_FILE_BACKUP_COUNT", "5") or "5")
+    tk.Entry(frame, textvariable=log_backup_var, width=10, **_entry_opts).grid(row=row, column=1, sticky="w", pady=3)
+    row += 1
+
+    # bottom padding so scroll ends comfortably
+    tk.Label(frame, text="", bg=theme["bg"]).grid(row=row, column=0, pady=10)
+    row += 1
+
+    frame.grid_columnconfigure(1, weight=1)
+
+    # ── Save / Cancel (fixed at bottom) ────────────────────────────────────
+    btn_bar = tk.Frame(win, bg=theme["bg_secondary"], padx=20, pady=10)
+    btn_bar.pack(side=tk.BOTTOM, fill=tk.X)
+
+    def on_save():
+        global g_language, g_auto_summarize_on_stop, g_output_dir, g_summaries_dir
+        global g_assistant_web_search_for_custom_prompts
+        global g_my_name, g_interupt_manually, g_keywords, g_openai_model_for_transcript
+        global g_agent_font_size, g_default_font_size, g_temp_dir, g_context_file
+        global RECORD_SECONDS, SILENCE_THRESHOLD, SILENCE_DURATION, FRAME_DURATION_MS
+        global g_live_assistant_mode_enabled
+
+        g_my_name = name_var.get().strip() or "You"
+        g_language = (lang_var.get() or "en").strip()
+        g_keywords = kw_var.get().strip() or None
+        g_interupt_manually = bool(interrupt_var.get())
+        g_auto_summarize_on_stop = bool(auto_sum_var.get())
+        g_assistant_web_search_for_custom_prompts = bool(web_search_var.get())
+        g_openai_model_for_transcript = transcript_model_var.get().strip() or "gpt-4o-mini-transcribe"
+        assistant_model_value = assistant_model_var.get().strip() or assistant.DEFAULT_ASSISTANT_MODEL
+        g_agent_font_size = int(agent_fs_var.get())
+        g_default_font_size = int(default_fs_var.get())
+        g_output_dir = out_var.get().strip() or "output"
+        g_summaries_dir = sum_var.get().strip() or "output_summaries"
+        g_temp_dir = tmp_var.get().strip() or "tmp"
+        g_context_file = ctx_var.get().strip() or ""
+
+        # Reload context and push to assistant
+        if g_assistant:
+            ctx_content = load_context_file()
+            g_assistant.set_background_context(ctx_content)
+
+        try:
+            RECORD_SECONDS = int(rec_var.get())
+        except (ValueError, tk.TclError):
+            pass
+        try:
+            SILENCE_THRESHOLD = float(sil_thresh_var.get())
+        except (ValueError, tk.TclError):
+            pass
+        try:
+            SILENCE_DURATION = float(sil_dur_var.get())
+        except (ValueError, tk.TclError):
+            pass
+        try:
+            FRAME_DURATION_MS = int(frame_dur_var.get())
+        except (ValueError, tk.TclError):
+            pass
+
+        os.makedirs(g_output_dir, exist_ok=True)
+        os.makedirs(g_summaries_dir, exist_ok=True)
+        os.makedirs(g_temp_dir, exist_ok=True)
+
+        if g_auto_start_var is not None:
+            g_auto_start_var.set(bool(auto_start_var.get()))
+        _sync_auto_start_var()
+
+        env_updates = {
+            "YOUR_NAME": g_my_name,
+            "LANGUAGE": g_language,
+            "INTERUPT_MANUALLY": "True" if g_interupt_manually else "False",
+            "AUTO_START_TRANSCRIPTION": "True" if bool(auto_start_var.get()) else "False",
+            "AUTO_SUMMARIZE_ON_STOP": "True" if g_auto_summarize_on_stop else "False",
+            "ASSISTANT_ENABLE_WEB_SEARCH_FOR_CUSTOM_PROMPTS": "True" if g_assistant_web_search_for_custom_prompts else "False",
+            "OPENAI_MODEL_FOR_TRANSCRIPT": g_openai_model_for_transcript,
+            "OPENAI_MODEL_FOR_ASSISTANT": assistant_model_value,
+            "OPENAI_VECTOR_STORE_ID_FOR_ANSWERS": vs_var.get().strip(),
+            "AGENT_FONT_SIZE": str(g_agent_font_size),
+            "DEFAULT_FONT_SIZE": str(g_default_font_size),
+            "RECORD_SECONDS": str(RECORD_SECONDS),
+            "SILENCE_THRESHOLD": str(SILENCE_THRESHOLD),
+            "SILENCE_DURATION": str(SILENCE_DURATION),
+            "FRAME_DURATION_MS": str(FRAME_DURATION_MS),
+            "OUTPUT_DIR": g_output_dir,
+            "SUMMARIES_DIR": g_summaries_dir,
+            "TEMP_DIR": g_temp_dir,
+            "CONTEXT_FILE": g_context_file or "",
+            "KEYWORDS": g_keywords or "",
+            "LOG_LEVEL": log_level_var.get().strip(),
+            "LOG_FILE_MAX_MB": log_max_var.get().strip(),
+            "LOG_FILE_BACKUP_COUNT": log_backup_var.get().strip(),
+            "TRANSCRIPT_FILTER_MIN_CHARS": filter_min_var.get().strip(),
+        }
+
+        for mode, _label, env_key in LIVE_ASSISTANT_PANEL_CONFIG:
+            mode_var = live_assistant_toggle_vars.get(mode)
+            enabled = bool(mode_var.get()) if mode_var is not None else bool(g_live_assistant_mode_enabled.get(mode, False))
+            g_live_assistant_mode_enabled[mode] = enabled
+            env_updates[env_key] = "True" if enabled else "False"
+
+        # API key — only overwrite when the user typed something new
+        new_key = api_key_var.get().strip()
+        if new_key:
+            env_updates["OPENAI_API_KEY"] = new_key
+
+        for env_key, var in resilience_vars.items():
+            val = var.get().strip()
+            if val:
+                env_updates[env_key] = val
+        for env_key, var in filter_vars.items():
+            env_updates[env_key] = var.get().strip()
+        for env_key, widget in prompt_text_widgets.items():
+            env_updates[env_key] = _encode_env_multiline(widget.get("1.0", tk.END))
+
+        _save_env_updates(env_updates)
+
+        if g_assistant:
+            g_assistant.set_custom_prompt_web_search_enabled(g_assistant_web_search_for_custom_prompts)
+            g_assistant.set_model(assistant_model_value)
+
+        _reinitialize_transcript_ai()
+        reset_log_file()
+        set_status("Settings saved", "info")
+        canvas.unbind_all("<MouseWheel>")
+        win.destroy()
+
+    def on_cancel():
+        canvas.unbind_all("<MouseWheel>")
+        win.destroy()
+
+    ui_module.create_styled_button(btn_bar, text="Save", command=on_save,
+                                   bg=theme["accent_green"], hover_bg=theme["accent_green_hover"],
+                                   font_size=g_default_font_size).pack(side=tk.RIGHT, padx=(6, 0))
+    ui_module.create_styled_button(btn_bar, text="Cancel", command=on_cancel,
+                                   bg=theme["surface_light"], hover_bg=theme["surface"],
+                                   fg=theme["text_secondary"],
+                                   font_size=g_default_font_size).pack(side=tk.RIGHT)
+
+
+def start_transcription():
+    global g_is_recording, g_recording_threads, g_devices_initialized
+    global flush_letter_mic, flush_letter_out
+    if g_is_recording:
+        return
+
+    g_devices_initialized = initialize_recording()
+    if not g_devices_initialized:
+        set_status("Failed to initialize recording devices", "error")
+        return
+
+    stop_event.clear()
+    _drain_queue(g_recordings_in)
+    _drain_queue(g_recordings_out)
+    _drain_queue(g_transcriptions_in)
+    with flush_letter_lock:
+        flush_letter_mic = None
+        flush_letter_out = None
+
+    # Every Start begins a brand-new transcript session and file.
+    reset_log_file()
+
+    g_recording_threads = [
+        Thread(target=store_audio_stream, args=(g_recordings_in, "in", g_device_in, True), daemon=True),
+        Thread(target=store_audio_stream, args=(g_recordings_out, "out", g_device_out, False), daemon=True),
+        Thread(target=collect_from_stream, args=(g_recordings_in, g_device_in, global_audio, True), daemon=True),
+        Thread(target=collect_from_stream, args=(g_recordings_out, g_device_out, global_audio, False), daemon=True),
+        Thread(target=get_speaker_name, daemon=True),
+        Thread(target=update_screen_on_new_transcription, daemon=True),
+    ]
+    for t in g_recording_threads:
+        t.start()
+
+    g_is_recording = True
+    _update_start_stop_button()
+    set_status("Transcription started", "info")
+
+
+def stop_transcription(trigger_auto_summary: bool = True):
+    global g_is_recording, g_recording_threads
+    if not g_is_recording:
+        return
+
+    stop_event.set()
+    for t in g_recording_threads:
+        t.join(timeout=2.0)
+    g_recording_threads = []
+    g_is_recording = False
+    _update_start_stop_button()
+    set_status("Transcription stopped", "info")
+
+    if trigger_auto_summary and g_auto_summarize_on_stop and g_assistant:
+        root.after(0, generate_summary)
+
+
+def toggle_start_stop():
+    if g_is_recording:
+        stop_transcription()
+    else:
+        start_transcription()
+
+
+def _run_summary_before_close(transcription_snapshot: list[list]) -> None:
+    theme = ui_module.THEME
+    dialog = tk.Toplevel(root)
+    dialog.title("Closing")
+    dialog.geometry("440x120")
+    dialog.resizable(False, False)
+    dialog.transient(root)
+    dialog.grab_set()
+    dialog.protocol("WM_DELETE_WINDOW", lambda: None)
+    dialog.configure(bg=theme["bg"])
+    ui_module.apply_dark_title_bar(dialog)
+
+    tk.Label(
+        dialog,
+        text="Generating summary before closing.\nPlease wait\u2026",
+        justify=tk.CENTER,
+        font=ui_module.get_font(max(9, g_default_font_size)),
+        bg=theme["bg"],
+        fg=theme["text_primary"],
+    ).pack(padx=12, pady=(16, 8))
+
+    progress = ttk.Progressbar(dialog, mode="indeterminate", length=360)
+    progress.pack(padx=12, pady=(0, 12))
+    progress.start(10)
+
+    completed = Event()
+    error_holder: list[Exception] = []
+
+    def _worker():
+        try:
+            _generate_and_save_summary(transcription_snapshot)
+        except Exception as e:
+            error_holder.append(e)
+        finally:
+            completed.set()
+
+    worker = Thread(target=_worker, daemon=True)
+    worker.start()
+
+    while not completed.is_set():
+        try:
+            root.update_idletasks()
+            root.update()
+        except Exception:
+            break
+        time.sleep(0.05)
+
+    try:
+        progress.stop()
+        dialog.grab_release()
+        dialog.destroy()
+    except Exception:
+        pass
+
+    if error_holder:
+        logger.warning("Error while generating summary during close: %s", error_holder[-1])
+
+
+def close_app():
+    global g_is_closing
+    if g_is_closing:
+        return
+    g_is_closing = True
+
+    logger.info("[UI] Closing application")
+    was_recording = g_is_recording
+    try:
+        stop_transcription(trigger_auto_summary=False)
+    except Exception as e:
+        logger.warning("Failed to stop transcription during close: %s", e)
+
+    if was_recording and g_auto_summarize_on_stop and g_assistant:
+        try:
+            set_status("Summarising transcript...", "info")
+            transcription_snapshot = g_transcript_store.snapshot()
+            if transcription_snapshot:
+                _run_summary_before_close(transcription_snapshot)
             else:
-                g_current_speaker = None
-        else:
-            g_current_speaker = None
-        if g_previous_speaker != g_current_speaker:
-            print(f"New speaker: {g_current_speaker} (was {g_previous_speaker})")
-            if g_previous_speaker:
-                with flush_letter_lock:
-                    flush_letter_mic = '_'
-                    flush_letter_out = '_'
-        time.sleep(0.1)
-        #print("Speaker not found.")
+                logger.info("[UI] No transcript to summarize during close.")
+        except Exception as e:
+            logger.warning("Failed to auto-summarize during close: %s", e)
+    try:
+        if g_assistant:
+            g_assistant.stop()
+    except Exception as e:
+        logger.warning("Failed to stop assistant during close: %s", e)
+    try:
+        global_audio.terminate()
+    except Exception:
+        pass
+    root.destroy()
 
 def toggle_mute():
     """Toggle the microphone mute state."""
     global mute_button
+    theme = ui_module.THEME
     if mute_mic_event.is_set():
         mute_mic_event.clear()
-        print("[UI] Microphone unmuted")
+        logger.info("[UI] Microphone unmuted")
         root.title("Live Audio Chat")
-        mute_button.config(text="Mute Mic", bg="#ff6b6b")  # Red when ready to mute
+        mute_button.config(image=mic_icon_on, bg=theme["accent_red"])
+        ui_module.add_hover_effect(mute_button, theme["accent_red"], theme["accent_red_hover"])
     else:
         mute_mic_event.set()
-        print("[UI] Microphone muted")
-        root.title("Live Audio Chat - MIC MUTED")
-        mute_button.config(text="Unmute Mic", bg="#2ecc40")  # Green when muted (ready to unmute)
+        logger.info("[UI] Microphone muted")
+        root.title("Live Audio Chat \u2014 MIC MUTED")
+        mute_button.config(image=mic_icon_off, bg=theme["surface_light"])
+        ui_module.add_hover_effect(mute_button, theme["surface_light"], theme["surface"])
 
 def reset_log_file():
     """Reset the transcription log file with a new timestamp."""
-    global g_trans_file_name, g_transcription
+    global g_trans_file_name
     
     # Create new filename with current timestamp
-    new_filename = f"{g_output_dir}/transcription-{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    new_filename = f"{g_output_dir}/transcription-{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
     
     # Initialize the new transcription log
     try:
-        with open(new_filename, "w") as f:
-            f.write(f"== Transcription Log ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')}) ==\n\n")
+        with open(new_filename, "w", encoding="utf-8") as f:
+            f.write(f"# Transcription Log\n\n")
+            f.write(f"**Created:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
         g_trans_file_name = new_filename
-        print(f"[UI] Reset log file to: {g_trans_file_name}")
+        logger.info("[UI] Reset log file to: %s", g_trans_file_name)
         
         # Clear current transcription display
-        g_transcription = []
+        g_transcript_store.set_file_path(new_filename)
+        g_transcript_store.clear()
 
         if g_assistant:
             g_assistant.start_new_thread()
         root.after(0, update_chat)
         
     except Exception as e:
-        print(f"[UI] Error creating new log file: {e}")
+        logger.error("[UI] Error creating new log file: %s", e)
 
-
-def load_context_file():
-    """Load background context from context.md if it exists."""
-    context_file = "context.md"
-    if os.path.exists(context_file):
-        try:
-            with open(context_file, 'r', encoding='utf-8') as f:
-                context = f.read().strip()
-            if context:
-                print(f"[Context] Loaded {len(context)} characters from {context_file}")
-                return context
-        except Exception as e:
-            print(f"[Context] Error loading {context_file}: {e}")
-    else:
-        print(f"[Context] No context file found at {context_file}")
-    return None
 
 def send_custom_prompt():
     """Send a custom prompt from the user to the assistant."""
     if not g_assistant:
-        print("[UI] Assistant is not available; cannot send prompt.")
+        logger.warning("[UI] Assistant is not available; cannot send prompt.")
         return
     
     prompt_text = custom_prompt_entry.get().strip()
     if not prompt_text:
-        print("[UI] Empty prompt, nothing to send.")
+        logger.info("[UI] Empty prompt, nothing to send.")
         return
     
-    print(f"[UI] Sending custom prompt: {prompt_text}")
+    logger.info("[UI] Sending custom prompt.")
     timestamp = time.time()
     
     # Add the custom prompt as a user message
@@ -371,64 +1288,29 @@ def send_custom_prompt():
     # Trigger the assistant to answer
     success = g_assistant.trigger_custom_prompt_answer()
     if not success:
-        print("[UI] Assistant was unable to generate a response to custom prompt.")
+        logger.warning("[UI] Assistant was unable to generate a response to custom prompt.")
 
 def generate_summary():
     """Generate a detailed meeting summary using AI and save to markdown file."""
     global summary_button
     
     if not g_assistant:
-        print("[UI] Assistant is not available; cannot generate summary.")
+        logger.warning("[UI] Assistant is not available; cannot generate summary.")
         return
     
-    if not g_transcription:
-        print("[UI] No transcription available to summarize.")
+    transcription_snapshot = g_transcript_store.snapshot()
+
+    if not transcription_snapshot:
+        logger.info("[UI] No transcription available to summarize.")
         return
     
-    print("[UI] Generating meeting summary...")
+    logger.info("[UI] Generating meeting summary...")
     if summary_button:
         summary_button.config(state=tk.DISABLED, text="Generating...")
-    
+
     def generate_and_save():
         try:
-            # Get the full transcript
-            transcript = ""
-            for entry in g_transcription:
-                user, text, start_time = entry
-                transcript += f"{user}: {text}\n"
-            
-            # Load context file
-            context = load_context_file()
-            
-            # Generate summary with title
-            if g_meeting_title:
-                print(f"[UI] Passing meeting title to AI: '{g_meeting_title}'")
-            else:
-                print("[UI] No meeting title detected, generating without title context")
-            summary_data = g_assistant.generate_meeting_summary(transcript, meeting_title=g_meeting_title, context=context)
-            
-            if summary_data:
-                title = summary_data.get('title', 'Meeting Summary')
-                summary = summary_data.get('summary', '')
-                
-                # Create filename with timestamp and title
-                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                # Sanitize title for filename
-                safe_title = "".join(c if c.isalnum() or c in (' ', '-', '_') else '' for c in title)
-                safe_title = safe_title.replace(' ', '_').lower()[:50]  # Limit length
-                filename = f"{g_summaries_dir}/{timestamp}_{safe_title}.md"
-                
-                # Save to file
-                with open(filename, 'w', encoding='utf-8') as f:
-                    f.write(f"# {title}\n\n")
-                    f.write(f"**Date:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-                    f.write(summary)
-                
-                print(f"[UI] Summary saved to: {filename}")
-            else:
-                print("[UI] Failed to generate summary.")
-        except Exception as e:
-            print(f"[UI] Error generating summary: {e}")
+            _generate_and_save_summary(transcription_snapshot)
         finally:
             if summary_button:
                 root.after(0, lambda: summary_button.config(state=tk.NORMAL, text="Generate Summary"))
@@ -437,68 +1319,279 @@ def generate_summary():
     Thread(target=generate_and_save, daemon=True).start()
 
 
+def _generate_and_save_summary(transcription_snapshot: list[list]) -> bool:
+    try:
+        # Get the full transcript
+        transcript = ""
+        for entry in transcription_snapshot:
+            user, text, start_time = entry
+            transcript += f"{user}: {text}\n"
+
+        # Load context file
+        context = load_context_file()
+
+        # Generate summary with title
+        meeting_title_snapshot = _get_meeting_title_snapshot()
+        if meeting_title_snapshot:
+            logger.info("[UI] Passing meeting title to AI: '%s'", meeting_title_snapshot)
+        else:
+            logger.info("[UI] No meeting title detected, generating without title context")
+        summary_data = g_assistant.generate_meeting_summary(transcript, meeting_title=meeting_title_snapshot, context=context)
+
+        if summary_data:
+            title = summary_data.get('title', 'Meeting Summary')
+            summary = summary_data.get('summary', '')
+
+            # Create filename with timestamp and title
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            # Sanitize title for filename
+            safe_title = sanitize_title_for_filename(title, max_length=50, default="meeting_summary")
+            filename = f"{g_summaries_dir}/{timestamp}_{safe_title}.md"
+
+            # Save to file
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write(f"# {title}\n\n")
+                f.write(f"**Date:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                f.write(summary)
+
+            logger.info("[UI] Summary saved to: %s", filename)
+            return True
+
+        logger.warning("[UI] Failed to generate summary.")
+        return False
+    except Exception as e:
+        logger.exception("[UI] Error generating summary: %s", e)
+        return False
+
+
 # GUI Setup
 def setup_ui():
-    global chat_window, root, mute_button, assistant_buttons, custom_prompt_entry, send_prompt_button, summary_button
+    global chat_window, root, mute_button, assistant_buttons, custom_prompt_entry, send_prompt_button, summary_button, status_label
+    global start_stop_button, settings_button, g_auto_start_var, mic_icon_on, mic_icon_off
+    global live_assistant_toggle_vars, live_assistant_text_boxes
     
     root = tk.Tk()
     root.title("Live Audio Chat")
-    root.geometry("600x400")
-    
-    # Create button frame at the top
-    button_frame = tk.Frame(root)
-    button_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
-    
-    # Create Mute button
-    mute_button = tk.Button(button_frame, text="Mute Mic", command=toggle_mute, 
-                           bg="#ff6b6b", fg="white", font=("Arial", g_default_font_size, "bold"))
-    mute_button.pack(side=tk.LEFT, padx=(0, 5))
-    
-    # Create Reset button
-    reset_button = tk.Button(button_frame, text="Reset Log", command=reset_log_file,
-                            bg="#4ecdc4", fg="white", font=("Arial", g_default_font_size, "bold"))
-    reset_button.pack(side=tk.LEFT, padx=(0, 5))
-    
-    # Create Generate Summary button
-    if g_assistant:
-        summary_button = tk.Button(button_frame, text="Generate Summary", command=generate_summary,
-                                bg="#9b59b6", fg="white", font=("Arial", g_default_font_size, "bold"))
-        summary_button.pack(side=tk.LEFT, padx=(0, 5))
+    root.geometry("2100x1500")
+    root.minsize(1800, 1200)
+
+    theme = ui_module.THEME
+    root.configure(bg=theme["bg"])
+    ui_module.apply_dark_title_bar(root)
+
+    # ── Toolbar ────────────────────────────────────────────────────────────
+    toolbar = tk.Frame(root, bg=theme["bg_secondary"], padx=10, pady=7)
+    toolbar.pack(side=tk.TOP, fill=tk.X)
+
+    left_group = tk.Frame(toolbar, bg=theme["bg_secondary"])
+    left_group.pack(side=tk.LEFT)
+
+    start_stop_button = ui_module.create_styled_button(
+        left_group,
+        text="\u25B6  Start",
+        command=toggle_start_stop,
+        bg=theme["accent_green"],
+        hover_bg=theme["accent_green_hover"],
+        font_size=g_default_font_size,
+    )
+    start_stop_button.pack(side=tk.LEFT, padx=(0, 6))
+
+    g_auto_start_var = tk.BooleanVar(value=g_auto_start_transcription)
+
+    settings_button = ui_module.create_styled_button(
+        left_group,
+        text="\u2699",
+        command=_open_settings,
+        bg=theme["accent_purple"],
+        hover_bg=theme["accent_purple_hover"],
+        font_size=g_default_font_size,
+    )
+    settings_button.pack(side=tk.LEFT, padx=(0, 6))
+
+    mic_icon_on, mic_icon_off = _create_mic_icons()
+
+    mute_button = tk.Button(
+        left_group,
+        image=mic_icon_on,
+        command=toggle_mute,
+        bg=theme["accent_red"],
+        activebackground=theme["accent_red_hover"],
+        relief=tk.FLAT,
+        bd=0,
+        highlightthickness=0,
+        cursor="hand2",
+        padx=14,
+        pady=5,
+    )
+    mute_button.pack(side=tk.LEFT, padx=(0, 6))
+    ui_module.add_hover_effect(mute_button, theme["accent_red"], theme["accent_red_hover"])
 
     if g_assistant:
-        # Create custom prompt input field
-        prompt_frame = tk.Frame(button_frame)
-        prompt_frame.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(5, 0))
-        
-        custom_prompt_entry = tk.Entry(prompt_frame, font=("Arial", g_default_font_size))
-        custom_prompt_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
-        custom_prompt_entry.bind('<Return>', lambda event: send_custom_prompt())
-        
-        send_prompt_button = tk.Button(
+        # ── Prompt entry (right side of toolbar) ──
+        prompt_frame = tk.Frame(toolbar, bg=theme["bg_secondary"])
+        prompt_frame.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(14, 0))
+
+        custom_prompt_entry = tk.Entry(
             prompt_frame,
-            text="Send to AI",
-            command=send_custom_prompt,
-            bg="#1f8ef1",
-            fg="white",
-            font=("Arial", g_default_font_size, "bold"),
+            font=ui_module.get_font(g_default_font_size),
+            bg=theme["input_bg"],
+            fg=theme["input_fg"],
+            insertbackground=theme["text_primary"],
+            relief=tk.FLAT,
+            highlightbackground=theme["border"],
+            highlightcolor=theme["accent_blue"],
+            highlightthickness=1,
+            bd=6,
         )
-        send_prompt_button.pack(side=tk.LEFT)
-        
-        assistant_buttons = {}  # Keep empty dict for compatibility
+        custom_prompt_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        custom_prompt_entry.bind('<Return>', lambda event: send_custom_prompt())
+
+        send_prompt_button = ui_module.create_styled_button(
+            prompt_frame,
+            text="Ask",
+            command=send_custom_prompt,
+            bg=theme["accent_blue"],
+            hover_bg=theme["accent_blue_hover"],
+            font_size=g_default_font_size,
+            state=tk.DISABLED,
+        )
+        send_prompt_button.pack(side=tk.RIGHT)
+        custom_prompt_entry.config(state=tk.DISABLED)
+
+        assistant_buttons = {}
     else:
         assistant_buttons = {}
-    
-    chat_window = tk.Text(root, wrap=tk.WORD, state=tk.DISABLED)
-    chat_window.pack(expand=True, fill=tk.BOTH, padx=5, pady=(0, 5))
-    chat_window.tag_config("microphone", foreground="blue")
-    chat_window.tag_config("output", foreground="green")
-    chat_window.tag_config("agent", foreground="gray", font=("Arial", g_agent_font_size, "bold"))
+
+    # ── Thin separator ─────────────────────────────────────────────────────
+    tk.Frame(root, bg=theme["border"], height=1).pack(side=tk.TOP, fill=tk.X)
+
+    # ── Status bar (pack before chat so it stays at the bottom) ────────────
+    status_bar = tk.Frame(root, bg=theme["status_bg"])
+    status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+
+    status_label = tk.Label(
+        status_bar,
+        text="Status: Ready",
+        anchor="w",
+        bg=theme["status_bg"],
+        fg=theme["status_info"],
+        font=ui_module.get_font(max(8, g_default_font_size - 1)),
+        padx=10,
+        pady=4,
+    )
+    status_label.pack(fill=tk.X)
+
+    # ── Chat area (fills remaining space) ──────────────────────────────────
+    chat_frame = tk.Frame(root, bg=theme["bg"], padx=8, pady=6)
+    chat_frame.pack(expand=True, fill=tk.BOTH)
+
+    chat_window = tk.Text(
+        chat_frame,
+        wrap=tk.WORD,
+        state=tk.DISABLED,
+        bg=theme["surface"],
+        fg=theme["text_primary"],
+        font=ui_module.get_font(g_default_font_size),
+        relief=tk.FLAT,
+        padx=12,
+        pady=10,
+        insertbackground=theme["text_primary"],
+        selectbackground=theme["accent_blue"],
+        selectforeground=theme["text_primary"],
+        highlightthickness=1,
+        highlightbackground=theme["border"],
+        highlightcolor=theme["border"],
+        bd=0,
+        spacing1=2,
+        spacing3=2,
+    )
+    chat_window.pack(expand=True, fill=tk.BOTH)
+    ui_module.setup_chat_tags(chat_window, g_agent_font_size, g_default_font_size)
+
+    # ── Live assistant panels (below transcript) ───────────────────────────
+    live_assistant_toggle_vars = {}
+    live_assistant_text_boxes = {}
+
+    live_panels = tk.Frame(root, bg=theme["bg"], padx=8, pady=0)
+    live_panels.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 6))
+
+    for col_idx, (mode, label, env_key) in enumerate(LIVE_ASSISTANT_PANEL_CONFIG):
+        live_panels.grid_columnconfigure(col_idx, weight=1)
+        panel = tk.Frame(
+            live_panels,
+            bg=theme["surface"],
+            highlightthickness=1,
+            highlightbackground=theme["border"],
+            bd=0,
+            padx=8,
+            pady=6,
+        )
+        panel.grid(row=0, column=col_idx, sticky="nsew", padx=(0, 6) if col_idx < len(LIVE_ASSISTANT_PANEL_CONFIG) - 1 else 0)
+
+        header = tk.Frame(panel, bg=theme["surface"])
+        header.pack(fill=tk.X, pady=(0, 4))
+
+        tk.Label(
+            header,
+            text=label,
+            bg=theme["surface"],
+            fg=theme["text_primary"],
+            font=ui_module.get_font(max(8, g_default_font_size - 1), "bold"),
+        ).pack(side=tk.LEFT)
+
+        mode_var = tk.BooleanVar(value=bool(g_live_assistant_mode_enabled.get(mode, False)))
+        live_assistant_toggle_vars[mode] = mode_var
+
+        def _on_toggle(current_mode: str = mode, current_var: tk.BooleanVar = mode_var, current_env_key: str = env_key):
+            enabled = bool(current_var.get())
+            g_live_assistant_mode_enabled[current_mode] = enabled
+            _save_env_updates({current_env_key: "True" if enabled else "False"})
+
+        tk.Checkbutton(
+            header,
+            text="Enable",
+            variable=mode_var,
+            command=_on_toggle,
+            state=tk.NORMAL if g_assistant else tk.DISABLED,
+            bg=theme["surface"],
+            fg=theme["text_secondary"],
+            selectcolor=theme["surface_light"],
+            activebackground=theme["surface"],
+            activeforeground=theme["text_primary"],
+            highlightthickness=0,
+            font=ui_module.get_font(max(8, g_default_font_size - 1)),
+        ).pack(side=tk.RIGHT)
+
+        output_box = tk.Text(
+            panel,
+            wrap=tk.WORD,
+            height=8,
+            state=tk.DISABLED,
+            bg=theme["input_bg"],
+            fg=theme["text_primary"],
+            font=ui_module.get_font(max(8, g_default_font_size - 1)),
+            relief=tk.FLAT,
+            bd=0,
+            padx=6,
+            pady=5,
+            insertbackground=theme["text_primary"],
+            highlightthickness=1,
+            highlightbackground=theme["border"],
+            highlightcolor=theme["border"],
+            spacing1=1,
+            spacing3=1,
+        )
+        output_box.pack(fill=tk.BOTH, expand=True)
+        _set_readonly_text(output_box, "Waiting for output transcript..." if g_assistant else "Assistant is unavailable.")
+        live_assistant_text_boxes[mode] = output_box
+
+    set_status("Ready", "info")
     
     # Bind extra events to see when the window is being hidden/destroyed.
     def on_destroy(event):
-        print("[Tkinter] Window destroy event triggered:", event)
+        logger.debug("[Tkinter] Window destroy event triggered: %s", event)
     def on_unmap(event):
-        print("[Tkinter] Window unmap (hidden) event triggered:", event)
+        logger.debug("[Tkinter] Window unmap (hidden) event triggered: %s", event)
     root.bind("<Destroy>", on_destroy)
     root.bind("<Unmap>", on_unmap)
     '''
@@ -518,236 +1611,158 @@ def setup_ui():
         with flush_letter_lock:
             flush_letter_mic = event.char
             flush_letter_out = event.char
-        print(f"[UI] Key '{event.char}' pressed. Flushing current audio buffers.")
+        logger.debug("[UI] Key '%s' pressed. Flushing current audio buffers.", event.char)
 
     if g_interupt_manually and not g_assistant:
         for key in "abcdefghijklmnopqrstuvwxyz":
             root.bind(f"<KeyPress-{key}>", on_key_press)
             root.bind(f"<KeyPress-{key.upper()}>", on_key_press)  # Also bind uppercase versions
     #--------------
-    root.protocol("WM_DELETE_WINDOW", stop_recording)
-    print("[GUI] UI setup complete.")
+    root.protocol("WM_DELETE_WINDOW", close_app)
+    logger.info("[GUI] UI setup complete.")
     
     return root
 
 def update_chat():
-    chat_window.config(state=tk.NORMAL)
-    chat_window.delete("1.0", tk.END)
-    last_user=''
-    for entry in g_transcription:
-        user, text, start_time = entry
-        if user != last_user:
-            if user == g_my_name:
-                chat_window.insert(tk.END, f"\n# {user}:\n{text}\n", "microphone")
-            elif user == AGENT_NAME:
-                chat_window.insert(tk.END, f"\n# {user}:\n{text}\n", "agent")
-            else:
-                chat_window.insert(tk.END, f"\n# {user}:\n{text}\n", "output")
+    transcription_snapshot = g_transcript_store.snapshot()
+    ui_module.render_transcription(chat_window, transcription_snapshot, g_my_name, AGENT_NAME)
 
-            last_user=user
-        else:
-            if user == g_my_name:
-                chat_window.insert(tk.END, f"{text}\n", "microphone")
-            elif user == AGENT_NAME:
-                chat_window.insert(tk.END, f"{text}\n", "agent")
-            else:
-                chat_window.insert(tk.END, f"{text}\n", "output")
- 
-    chat_window.config(state=tk.DISABLED)
-    chat_window.yview(tk.END)
+
+def _set_readonly_text(widget: tk.Text, value: str) -> None:
+    widget.config(state=tk.NORMAL)
+    widget.delete("1.0", tk.END)
+    widget.insert("1.0", value)
+    widget.config(state=tk.DISABLED)
+
+
+def _update_live_assistant_panel_text(mode: str, text: str | None) -> None:
+    widget = live_assistant_text_boxes.get(mode)
+    if not widget:
+        return
+    rendered = (text or "---").strip() or "---"
+    _set_readonly_text(widget, rendered)
+
+
+def _trigger_live_assistant_for_output_transcript() -> None:
+    if not g_assistant:
+        return
+
+    for mode, _label, _env_key in LIVE_ASSISTANT_PANEL_CONFIG:
+        mode_var = live_assistant_toggle_vars.get(mode)
+        enabled = bool(mode_var.get()) if mode_var is not None else bool(g_live_assistant_mode_enabled.get(mode, False))
+        if not enabled:
+            continue
+
+        def _callback(response_text: str | None, current_mode: str = mode) -> None:
+            if root is None:
+                return
+            try:
+                root.after(0, lambda: _update_live_assistant_panel_text(current_mode, response_text))
+            except Exception:
+                pass
+
+        success = g_assistant.trigger_answer(
+            mode=mode,
+            result_callback=_callback,
+            append_response_to_messages=False,
+            enqueue_response=False,
+        )
+        if not success and root is not None:
+            try:
+                root.after(0, lambda current_mode=mode: _update_live_assistant_panel_text(current_mode, "Failed to generate response."))
+            except Exception:
+                pass
+
 
 # Audio Recording Functions
 def store_audio_stream(queue, filename_suffix, device_info, from_microphone):
-    print(f"[{filename_suffix}] store_audio_stream started.")
-    while not stop_event.is_set():
-        try:
-            #print(f"[{filename_suffix}] Waiting for frames from queue...")
-            frames, letter, start_time = queue.get(block=True, timeout=1)
-            print(f"[{filename_suffix}] Got {len(frames)} frames.")
-        except Empty:
-            continue
-        except Exception as e:
-            print(f"[{filename_suffix}] Exception while getting frames: {e}")
-            continue
-        
-        filename = f'output/{start_time:.2f}-{filename_suffix}.wav'
-        try:
-            with wave.open(filename, 'wb') as wf:
-                wf.setnchannels(device_info["maxInputChannels"])
-                wf.setsampwidth(g_sample_size)
-                wf.setframerate(int(device_info["defaultSampleRate"]))
-                wf.writeframes(b"".join(frames))
-            print(f"[{filename_suffix}] Wrote audio to {filename}.")
-        except Exception as e:
-            print(f"[{filename_suffix}] Error writing WAV file: {e}")
-            continue
-
-        transcribe_and_display(filename, filename_suffix == "in", letter)
-        try:
-            os.remove(filename)
-            print(f"[{filename_suffix}] Removed temporary file {filename}.")
-        except Exception as e:
-            print(f"[{filename_suffix}] Error removing file {filename}: {e}")
-
-    print(f"[{filename_suffix}] store_audio_stream exiting.")
+    audio_capture_module.store_audio_stream(
+        queue=queue,
+        filename_suffix=filename_suffix,
+        device_info=device_info,
+        temp_dir=g_temp_dir,
+        stop_event=stop_event,
+        sample_size_getter=lambda: g_sample_size,
+        transcribe_callback=transcribe_and_display,
+        logger=logger,
+    )
 
 def collect_from_stream(queue, input_device, p_instance, from_microphone):
-    global g_sample_size
     global flush_letter_mic, flush_letter_out
-    global g_current_speaker
-    print(f"[{input_device['name']}] Starting collect_from_stream...")
-    try:
-        print(f"[{input_device['name']}] About to open audio stream...")
-        frame_rate = int(input_device["defaultSampleRate"])
-        print(f"[{input_device['name']}] Opened audio stream at {frame_rate} Hz.")
-        print(f"[{input_device['name']}] Input channels: {input_device['maxInputChannels']}")
-        print(f"[{input_device['name']}] Sample size (bytes): {p_instance.get_sample_size(pyaudio.paInt16)}")
-        print(f"[{input_device['name']}] Sample format: {pyaudio.paInt16}")
-        print(f"[{input_device['name']}] Chunk size: {int(frame_rate * 0.1)} samples")
-        print(f"[{input_device['name']}] Frames per buffer: {int(frame_rate * 0.1)} samples")
-        print(f"[{input_device['name']}] Input device index: {input_device['index']}")
-        FRAME_DURATION_MS = 100
-        chunk_size = int(frame_rate * FRAME_DURATION_MS / 1000)  # 20 ms worth of samples
-        with p_instance.open(format=pyaudio.paInt16,
-                             channels=input_device["maxInputChannels"],
-                             rate=frame_rate,
-                             frames_per_buffer=chunk_size,
-                             input=True,
-                             input_device_index=input_device["index"]) as stream:
-            print(f"[{input_device['name']}] Audio stream opened successfully.")
-            g_sample_size = p_instance.get_sample_size(pyaudio.paInt16)
-            print(f"Global sample size: {g_sample_size}")
-            frames = []
-            start_time = time.time()
-            print(f"[{input_device['name']}] Starting to read data...")
-            silence_start_time = None
-            silence_frame_count = 0
-            while not stop_event.is_set():
-                try:
-                    if len(frames) ==silence_frame_count:
-                        start_time = time.time()
-                    
-                    # Check if microphone is muted (only for microphone input)
-                    if from_microphone and mute_mic_event.is_set():
-                        # Skip reading audio data when muted, but keep the loop running
-                        time.sleep(0.001)  # Small sleep to prevent busy waiting
-                        continue
-                    
-                    data = stream.read(chunk_size, exception_on_overflow=False)
-                    frames.append(data)
-                    
-                    
-                    with flush_letter_lock:
-                        if from_microphone:
-                            current_letter = flush_letter_mic
-                            flush_letter_mic=None
-                        else:
-                            current_letter = flush_letter_out
-                            flush_letter_out=None
-                    if current_letter:
-                        last_letter=current_letter
-                        if len(frames)>0:
-                            if last_letter=='_' and from_microphone==False:
-                                SECONDS_TO_GO_BACK = 2.0
-                                frames_to_remove = int((1000/FRAME_DURATION_MS) * SECONDS_TO_GO_BACK)
-                                frames_to_proess = frames[:-frames_to_remove]
-                                queue.put((frames_to_proess.copy(), g_previous_speaker, start_time))
-                                frames = frames[-frames_to_remove:]
-                                start_time = time.time() - (frames_to_remove*FRAME_DURATION_MS)/1000
-                            elif last_letter != '_':
-                                print(f"[{input_device['name']}] Manual split triggered; flushing {len(frames)} frames.")
-                                g_current_speaker = last_letter
-                                queue.put((frames.copy(), last_letter, start_time))
-                                frames = []
-                            silence_frame_count=0
-              
-                    #-- Silence check
-                    # Convert raw bytes to numpy array
-                    audio_samples = np.array(struct.unpack(f"{len(data)//2}h", data))
-                    # Calculate the volume (RMS)
-                    volume = np.sqrt(np.mean(audio_samples**2))
 
-                    # Check if volume is below threshold
-                    if volume < SILENCE_THRESHOLD:
-                        silence_frame_count+=1
-                        if silence_start_time is None:
-                            silence_start_time = time.time()  # Mark when silence starts
-                        elif time.time() - silence_start_time >= SILENCE_DURATION:
-                            #print(f"[{input_device['name']}] Silence detected for {SILENCE_DURATION} seconds.")
-                            if len(frames) ==silence_frame_count:
-                                #print(f"[{input_device['name']}] No audio detected for {SILENCE_DURATION} seconds. Ignoring.")
-                                pass
-                            else:
-                                queue.put((frames.copy(), g_current_speaker, start_time))
-                            frames = []
-                            silence_frame_count=0
-                            silence_start_time = None  # Reset silence timer
-                    else:
-                        silence_start_time = None  # Reset if we detect sound
+    def get_flush_letters():
+        return flush_letter_mic, flush_letter_out
 
-                    #-- Time check
-                    # If we've reached the RECORD_SECONDS duration, flush automatically.
-                    if len(frames) >= int((frame_rate * RECORD_SECONDS) / chunk_size):
-                        print(f"[{input_device['name']}] Auto split after reaching {RECORD_SECONDS} seconds; queueing {len(frames)} frames.")
-                        queue.put((frames.copy(), g_current_speaker, start_time))
-                        frames = []
-                        silence_frame_count=0
-                except Exception as e:
-                    print(f"[{input_device['name']}] Error reading from stream: {e}")
-                    break
-            print(f"[{input_device['name']}] Exiting reading loop.")
-    except Exception as e:
-        print(f"[{input_device.get('name', 'Unknown')}] Failed to open audio stream: {e}")
-    print(f"[{input_device.get('name', 'Unknown')}] collect_from_stream exiting.")
+    def clear_flush_letters(is_microphone: bool):
+        global flush_letter_mic, flush_letter_out
+        if is_microphone:
+            flush_letter_mic = None
+        else:
+            flush_letter_out = None
+
+    audio_capture_module.collect_from_stream(
+        queue=queue,
+        input_device=input_device,
+        p_instance=p_instance,
+        from_microphone=from_microphone,
+        stop_event=stop_event,
+        mute_mic_event=mute_mic_event,
+        flush_lock=flush_letter_lock,
+        get_flush_letters=get_flush_letters,
+        clear_flush_letters=clear_flush_letters,
+        speaker_snapshot_getter=_get_speaker_snapshot,
+        speaker_setter=_set_current_speaker,
+        frame_duration_ms=FRAME_DURATION_MS,
+        silence_threshold=SILENCE_THRESHOLD,
+        silence_duration=SILENCE_DURATION,
+        record_seconds=RECORD_SECONDS,
+        logger=logger,
+    )
 
 def transcribe_and_display(file, from_microphone, letter):
-    global g_transcription
     if not letter:
         letter = "?"
-    #print(f"[Transcribe] Starting transcription for {file}.")
-    file_size = os.path.getsize(file)  # Size in bytes
-    print(f"[Transcribe] File size: {file_size / (1024 * 1024):.2f} MB")
     try:
-        start_time = float(file.split("/")[-1].split("-")[0])
+        file_size = os.path.getsize(file)  # Size in bytes
+        logger.debug("[Transcribe] File size: %.2f MB", file_size / (1024 * 1024))
+        start_time = float(os.path.basename(file).split("-")[0])
         segments = g_transcript_ai.transcribe(file)
         new_segments = False
         #with g_transcription_lock:
         for segment in segments:
             text = segment.text.strip()
             if len(text) > 0:
-                #print(f"Segment: {segment}") 
-                # FastWhisper often returns the following text values which are not an actual transcriptions but halucinations.
-                if text == 'Bye.'  or text == 'Um' or text.startswith("Thanks for watching") or text.startswith("Thank you for watching") or text.startswith("Thanks for listening") or text.startswith("Thank you for joining") \
-                        or text.startswith("Thank you very much") or text.startswith("Thank you for tuning in") or text == 'Paldies!' or text =="Thank you." or text == '.' or text == 'You' \
-                        or text.find("please subscribe to my channel")>=0 or text.startswith("Thank you guys.") \
-                        or text.find("www.NorthstarIT.co.uk")>=0 or text.find("Amara.org")>=0 or text.find("I'll see you in the next video")>=0 or text.find("brandhagen10.com") >=0 or text.find("WWW.ABERCAP.COM")>=0 \
-                        or text.find(g_keywords)>=0:
+                should_filter, reason = g_transcript_filter.should_filter(text)
+                if should_filter:
+                    logger.debug("[Transcribe] Filtered segment (%s): %s", reason, text)
                     continue
                 converted_time = datetime.fromtimestamp(segment.start)
                 #print(converted_time)  # Outputs in a readable format
-                print(f"[{converted_time} -> {segment.end:.2f}] {segment.text}")
+                logger.info("[%s -> %.2f] %s", converted_time, segment.end, segment.text)
                 #root.after(0, update_chat, transcription, letter, from_microphone)
                 if from_microphone:
-                    add_transcription(g_my_name, text, start_time + segment.start)
+                    add_transcription(g_my_name, text, start_time + segment.start, from_microphone=True)
                 else:
                     if len(letter)==1:
-                        add_transcription(f"Person_{letter.upper()}", text, start_time + segment.start)
+                        add_transcription(f"Person_{letter.upper()}", text, start_time + segment.start, from_microphone=False)
                     else:
-                        add_transcription(f"{letter}", text, start_time + segment.start)
+                        add_transcription(f"{letter}", text, start_time + segment.start, from_microphone=False)
 
     except Exception as e:
-        print(f"[Transcribe] Transcription error for {file}: {e}")
+        logger.exception("[Transcribe] Transcription error for %s: %s", file, e)
 
-def add_transcription(user, text, start_time):
+def add_transcription(user, text, start_time, from_microphone: bool):
     """
     Add a transcription entry to the global transcription list.
     """
+    text = _normalize_transcription_text(text)
     g_transcriptions_in.put((user, text, start_time))
     if g_assistant:
         g_assistant.add_message(start_time+1,f"{user}: {text}")
+        if not from_microphone:
+            _trigger_live_assistant_for_output_transcript()
 
 def update_screen_on_new_transcription():
-    global g_transcription
     """
     Update the transcription display in the chat window.
     """
@@ -756,23 +1771,10 @@ def update_screen_on_new_transcription():
             user, text, start_time = g_transcriptions_in.get(block=True, timeout=1)
         except Empty:
             continue
-        try:
-            if user != AGENT_NAME:
-                with open(g_trans_file_name, "a") as f:
-                    f.write(f"{user}: {text}\n\n")
-        except:
-            pass
-        g_transcription.append([user, text, start_time])
-        g_transcription = sorted(g_transcription, key=lambda entry: entry[2])
+        g_transcript_store.append_to_file_if_user(user, text)
+        g_transcript_store.add(user, text, start_time)
         root.after(0, update_chat)
 
-# Stop Recording
-def stop_recording():
-    print("[Stop] Stop recording triggered!")
-    stop_event.set()
-    global_audio.terminate()
-    root.destroy()
-    
 # Initialize Recording
 def initialize_recording():
     try:
@@ -792,48 +1794,36 @@ def initialize_recording():
                 # Fallback: Pick default input/output devices
                 g_device_in = p.get_default_input_device_info()
                 g_device_out = p.get_default_output_device_info()
-        print("[Init] Devices initialized successfully. Recording device:", g_device_in["name"], "Output device:", g_device_out["name"])
+        logger.info("[Init] Devices initialized successfully. Recording device: %s Output device: %s", g_device_in["name"], g_device_out["name"])
     except Exception as e:
-        print(f"[Init] Error initializing devices: {e}")
+        logger.error("[Init] Error initializing devices: %s", e)
         return False
     return True
 
 def handler(signum, frame):
-    print("Ctrl-C was pressed.", flush=True)
-    if g_assistant:
-        g_assistant.stop()
-    stop_recording()
+    logger.info("Ctrl-C was pressed.")
+    close_app()
     exit(1)
 
-if __name__ == "__main__":
-    print("[Main] Starting application...")
+def main():
+    global g_devices_initialized
+    logger.info("[Main] Starting application...")
     signal.signal(signal.SIGINT, handler)
-    os.makedirs("output", exist_ok=True)
+    os.makedirs(g_output_dir, exist_ok=True)
+    os.makedirs(g_temp_dir, exist_ok=True)
     root = setup_ui()
-    if initialize_recording():
-        print("[Main] Recording initialized. Launching UI.")
-        threads = [
-            Thread(target=store_audio_stream, args=(g_recordings_in, "in", g_device_in, True)),
-            Thread(target=store_audio_stream, args=(g_recordings_out, "out", g_device_out, False)),
-            Thread(target=collect_from_stream, args=(g_recordings_in, g_device_in, global_audio, True)),
-            Thread(target=collect_from_stream, args=(g_recordings_out, g_device_out, global_audio, False)),
-            Thread(target=get_speaker_name),
-            Thread(target=update_screen_on_new_transcription),
-        ]
-        for thread in threads:
-            thread.start()
-            print(f"[Main] Started thread: {thread.name}")
 
-        try:
-            print("[Main] Starting Tkinter main loop...")
-            root.mainloop()
-            print("[Main] Tkinter loop has exited.")
-        except Exception as e:
-            print(f"[Main] Error in Tkinter loop: {e}")
+    _update_start_stop_button()
+    if g_auto_start_transcription:
+        root.after(100, start_transcription)
 
-        for thread in threads:
-            thread.join()
-            print(f"[Main] Thread {thread.name} joined.")
-        print("[Main] All threads have finished. Exiting.")
-    else:
-        print("[Main] Failed to initialize recording. Exiting...")
+    try:
+        logger.info("[Main] Starting Tkinter main loop...")
+        root.mainloop()
+        logger.info("[Main] Tkinter loop has exited.")
+    except Exception as e:
+        logger.exception("[Main] Error in Tkinter loop: %s", e)
+
+
+if __name__ == "__main__":
+    main()
