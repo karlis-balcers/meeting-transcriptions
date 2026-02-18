@@ -652,7 +652,14 @@ def _open_settings():
     canvas.bind("<Configure>", _on_canvas_configure)
 
     def _on_mousewheel(event):
-        canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        try:
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        except tk.TclError:
+            pass  # Canvas has been destroyed; unbind to stop further calls
+            try:
+                canvas.unbind_all("<MouseWheel>")
+            except tk.TclError:
+                pass
     canvas.bind_all("<MouseWheel>", _on_mousewheel)
 
     pad = {"padx": (20, 20)}
