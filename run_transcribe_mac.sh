@@ -1,44 +1,43 @@
 #!/bin/bash
+set -u
 
-e# Check if virtual environment exists
-if [ ! -d ".venv" ]; then
-    echo "Virtual environment not found in project directory."
-    echo "Checking if Poetry has a virtual environment configured..."
-    if ! poetry env info >/dev/null 2>&1; then
-        echo "ERROR: No virtual environment found."
-        echo "Please run ./first_time_install_mac.sh to set up the project."
-        exit 1
-    else
-        echo "Found Poetry virtual environment outside project directory."
-        echo "This will still work, but consider running ./first_time_install_mac.sh"
-        echo "to create a local .venv folder for easier management."
-        echo
-    fi
-fi=============================================="
+# Run from repo root regardless of caller's current directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR" || exit 1
+
+echo "==============================================="
 echo "Starting transcribe application"
 echo "==============================================="
 echo
 
 # Check if Poetry is available
-if ! command -v poetry &> /dev/null; then
+if ! command -v poetry >/dev/null 2>&1; then
     echo "ERROR: Poetry is not installed or not in PATH."
     echo "Please run ./first_time_install_mac.sh to set up the project."
     exit 1
 fi
 
-# Check if virtual environment exists
-if [ ! -d ".venv" ]; then
-    echo "ERROR: Virtual environment not found."
+# Check if Poetry has an environment configured
+if ! poetry env info >/dev/null 2>&1; then
+    echo "ERROR: No Poetry virtual environment found."
     echo "Please run ./first_time_install_mac.sh to set up the project."
     exit 1
 fi
 
+# Optional warning if local .venv does not exist
+if [ ! -d ".venv" ]; then
+    echo "Warning: .venv not found in project directory."
+    echo "Poetry may be using an external virtual environment."
+    echo
+fi
+
 echo "Starting application..."
 poetry run python transcribe.py
+status=$?
 
-if [ $? -ne 0 ]; then
+if [ $status -ne 0 ]; then
     echo
     echo "ERROR: Application failed to start."
     echo "Please check the error messages above."
-    exit 1
+    exit $status
 fi
