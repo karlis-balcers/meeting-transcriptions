@@ -24,6 +24,7 @@ import assistant
 import openai_transcribe
 import audio_capture as audio_capture_module
 import ui as ui_module
+from env_utils import parse_language_candidates
 from logging_utils import setup_logging
 from transcript_store import TranscriptStore
 from transcript_filter import TranscriptFilter
@@ -107,12 +108,21 @@ LIVE_ASSISTANT_PANEL_CONFIG: list[tuple[str, str, str]] = [
     ("get_facts", "Facts", "ASSISTANT_LIVE_FACTS_ENABLED"),
 ]
 
+SUPPORTED_LANGUAGES = [
+    "en", "lv", "ru", "de", "fr", "es", "it", "pt", "nl", "pl",
+    "sv", "fi", "et", "lt", "ja", "zh", "ko", "ar", "tr", "no",
+]
+
+def _format_language_candidates(candidates: list[str]) -> str:
+    return ",".join(candidates)
+
 
 def _print_startup_summary() -> None:
     logger.info("=== Startup Configuration Summary ===")
     logger.info("Platform: %s", sys.platform)
     logger.info("User name: %s", g_my_name)
-    logger.info("Language: %s", g_language)
+    logger.info("Configured language candidates: %s", _format_language_candidates(g_language_candidates))
+    logger.info("Default active language at startup: %s", g_active_language)
     logger.info("Manual interrupt enabled: %s", g_interupt_manually)
     logger.info("Transcript model: %s", g_openai_model_for_transcript)
     logger.info("Record seconds: %s", RECORD_SECONDS)
@@ -282,7 +292,7 @@ def _create_transcript_ai() -> openai_transcribe.OpenAITranscribe:
     return openai_transcribe.OpenAITranscribe(
         model=g_openai_model_for_transcript,
         keywords=g_keywords,
-        language=g_language,
+        language=g_active_language,
         status_callback=_transcription_status_callback,
     )
 
@@ -291,7 +301,11 @@ def _reinitialize_transcript_ai() -> None:
     global g_transcript_ai
     try:
         g_transcript_ai = _create_transcript_ai()
-        logger.info("Transcription model reinitialized with language=%s model=%s", g_language, g_openai_model_for_transcript)
+        logger.info(
+            "Transcription model reinitialized with language=%s model=%s",
+            g_active_language,
+            g_openai_model_for_transcript,
+        )
     except Exception as e:
         logger.error("Failed to reinitialize transcription model: %s", e)
         set_status("Transcription reinit failed", "error")
@@ -349,8 +363,15 @@ if g_my_name == "You":
 logger.info("Your name is: %s", g_my_name)
 AGENT_NAME="Agent"
 
-g_language = _env_str("LANGUAGE", "en")
-logger.info("Language: %s", g_language)
+g_language_candidates = parse_language_candidates(
+    _env_str("LANGUAGE", "en"),
+    SUPPORTED_LANGUAGES,
+    g_startup_warnings,
+    fallback="en",
+)
+g_active_language = g_language_candidates[0]
+logger.info("Configured language candidates: %s", _format_language_candidates(g_language_candidates))
+logger.info("Default active language at startup: %s", g_active_language)
 
 g_open_api_key = _env_str("OPENAI_API_KEY")
 if not g_open_api_key:
@@ -590,8 +611,79 @@ def _sync_auto_start_var():
         _save_env_updates({"AUTO_START_TRANSCRIPTION": "True" if g_auto_start_transcription else "False"})
 
 
+def _prompt_language_selection(candidates: list[str], default_language: str) -> str | None:
+    if root is None:
+        return default_language
+    if len(candidates) <= 1:
+        return candidates[0] if candidates else default_language
+
+    theme = ui_module.THEME
+    dialog = tk.Toplevel(root)
+    dialog.title("Select Transcription Language")
+    dialog.geometry("420x180")
+    dialog.resizable(False, False)
+    dialog.transient(root)
+    dialog.grab_set()
+    dialog.configure(bg=theme["bg"])
+    ui_module.apply_dark_title_bar(dialog)
+
+    selected_var = tk.StringVar(
+        value=default_language if default_language in candidates else candidates[0]
+    )
+    selection: dict[str, str | None] = {"value": None}
+
+    tk.Label(
+        dialog,
+        text="Choose language for this recording session:",
+        bg=theme["bg"],
+        fg=theme["text_primary"],
+        font=ui_module.get_font(g_default_font_size),
+    ).pack(anchor="w", padx=16, pady=(16, 8))
+
+    ttk.Combobox(
+        dialog,
+        values=candidates,
+        textvariable=selected_var,
+        state="readonly",
+        width=20,
+    ).pack(anchor="w", padx=16, pady=(0, 16))
+
+    btn_row = tk.Frame(dialog, bg=theme["bg"])
+    btn_row.pack(fill=tk.X, padx=16, pady=(0, 12))
+
+    def on_start() -> None:
+        selection["value"] = (selected_var.get() or "").strip().lower()
+        dialog.destroy()
+
+    def on_cancel() -> None:
+        selection["value"] = None
+        dialog.destroy()
+
+    ui_module.create_styled_button(
+        btn_row,
+        text="Start",
+        command=on_start,
+        bg=theme["accent_green"],
+        hover_bg=theme["accent_green_hover"],
+        font_size=g_default_font_size,
+    ).pack(side=tk.RIGHT, padx=(6, 0))
+    ui_module.create_styled_button(
+        btn_row,
+        text="Cancel",
+        command=on_cancel,
+        bg=theme["surface_light"],
+        hover_bg=theme["surface"],
+        fg=theme["text_secondary"],
+        font_size=g_default_font_size,
+    ).pack(side=tk.RIGHT)
+
+    dialog.protocol("WM_DELETE_WINDOW", on_cancel)
+    dialog.wait_window()
+    return selection["value"]
+
+
 def _open_settings():
-    global g_language, g_auto_summarize_on_stop, g_output_dir, g_summaries_dir
+    global g_language_candidates, g_active_language, g_auto_summarize_on_stop, g_output_dir, g_summaries_dir
     global g_assistant_web_search_for_custom_prompts
     global g_my_name, g_interupt_manually, g_keywords, g_openai_model_for_transcript
     global g_agent_font_size, g_default_font_size, g_temp_dir, g_context_file
@@ -675,11 +767,17 @@ def _open_settings():
     tk.Entry(frame, textvariable=name_var, width=30, **_entry_opts).grid(row=row, column=1, sticky="w", pady=3)
     row += 1
 
-    tk.Label(frame, text="Language", **_lbl_opts).grid(row=row, column=0, sticky="w", pady=3, **pad)
-    lang_var = tk.StringVar(value=g_language or "en")
-    languages = ["en", "lv", "ru", "de", "fr", "es", "it", "pt", "nl", "pl", "sv", "fi", "et", "lt", "ja", "zh", "ko", "ar", "tr"]
-    ttk.Combobox(frame, values=languages, textvariable=lang_var, state="readonly", width=12).grid(
-        row=row, column=1, sticky="w", pady=3)
+    tk.Label(frame, text="Language(s)", **_lbl_opts).grid(row=row, column=0, sticky="w", pady=3, **pad)
+    lang_var = tk.StringVar(value=_format_language_candidates(g_language_candidates))
+    tk.Entry(frame, textvariable=lang_var, width=30, **_entry_opts).grid(row=row, column=1, sticky="w", pady=3)
+    tk.Label(
+        frame,
+        text="Use one code or comma-separated list (example: en,no).",
+        bg=theme["bg"],
+        fg=theme["text_muted"],
+        font=ui_module.get_font(max(8, g_default_font_size - 1)),
+    ).grid(row=row + 1, column=1, columnspan=2, sticky="w")
+    row += 1
     row += 1
 
     tk.Label(frame, text="Keywords", **_lbl_opts).grid(row=row, column=0, sticky="w", pady=3, **pad)
@@ -950,7 +1048,7 @@ def _open_settings():
     btn_bar.pack(side=tk.BOTTOM, fill=tk.X)
 
     def on_save():
-        global g_language, g_auto_summarize_on_stop, g_output_dir, g_summaries_dir
+        global g_language_candidates, g_active_language, g_auto_summarize_on_stop, g_output_dir, g_summaries_dir
         global g_assistant_web_search_for_custom_prompts
         global g_my_name, g_interupt_manually, g_keywords, g_openai_model_for_transcript
         global g_agent_font_size, g_default_font_size, g_temp_dir, g_context_file
@@ -958,7 +1056,16 @@ def _open_settings():
         global g_live_assistant_mode_enabled
 
         g_my_name = name_var.get().strip() or "You"
-        g_language = (lang_var.get() or "en").strip()
+        language_warnings: list[str] = []
+        g_language_candidates = parse_language_candidates(
+            (lang_var.get() or "en").strip(),
+            SUPPORTED_LANGUAGES,
+            language_warnings,
+            fallback="en",
+        )
+        g_active_language = g_language_candidates[0]
+        for warning in language_warnings:
+            logger.warning("[Settings] %s", warning)
         g_keywords = kw_var.get().strip() or None
         g_interupt_manually = bool(interrupt_var.get())
         g_auto_summarize_on_stop = bool(auto_sum_var.get())
@@ -1004,7 +1111,7 @@ def _open_settings():
 
         env_updates = {
             "YOUR_NAME": g_my_name,
-            "LANGUAGE": g_language,
+            "LANGUAGE": _format_language_candidates(g_language_candidates),
             "INTERUPT_MANUALLY": "True" if g_interupt_manually else "False",
             "AUTO_START_TRANSCRIPTION": "True" if bool(auto_start_var.get()) else "False",
             "AUTO_SUMMARIZE_ON_STOP": "True" if g_auto_summarize_on_stop else "False",
@@ -1074,11 +1181,34 @@ def _open_settings():
                                    font_size=g_default_font_size).pack(side=tk.RIGHT)
 
 
-def start_transcription():
-    global g_is_recording, g_recording_threads, g_devices_initialized
+def start_transcription(manual_start: bool = True):
+    global g_is_recording, g_recording_threads, g_devices_initialized, g_active_language
     global flush_letter_mic, flush_letter_out
     if g_is_recording:
         return
+
+    if manual_start and len(g_language_candidates) > 1:
+        selected_language = _prompt_language_selection(g_language_candidates, g_active_language)
+        if not selected_language:
+            set_status("Transcription start cancelled", "warning")
+            return
+    elif not manual_start and len(g_language_candidates) > 1:
+        selected_language = g_language_candidates[0]
+    else:
+        selected_language = g_language_candidates[0]
+
+    if selected_language != g_active_language:
+        g_active_language = selected_language
+        _reinitialize_transcript_ai()
+    else:
+        g_active_language = selected_language
+
+    logger.info(
+        "[Start] Using transcription language '%s' (candidates=%s, auto_start=%s)",
+        g_active_language,
+        _format_language_candidates(g_language_candidates),
+        not manual_start,
+    )
 
     g_devices_initialized = initialize_recording()
     if not g_devices_initialized:
@@ -1109,7 +1239,7 @@ def start_transcription():
 
     g_is_recording = True
     _update_start_stop_button()
-    set_status("Transcription started", "info")
+    set_status(f"Transcription started (language: {g_active_language})", "info")
 
 
 def stop_transcription(trigger_auto_summary: bool = True):
@@ -1133,7 +1263,7 @@ def toggle_start_stop():
     if g_is_recording:
         stop_transcription()
     else:
-        start_transcription()
+        start_transcription(manual_start=True)
 
 
 def _run_summary_before_close(transcription_snapshot: list[list]) -> None:
@@ -1784,27 +1914,31 @@ def update_screen_on_new_transcription():
 
 # Initialize Recording
 def initialize_recording():
+    p = None
     try:
-        with pyaudio.PyAudio() as p:
-            global g_device_in, g_device_out
-            if sys.platform == "win32":
-                wasapi_info = p.get_host_api_info_by_type(pyaudio.paWASAPI)
-                g_device_in = p.get_device_info_by_index(wasapi_info["defaultInputDevice"])
-                g_device_out = p.get_device_info_by_index(wasapi_info["defaultOutputDevice"])
+        p = pyaudio.PyAudio()
+        global g_device_in, g_device_out
+        if sys.platform == "win32":
+            wasapi_info = p.get_host_api_info_by_type(pyaudio.paWASAPI)
+            g_device_in = p.get_device_info_by_index(wasapi_info["defaultInputDevice"])
+            g_device_out = p.get_device_info_by_index(wasapi_info["defaultOutputDevice"])
 
-                if not g_device_out.get("isLoopbackDevice", False):
-                    for loopback in p.get_loopback_device_info_generator():
-                        if g_device_out["name"] in loopback.get("name", ""):
-                            g_device_out = loopback
-                            break
-            else:
-                # Fallback: Pick default input/output devices
-                g_device_in = p.get_default_input_device_info()
-                g_device_out = p.get_default_output_device_info()
+            if not g_device_out.get("isLoopbackDevice", False):
+                for loopback in p.get_loopback_device_info_generator():
+                    if g_device_out["name"] in loopback.get("name", ""):
+                        g_device_out = loopback
+                        break
+        else:
+            # Fallback: Pick default input/output devices
+            g_device_in = p.get_default_input_device_info()
+            g_device_out = p.get_default_output_device_info()
         logger.info("[Init] Devices initialized successfully. Recording device: %s Output device: %s", g_device_in["name"], g_device_out["name"])
     except Exception as e:
         logger.error("[Init] Error initializing devices: %s", e)
         return False
+    finally:
+        if p is not None:
+            p.terminate()
     return True
 
 def handler(signum, frame):
@@ -1822,7 +1956,7 @@ def main():
 
     _update_start_stop_button()
     if g_auto_start_transcription:
-        root.after(100, start_transcription)
+        root.after(100, lambda: start_transcription(manual_start=False))
 
     try:
         logger.info("[Main] Starting Tkinter main loop...")

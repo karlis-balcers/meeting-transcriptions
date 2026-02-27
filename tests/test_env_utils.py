@@ -1,6 +1,6 @@
 import unittest
 
-from env_utils import env_str, env_int, env_float, env_bool
+from env_utils import env_str, env_int, env_float, env_bool, parse_language_candidates
 
 
 class EnvUtilsTests(unittest.TestCase):
@@ -30,6 +30,36 @@ class EnvUtilsTests(unittest.TestCase):
         self.assertFalse(env_bool(env, "B", True, warnings))
         self.assertTrue(env_bool(env, "C", True, warnings))
         self.assertTrue(any("Invalid boolean" in w for w in warnings))
+
+    def test_parse_language_candidates_single(self):
+        warnings = []
+        langs = parse_language_candidates("en", ["en", "no", "lv"], warnings)
+        self.assertEqual(langs, ["en"])
+        self.assertEqual(warnings, [])
+
+    def test_parse_language_candidates_multiple(self):
+        warnings = []
+        langs = parse_language_candidates("en,no", ["en", "no", "lv"], warnings)
+        self.assertEqual(langs, ["en", "no"])
+        self.assertEqual(warnings, [])
+
+    def test_parse_language_candidates_with_invalid(self):
+        warnings = []
+        langs = parse_language_candidates("EN, no ,xx", ["en", "no", "lv"], warnings)
+        self.assertEqual(langs, ["en", "no"])
+        self.assertTrue(any("unsupported code 'xx'" in w for w in warnings))
+
+    def test_parse_language_candidates_empty_fallback(self):
+        warnings = []
+        langs = parse_language_candidates(", ,", ["en", "no", "lv"], warnings)
+        self.assertEqual(langs, ["en"])
+        self.assertTrue(any("has no supported codes" in w for w in warnings))
+
+    def test_parse_language_candidates_dedupes(self):
+        warnings = []
+        langs = parse_language_candidates("en,en,no", ["en", "no", "lv"], warnings)
+        self.assertEqual(langs, ["en", "no"])
+        self.assertEqual(warnings, [])
 
 
 if __name__ == "__main__":

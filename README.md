@@ -77,7 +77,11 @@ Use `env.sample` as the source of truth. Important settings:
 ### Identity and language
 
 - `YOUR_NAME` - your speaker label in transcript
-- `LANGUAGE` - transcription language code (for example `en`, `lv`)
+- `LANGUAGE` - transcription language code(s):
+  - single code: `en`
+  - comma-separated list: `en,no,lv`
+  - when multiple codes are configured, manual `Start` prompts you to pick one language for that recording session
+  - with `AUTO_START_TRANSCRIPTION=True`, the app uses the first configured language automatically (no prompt)
 
 ### Session behavior
 
@@ -124,7 +128,7 @@ Use `env.sample` as the source of truth. Important settings:
 The app settings dialog allows runtime updates and persists them to `.env`:
 
 - Auto-start transcription
-- Transcription language
+- Transcription language(s) (single code or comma-separated list)
 - Auto-summarize on stop
 - Enable internet search for assistant custom prompts
 - Transcriptions folder
