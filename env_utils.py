@@ -49,3 +49,35 @@ def env_bool(env: dict[str, str], name: str, default: bool, warnings: list[str])
 
     warnings.append(f"Invalid boolean for {name}='{raw}'. Using default {default}.")
     return default
+
+
+def parse_language_candidates(
+    raw: Optional[str],
+    supported_languages: list[str],
+    warnings: list[str],
+    fallback: str = "en",
+) -> list[str]:
+    value = (raw or "").strip().lower()
+    if not value:
+        return [fallback]
+
+    seen: set[str] = set()
+    candidates: list[str] = []
+    for token in value.split(","):
+        code = token.strip().lower()
+        if not code:
+            continue
+        if code not in supported_languages:
+            warnings.append(f"LANGUAGE includes unsupported code '{code}'. Ignoring it.")
+            continue
+        if code in seen:
+            continue
+        seen.add(code)
+        candidates.append(code)
+
+    if not candidates:
+        warnings.append(
+            f"LANGUAGE='{raw}' has no supported codes. Using '{fallback}'."
+        )
+        return [fallback]
+    return candidates

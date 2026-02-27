@@ -74,87 +74,116 @@ def collect_from_stream(
 	logger,
 ):
 	logger.info("[%s] Starting collect_from_stream...", input_device["name"])
+	stream = None
 	try:
 		frame_rate = int(input_device["defaultSampleRate"])
 		chunk_size = int(frame_rate * frame_duration_ms / 1000)
 		if chunk_size <= 0:
 			chunk_size = 1
 
-		with p_instance.open(
+		input_channels = int(input_device.get("maxInputChannels", 0) or 0)
+		if input_channels <= 0:
+			logger.warning(
+				"[%s] Device has no input channels; skipping capture for this device.",
+				input_device.get("name", "Unknown"),
+			)
+			return
+
+		stream = p_instance.open(
 			format=p_instance.get_format_from_width(2),
-			channels=input_device["maxInputChannels"],
+			channels=input_channels,
 			rate=frame_rate,
 			frames_per_buffer=chunk_size,
 			input=True,
 			input_device_index=input_device["index"],
-		) as stream:
-			logger.info("[%s] Audio stream opened successfully.", input_device["name"])
-			frames = []
-			start_time = time.time()
-			silence_start_time = None
-			silence_frame_count = 0
+		)
+		logger.info("[%s] Audio stream opened successfully.", input_device["name"])
+		frames = []
+		start_time = time.time()
+		silence_start_time = None
+		silence_frame_count = 0
 
-			while not stop_event.is_set():
-				try:
-					if len(frames) == silence_frame_count:
-						start_time = time.time()
+		while not stop_event.is_set():
+			try:
+				if len(frames) == silence_frame_count:
+					start_time = time.time()
 
-					if from_microphone and mute_mic_event.is_set():
-						time.sleep(0.001)
-						continue
+				if from_microphone and mute_mic_event.is_set():
+					time.sleep(0.001)
+					continue
 
-					data = stream.read(chunk_size, exception_on_overflow=False)
-					frames.append(data)
+				data = stream.read(chunk_size, exception_on_overflow=False)
+				frames.append(data)
 
-					with flush_lock:
-						flush_mic, flush_out = get_flush_letters()
-						current_letter = flush_mic if from_microphone else flush_out
-						clear_flush_letters(from_microphone)
+				with flush_lock:
+					flush_mic, flush_out = get_flush_letters()
+					current_letter = flush_mic if from_microphone else flush_out
+					clear_flush_letters(from_microphone)
 
-					if current_letter:
-						if len(frames) > 0:
-							if current_letter == "_" and not from_microphone:
-								seconds_to_go_back = 2.0
-								frames_to_remove = int((1000 / frame_duration_ms) * seconds_to_go_back)
-								frames_to_process = frames[:-frames_to_remove]
-								previous_speaker, _ = speaker_snapshot_getter()
-								queue.put((frames_to_process.copy(), previous_speaker, start_time))
-								frames = frames[-frames_to_remove:]
-								start_time = time.time() - (frames_to_remove * frame_duration_ms) / 1000
-							elif current_letter != "_":
-								logger.info("[%s] Manual split triggered; flushing %s frames.", input_device["name"], len(frames))
-								speaker_setter(current_letter)
-								queue.put((frames.copy(), current_letter, start_time))
-								frames = []
-							silence_frame_count = 0
-
-					audio_samples = np.array(struct.unpack(f"{len(data)//2}h", data))
-					volume = np.sqrt(np.mean(audio_samples ** 2))
-
-					if volume < silence_threshold:
-						silence_frame_count += 1
-						if silence_start_time is None:
-							silence_start_time = time.time()
-						elif time.time() - silence_start_time >= silence_duration:
-							if len(frames) != silence_frame_count:
-								_, current_speaker = speaker_snapshot_getter()
-								queue.put((frames.copy(), current_speaker, start_time))
+				if current_letter:
+					if len(frames) > 0:
+						if current_letter == "_" and not from_microphone:
+							seconds_to_go_back = 2.0
+							frames_to_remove = int((1000 / frame_duration_ms) * seconds_to_go_back)
+							frames_to_process = frames[:-frames_to_remove]
+							previous_speaker, _ = speaker_snapshot_getter()
+							queue.put((frames_to_process.copy(), previous_speaker, start_time))
+							frames = frames[-frames_to_remove:]
+							start_time = time.time() - (frames_to_remove * frame_duration_ms) / 1000
+						elif current_letter != "_":
+							logger.info("[%s] Manual split triggered; flushing %s frames.", input_device["name"], len(frames))
+							speaker_setter(current_letter)
+							queue.put((frames.copy(), current_letter, start_time))
 							frames = []
-							silence_frame_count = 0
-							silence_start_time = None
-					else:
-						silence_start_time = None
+						silence_frame_count = 0
 
-					if len(frames) >= int((frame_rate * record_seconds) / chunk_size):
-						logger.info("[%s] Auto split after reaching %s seconds; queueing %s frames.", input_device["name"], record_seconds, len(frames))
-						_, current_speaker = speaker_snapshot_getter()
-						queue.put((frames.copy(), current_speaker, start_time))
+				audio_samples = np.array(struct.unpack(f"{len(data)//2}h", data))
+				volume = np.sqrt(np.mean(audio_samples ** 2))
+
+				if volume < silence_threshold:
+					silence_frame_count += 1
+					if silence_start_time is None:
+						silence_start_time = time.time()
+					elif time.time() - silence_start_time >= silence_duration:
+						if len(frames) != silence_frame_count:
+							_, current_speaker = speaker_snapshot_getter()
+							queue.put((frames.copy(), current_speaker, start_time))
 						frames = []
 						silence_frame_count = 0
-				except Exception as e:
-					logger.warning("[%s] Error reading from stream: %s", input_device["name"], e)
-					break
+						silence_start_time = None
+				else:
+					silence_start_time = None
+
+				if len(frames) >= int((frame_rate * record_seconds) / chunk_size):
+					logger.info("[%s] Auto split after reaching %s seconds; queueing %s frames.", input_device["name"], record_seconds, len(frames))
+					_, current_speaker = speaker_snapshot_getter()
+					queue.put((frames.copy(), current_speaker, start_time))
+					frames = []
+					silence_frame_count = 0
+			except Exception as e:
+				logger.warning("[%s] Error reading from stream: %s", input_device["name"], e)
+				break
+
+		if frames:
+			_, current_speaker = speaker_snapshot_getter()
+			queue.put((frames.copy(), current_speaker, start_time))
+			logger.info(
+				"[%s] Flushed %s buffered frames on stop.",
+				input_device["name"],
+				len(frames),
+			)
 	except Exception as e:
 		logger.error("[%s] Failed to open audio stream: %s", input_device.get("name", "Unknown"), e)
+	finally:
+		if stream is not None:
+			try:
+				if stream.is_active():
+					stream.stop_stream()
+			except Exception:
+				pass
+			try:
+				stream.close()
+			except Exception:
+				pass
 
 	logger.info("[%s] collect_from_stream exiting.", input_device.get("name", "Unknown"))
