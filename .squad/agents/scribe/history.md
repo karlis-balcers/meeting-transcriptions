@@ -9,3 +9,4 @@
 ## Learnings
 
 <!-- Append learnings below -->
+- 2026-05-27: Merged eight Go TUI migration decisions from the inbox, created orchestration/session logs, and marked focus as implemented and approved without staging or committing.
