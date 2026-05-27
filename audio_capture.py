@@ -2,9 +2,165 @@ from __future__ import annotations
 
 import os
 import struct
+import sys
 import time
 import wave
 import numpy as np
+
+
+def clone_device_info(device_info: dict | None) -> dict:
+	"""Return a shallow copy of a device info mapping."""
+	return dict(device_info or {})
+
+
+def is_loopback_device(device_info: dict | None) -> bool:
+	"""Return True when the supplied device is a WASAPI loopback device."""
+	return bool((device_info or {}).get("isLoopbackDevice", False))
+
+
+def normalize_device_name(name: str | None) -> str:
+	"""Normalize device names so render and loopback variants can be matched."""
+	value = str(name or "").strip().casefold()
+	value = value.replace("[loopback]", " ")
+	return " ".join(value.split())
+
+
+def device_label(device_info: dict | None) -> str:
+	"""Create a stable, user-friendly label for UI selection widgets."""
+	if not device_info:
+		return "Unknown device"
+
+	name = str(device_info.get("name") or "Unknown device").strip()
+	index = device_info.get("index")
+	channels = int(device_info.get("maxInputChannels", 0) or 0)
+	if index is None:
+		return f"{name} • {channels}ch"
+	return f"{name} • {channels}ch • #{index}"
+
+
+def build_recording_device_catalog(devices: list[dict], platform_name: str | None = None) -> dict[str, list[dict]]:
+	"""Split raw device infos into microphone and output-capture candidates."""
+	platform_name = platform_name or sys.platform
+	inputs: list[dict] = []
+	outputs: list[dict] = []
+
+	for raw_device in devices:
+		device = clone_device_info(raw_device)
+		input_channels = int(device.get("maxInputChannels", 0) or 0)
+		output_channels = int(device.get("maxOutputChannels", 0) or 0)
+
+		if platform_name == "win32":
+			if input_channels > 0 and is_loopback_device(device):
+				outputs.append(device)
+			elif input_channels > 0:
+				inputs.append(device)
+		else:
+			if input_channels > 0:
+				inputs.append(device)
+			if output_channels > 0:
+				outputs.append(device)
+
+	return {"inputs": inputs, "outputs": outputs}
+
+
+def pick_preferred_device(
+	devices: list[dict],
+	preferred_index: int | None = None,
+	preferred_name: str | None = None,
+	fallback_device: dict | None = None,
+) -> dict:
+	"""Select a device by saved index/name, then fall back to the suggested/default one."""
+	for device in devices:
+		if preferred_index is not None and device.get("index") == preferred_index:
+			return clone_device_info(device)
+
+	needle = normalize_device_name(preferred_name)
+	if needle:
+		for device in devices:
+			if normalize_device_name(device.get("name")) == needle:
+				return clone_device_info(device)
+
+	if fallback_device:
+		fallback_index = fallback_device.get("index")
+		fallback_name = fallback_device.get("name")
+		for device in devices:
+			if fallback_index is not None and device.get("index") == fallback_index:
+				return clone_device_info(device)
+		fallback_needle = normalize_device_name(fallback_name)
+		if fallback_needle:
+			for device in devices:
+				if normalize_device_name(device.get("name")) == fallback_needle:
+					return clone_device_info(device)
+
+	return clone_device_info(devices[0]) if devices else {}
+
+
+def enumerate_recording_devices(p_instance, platform_name: str | None = None) -> dict[str, dict | list[dict]]:
+	"""Discover recording-capable input and output-capture devices."""
+	platform_name = platform_name or sys.platform
+	raw_devices: list[dict] = []
+	for device_index in range(int(p_instance.get_device_count())):
+		try:
+			raw_devices.append(clone_device_info(p_instance.get_device_info_by_index(device_index)))
+		except Exception:
+			continue
+
+	catalog = build_recording_device_catalog(raw_devices, platform_name=platform_name)
+	default_input: dict = {}
+	default_output: dict = {}
+
+	if platform_name == "win32":
+		try:
+			wasapi_info = p_instance.get_host_api_info_by_type(p_instance.paWASAPI)
+		except Exception:
+			wasapi_info = None
+
+		if wasapi_info:
+			try:
+				default_input = clone_device_info(
+					p_instance.get_device_info_by_index(wasapi_info["defaultInputDevice"])
+				)
+			except Exception:
+				default_input = {}
+
+			try:
+				if hasattr(p_instance, "get_default_wasapi_loopback"):
+					default_output = clone_device_info(p_instance.get_default_wasapi_loopback())
+			except Exception:
+				default_output = {}
+
+			if not default_output:
+				try:
+					default_render_device = clone_device_info(
+						p_instance.get_device_info_by_index(wasapi_info["defaultOutputDevice"])
+					)
+					default_output = pick_preferred_device(
+						catalog["outputs"],
+						preferred_name=default_render_device.get("name"),
+					)
+				except Exception:
+					default_output = {}
+	else:
+		try:
+			default_input = clone_device_info(p_instance.get_default_input_device_info())
+		except Exception:
+			default_input = {}
+		try:
+			default_output = clone_device_info(p_instance.get_default_output_device_info())
+		except Exception:
+			default_output = {}
+
+	if not default_input and catalog["inputs"]:
+		default_input = clone_device_info(catalog["inputs"][0])
+	if not default_output and catalog["outputs"]:
+		default_output = clone_device_info(catalog["outputs"][0])
+
+	return {
+		"inputs": catalog["inputs"],
+		"outputs": catalog["outputs"],
+		"default_input": default_input,
+		"default_output": default_output,
+	}
 
 
 def store_audio_stream(
