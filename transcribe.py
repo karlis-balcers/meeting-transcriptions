@@ -87,6 +87,17 @@ def _env_bool(name: str, default: bool, warnings: list[str]) -> bool:
     return default
 
 
+def _env_optional_int(name: str, warnings: list[str]) -> int | None:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        warnings.append(f"Invalid integer for {name}='{raw}'. Ignoring saved value.")
+        return None
+
+
 def _decode_env_multiline(raw: str | None, default: str = "") -> str:
     if raw is None:
         return default
@@ -137,6 +148,8 @@ def _print_startup_summary() -> None:
     logger.info("Transcription output dir: %s", g_output_dir)
     logger.info("Temporary audio dir: %s", g_temp_dir)
     logger.info("Summary output dir: %s", g_summaries_dir)
+    logger.info("Preferred microphone: %s", g_selected_input_name or "default")
+    logger.info("Preferred output capture: %s", g_selected_output_name or "default")
     logger.info("Keywords configured: %s", 'yes' if g_keywords else 'no')
     logger.info("OpenAI API key configured: %s", 'yes' if g_open_api_key else 'no')
     logger.info("Assistant enabled: %s", 'yes' if g_assistant else 'no')
@@ -175,6 +188,14 @@ g_status_level = "info"
 g_device_in = {}
 g_device_out = {}
 g_sample_size = 0
+g_available_input_devices: list[dict] = []
+g_available_output_devices: list[dict] = []
+g_input_device_labels: dict[str, dict] = {}
+g_output_device_labels: dict[str, dict] = {}
+g_selected_input_device_index: int | None = None
+g_selected_output_device_index: int | None = None
+g_selected_input_name: str | None = None
+g_selected_output_name: str | None = None
 
 # Global flush counter (for manual splits) and its lock
 flush_letter_mic = None
@@ -190,6 +211,11 @@ g_devices_initialized = False
 
 start_stop_button = None
 settings_button = None
+input_device_var = None
+output_device_var = None
+input_device_dropdown = None
+output_device_dropdown = None
+refresh_devices_button = None
 
 g_auto_start_transcription = False
 g_auto_summarize_on_stop = False
@@ -390,6 +416,10 @@ g_live_assistant_mode_enabled = {
 
 g_assistant = None
 g_vector_store_id = _env_str("OPENAI_VECTOR_STORE_ID_FOR_ANSWERS")
+g_selected_input_device_index = _env_optional_int("AUDIO_INPUT_DEVICE_INDEX", g_startup_warnings)
+g_selected_output_device_index = _env_optional_int("AUDIO_OUTPUT_DEVICE_INDEX", g_startup_warnings)
+g_selected_input_name = _env_str("AUDIO_INPUT_DEVICE_NAME")
+g_selected_output_name = _env_str("AUDIO_OUTPUT_DEVICE_NAME")
 
 if g_open_api_key:
     try:
@@ -603,12 +633,148 @@ def _update_start_stop_button():
         if settings_button:
             settings_button.config(state=tk.NORMAL)
 
+    _apply_audio_device_dropdown_state()
+
 
 def _sync_auto_start_var():
     global g_auto_start_transcription
     if g_auto_start_var is not None:
         g_auto_start_transcription = bool(g_auto_start_var.get())
         _save_env_updates({"AUTO_START_TRANSCRIPTION": "True" if g_auto_start_transcription else "False"})
+
+
+def _persist_audio_device_preferences() -> None:
+    _save_env_updates(
+        {
+            "AUDIO_INPUT_DEVICE_INDEX": "" if g_selected_input_device_index is None else str(g_selected_input_device_index),
+            "AUDIO_INPUT_DEVICE_NAME": g_selected_input_name or "",
+            "AUDIO_OUTPUT_DEVICE_INDEX": "" if g_selected_output_device_index is None else str(g_selected_output_device_index),
+            "AUDIO_OUTPUT_DEVICE_NAME": g_selected_output_name or "",
+        }
+    )
+
+
+def _set_selected_audio_device(kind: str, device_info: dict | None, persist: bool = True) -> None:
+    global g_selected_input_device_index, g_selected_input_name
+    global g_selected_output_device_index, g_selected_output_name
+
+    device = dict(device_info or {})
+    device_index = device.get("index")
+    device_name = (device.get("name") or "").strip() or None
+
+    if kind == "input":
+        g_selected_input_device_index = device_index if isinstance(device_index, int) else None
+        g_selected_input_name = device_name
+    else:
+        g_selected_output_device_index = device_index if isinstance(device_index, int) else None
+        g_selected_output_name = device_name
+
+    if persist:
+        _persist_audio_device_preferences()
+
+
+def _apply_audio_device_dropdown_state() -> None:
+    input_state = "readonly" if (not g_is_recording and g_available_input_devices) else "disabled"
+    output_state = "readonly" if (not g_is_recording and g_available_output_devices) else "disabled"
+
+    if input_device_dropdown is not None:
+        input_device_dropdown.config(state=input_state)
+    if output_device_dropdown is not None:
+        output_device_dropdown.config(state=output_state)
+    if refresh_devices_button is not None:
+        refresh_devices_button.config(state=tk.DISABLED if g_is_recording else tk.NORMAL)
+
+
+def refresh_audio_device_options(show_status_message: bool = True) -> bool:
+    global g_available_input_devices, g_available_output_devices
+    global g_input_device_labels, g_output_device_labels
+
+    p = None
+    try:
+        p = pyaudio.PyAudio()
+        device_catalog = audio_capture_module.enumerate_recording_devices(p, platform_name=sys.platform)
+    except Exception as e:
+        logger.error("[Audio] Failed to enumerate devices: %s", e)
+        if show_status_message:
+            set_status("Could not refresh audio devices", "error")
+        return False
+    finally:
+        if p is not None:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+
+    g_available_input_devices = list(device_catalog.get("inputs", []))
+    g_available_output_devices = list(device_catalog.get("outputs", []))
+
+    selected_input = audio_capture_module.pick_preferred_device(
+        g_available_input_devices,
+        preferred_index=g_selected_input_device_index,
+        preferred_name=g_selected_input_name,
+        fallback_device=device_catalog.get("default_input"),
+    )
+    selected_output = audio_capture_module.pick_preferred_device(
+        g_available_output_devices,
+        preferred_index=g_selected_output_device_index,
+        preferred_name=g_selected_output_name,
+        fallback_device=device_catalog.get("default_output"),
+    )
+
+    g_input_device_labels = {
+        audio_capture_module.device_label(device): device
+        for device in g_available_input_devices
+    }
+    g_output_device_labels = {
+        audio_capture_module.device_label(device): device
+        for device in g_available_output_devices
+    }
+
+    selected_input_label = audio_capture_module.device_label(selected_input) if selected_input else ""
+    selected_output_label = audio_capture_module.device_label(selected_output) if selected_output else ""
+
+    _set_selected_audio_device("input", selected_input, persist=False)
+    _set_selected_audio_device("output", selected_output, persist=False)
+    _persist_audio_device_preferences()
+
+    if input_device_dropdown is not None:
+        input_device_dropdown["values"] = list(g_input_device_labels.keys())
+    if output_device_dropdown is not None:
+        output_device_dropdown["values"] = list(g_output_device_labels.keys())
+
+    if input_device_var is not None:
+        input_device_var.set(selected_input_label)
+    if output_device_var is not None:
+        output_device_var.set(selected_output_label)
+
+    _apply_audio_device_dropdown_state()
+
+    if show_status_message:
+        if selected_input and selected_output:
+            set_status("Audio devices refreshed", "info")
+        elif selected_input or selected_output:
+            set_status("Some audio devices are unavailable", "warning")
+        else:
+            set_status("No recording devices detected", "warning")
+
+    return bool(selected_input and selected_output)
+
+
+def _handle_audio_device_selection(kind: str) -> None:
+    if kind == "input":
+        label = input_device_var.get().strip() if input_device_var is not None else ""
+        device = g_input_device_labels.get(label)
+        friendly_kind = "Microphone"
+    else:
+        label = output_device_var.get().strip() if output_device_var is not None else ""
+        device = g_output_device_labels.get(label)
+        friendly_kind = "Output capture"
+
+    if not device:
+        return
+
+    _set_selected_audio_device(kind, device, persist=True)
+    set_status(f"{friendly_kind} set to {device.get('name', 'Unknown device')}", "info")
 
 
 def _prompt_language_selection(candidates: list[str], default_language: str) -> str | None:
@@ -1505,6 +1671,7 @@ def _generate_and_save_summary(transcription_snapshot: list[list]) -> bool:
 def setup_ui():
     global chat_window, root, mute_button, assistant_buttons, custom_prompt_entry, send_prompt_button, summary_button, status_label
     global start_stop_button, settings_button, g_auto_start_var, mic_icon_on, mic_icon_off
+    global input_device_var, output_device_var, input_device_dropdown, output_device_dropdown, refresh_devices_button
     global live_assistant_toggle_vars, live_assistant_text_boxes
     
     root = tk.Tk()
@@ -1515,6 +1682,27 @@ def setup_ui():
     theme = ui_module.THEME
     root.configure(bg=theme["bg"])
     ui_module.apply_dark_title_bar(root)
+
+    style = ttk.Style(root)
+    if "clam" in style.theme_names():
+        style.theme_use("clam")
+    style.configure(
+        "Device.TCombobox",
+        fieldbackground=theme["input_bg"],
+        background=theme["surface_light"],
+        foreground=theme["text_primary"],
+        arrowcolor=theme["text_primary"],
+        bordercolor=theme["border"],
+        lightcolor=theme["border"],
+        darkcolor=theme["border"],
+    )
+    style.map(
+        "Device.TCombobox",
+        fieldbackground=[("readonly", theme["input_bg"]), ("disabled", theme["surface_light"])],
+        foreground=[("readonly", theme["text_primary"]), ("disabled", theme["text_muted"])],
+        selectforeground=[("readonly", theme["text_primary"])],
+        selectbackground=[("readonly", theme["surface_light"])],
+    )
 
     # ── Toolbar ────────────────────────────────────────────────────────────
     toolbar = tk.Frame(root, bg=theme["bg_secondary"], padx=10, pady=7)
@@ -1534,6 +1722,59 @@ def setup_ui():
     start_stop_button.pack(side=tk.LEFT, padx=(0, 6))
 
     g_auto_start_var = tk.BooleanVar(value=g_auto_start_transcription)
+
+    devices_group = tk.Frame(toolbar, bg=theme["bg_secondary"])
+    devices_group.pack(side=tk.LEFT, padx=(8, 0))
+
+    tk.Label(
+        devices_group,
+        text="Mic",
+        bg=theme["bg_secondary"],
+        fg=theme["text_secondary"],
+        font=ui_module.get_font(max(8, g_default_font_size - 1)),
+    ).pack(side=tk.LEFT, padx=(0, 4))
+
+    input_device_var = tk.StringVar(value="")
+    input_device_dropdown = ttk.Combobox(
+        devices_group,
+        textvariable=input_device_var,
+        state="disabled",
+        width=34,
+        style="Device.TCombobox",
+    )
+    input_device_dropdown.pack(side=tk.LEFT, padx=(0, 8))
+    input_device_dropdown.bind("<<ComboboxSelected>>", lambda _event: _handle_audio_device_selection("input"))
+
+    tk.Label(
+        devices_group,
+        text="Output",
+        bg=theme["bg_secondary"],
+        fg=theme["text_secondary"],
+        font=ui_module.get_font(max(8, g_default_font_size - 1)),
+    ).pack(side=tk.LEFT, padx=(0, 4))
+
+    output_device_var = tk.StringVar(value="")
+    output_device_dropdown = ttk.Combobox(
+        devices_group,
+        textvariable=output_device_var,
+        state="disabled",
+        width=38,
+        style="Device.TCombobox",
+    )
+    output_device_dropdown.pack(side=tk.LEFT, padx=(0, 6))
+    output_device_dropdown.bind("<<ComboboxSelected>>", lambda _event: _handle_audio_device_selection("output"))
+
+    refresh_devices_button = ui_module.create_styled_button(
+        devices_group,
+        text="↻",
+        command=refresh_audio_device_options,
+        bg=theme["surface_light"],
+        hover_bg=theme["surface"],
+        fg=theme["text_primary"],
+        font_size=max(9, g_default_font_size - 1),
+        padx=10,
+    )
+    refresh_devices_button.pack(side=tk.LEFT, padx=(0, 6))
 
     settings_button = ui_module.create_styled_button(
         left_group,
@@ -1723,6 +1964,7 @@ def setup_ui():
         live_assistant_text_boxes[mode] = output_box
 
     set_status("Ready", "info")
+    refresh_audio_device_options(show_status_message=False)
     
     # Bind extra events to see when the window is being hidden/destroyed.
     def on_destroy(event):
@@ -1918,21 +2160,43 @@ def initialize_recording():
     try:
         p = pyaudio.PyAudio()
         global g_device_in, g_device_out
-        if sys.platform == "win32":
-            wasapi_info = p.get_host_api_info_by_type(pyaudio.paWASAPI)
-            g_device_in = p.get_device_info_by_index(wasapi_info["defaultInputDevice"])
-            g_device_out = p.get_device_info_by_index(wasapi_info["defaultOutputDevice"])
+        global g_available_input_devices, g_available_output_devices
 
-            if not g_device_out.get("isLoopbackDevice", False):
-                for loopback in p.get_loopback_device_info_generator():
-                    if g_device_out["name"] in loopback.get("name", ""):
-                        g_device_out = loopback
-                        break
-        else:
-            # Fallback: Pick default input/output devices
-            g_device_in = p.get_default_input_device_info()
-            g_device_out = p.get_default_output_device_info()
-        logger.info("[Init] Devices initialized successfully. Recording device: %s Output device: %s", g_device_in["name"], g_device_out["name"])
+        device_catalog = audio_capture_module.enumerate_recording_devices(p, platform_name=sys.platform)
+        g_available_input_devices = list(device_catalog.get("inputs", []))
+        g_available_output_devices = list(device_catalog.get("outputs", []))
+
+        g_device_in = audio_capture_module.pick_preferred_device(
+            g_available_input_devices,
+            preferred_index=g_selected_input_device_index,
+            preferred_name=g_selected_input_name,
+            fallback_device=device_catalog.get("default_input"),
+        )
+        g_device_out = audio_capture_module.pick_preferred_device(
+            g_available_output_devices,
+            preferred_index=g_selected_output_device_index,
+            preferred_name=g_selected_output_name,
+            fallback_device=device_catalog.get("default_output"),
+        )
+
+        if not g_device_in:
+            logger.error("[Init] No microphone device available for recording.")
+            return False
+        if not g_device_out:
+            logger.error("[Init] No output capture device available for recording.")
+            return False
+
+        _set_selected_audio_device("input", g_device_in, persist=False)
+        _set_selected_audio_device("output", g_device_out, persist=False)
+        _persist_audio_device_preferences()
+
+        logger.info(
+            "[Init] Devices initialized successfully. Recording device: %s (index=%s) Output device: %s (index=%s)",
+            g_device_in.get("name"),
+            g_device_in.get("index"),
+            g_device_out.get("name"),
+            g_device_out.get("index"),
+        )
     except Exception as e:
         logger.error("[Init] Error initializing devices: %s", e)
         return False
