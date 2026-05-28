@@ -286,7 +286,7 @@ func (m Model) settingsView() string {
 			cursor = "> "
 		}
 		b.WriteString(cursor)
-		b.WriteString(device.DisplayName())
+		b.WriteString(settingsDeviceLabel(device))
 		if device.Default {
 			b.WriteString(" [default]")
 		}
@@ -307,6 +307,24 @@ func (m Model) devicesForMode() []audio.Device {
 		}
 	}
 	return result
+}
+
+func settingsDeviceLabel(device audio.Device) string {
+	label := device.DisplayName()
+	var details []string
+	if strings.TrimSpace(device.Backend) != "" {
+		details = append(details, device.Backend)
+	}
+	if device.Source == audio.SourceOutput && device.Backend == "dshow" {
+		details = append(details, "DirectShow audio capture candidate")
+	}
+	if strings.TrimSpace(device.ID) != "" && device.ID != device.DisplayName() {
+		details = append(details, "id: "+device.ID)
+	}
+	if len(details) > 0 {
+		label += " (" + strings.Join(details, "; ") + ")"
+	}
+	return label
 }
 
 func (m *Model) refreshTranscript() {

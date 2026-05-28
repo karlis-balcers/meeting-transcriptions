@@ -61,7 +61,7 @@ openai:
   retry_max_interval: "8s"
 
 audio:
-  mic_device_id: "default"
+  mic_device_id: ""
   mic_device_name: ""
   output_device_id: "alsa_output.pci-0000_00_1f.3.analog-stereo.monitor"
   output_device_name: ""
@@ -123,6 +123,8 @@ Override devices for one run:
 ./transcribe --mic default --output alsa_output.pci-0000_00_1f.3.analog-stereo.monitor
 ```
 
+On Windows, prefer a concrete device shown by `--list-devices` instead of `default`. DirectShow device IDs may be long `@device_...` alternative names; those are safe to paste into `--mic`, `--output`, `audio.mic_device_id`, or `audio.output_device_id`.
+
 ## TUI shortcuts
 
 - `P` pause
@@ -167,7 +169,15 @@ If no monitor source exists, create/enable one in your audio stack or set `audio
 
 ### Windows
 
-The build is pure Go and cross-compiles. Runtime capture uses an ffmpeg external recorder with DirectShow-style device names. System output defaults to a documented `virtual-audio-capturer`/WASAPI-compatible path, but real machines may require installing/configuring a loopback capture device and setting `audio.output_device_id`.
+The build is pure Go and cross-compiles. Runtime capture uses an ffmpeg external recorder with DirectShow device names from:
+
+```sh
+ffmpeg -hide_banner -list_devices true -f dshow -i dummy
+```
+
+`transcribe --list-devices` parses that output, shows all DirectShow audio capture devices as microphone candidates, and includes DirectShow `Alternative name` values as selectable IDs/aliases. A configured `default` or old synthetic placeholder is resolved to a concrete enumerated DirectShow audio device before capture; the app should not start ffmpeg with `audio=default` unless DirectShow actually listed a device with that exact name.
+
+DirectShow does not reliably label which audio capture devices are system-output loopbacks. The output-device settings therefore surface all DirectShow audio capture candidates, prefer obvious loopback/virtual devices such as `Stereo Mix`, `virtual-audio-capturer`, VB-CABLE, Voicemeeter, BlackHole, or Soundflower when present, and warn when no likely loopback is identifiable. If system audio capture fails or records the wrong source, run `transcribe --list-devices` and choose a displayed loopback/virtual device for `audio.output_device_id` or `--output`.
 
 MS Teams speaker recognition is best-effort on Windows via PowerShell process/window-title polling. It avoids native UI Automation/cgo for cross-compilation safety, updates output speaker labels when a recognizable Teams title is found, and otherwise falls back to `Person_?` with a warning.
 

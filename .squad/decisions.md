@@ -135,6 +135,16 @@ Full QA strategy artifact: `.squad/agents/basher/go-tui-qa-validation-strategy.m
 **What:** APPROVED Danny's Go TUI revision after re-reviewing the original rejection points and the broader CLI/TUI/silent/config/OpenAI/transcript contract. Runtime controls now cancel active recorder contexts and use short configurable capture chunks, loudness meters are computed from captured WAV/PCM RMS levels, Windows Teams detection makes a genuine best-effort title-polling attempt, and non-Windows fallback is explicit.
 **Why:** Validation passed on Linux amd64 with Go 1.26.3: `go test ./...`, `go vet ./...`, native build, cross-compiles for linux/darwin/windows amd64/arm64, `go test -race ./...`, formatting/module/whitespace/final-newline hygiene, plus CLI smoke checks for help/version/list-devices and missing API-key stderr/no-stdout behavior.
 
+### 2026-05-27: Windows DirectShow devices must be concrete enumerated choices
+**By:** Livingston
+**What:** Windows audio discovery now parses ffmpeg DirectShow device-list output, stores DirectShow alternative names as aliases/selectable IDs, suppresses old synthetic `default`/`virtual-audio-capturer` placeholders unless actually enumerated, and exposes all DirectShow audio capture devices in both microphone and output-capture settings with clear output-candidate labeling.
+**Why:** Passing `audio=default` to DirectShow failed on real Windows hosts and hid most available microphones. ffmpeg can list concrete DirectShow audio devices without cgo, preserving pure-Go cross-compilation while giving users actionable names/IDs and documenting that DirectShow alone cannot reliably classify system-output loopbacks.
+
+### 2026-05-27: Windows DirectShow audio fix review approved
+**By:** Basher
+**What:** APPROVED Livingston's Windows audio discovery fix after code review and validation. The Go `transcribe/` app now parses ffmpeg DirectShow audio sections from stderr, preserves alternative-name aliases, avoids treating video devices as audio, exposes every parsed DirectShow audio candidate for both microphone and output-capture settings, suppresses unresolved synthetic `default`/old placeholder selections when concrete devices exist, and provides list-devices guidance when defaults cannot resolve.
+**Why:** Regression coverage now pins the reported failure mode: multiple DirectShow audio devices and aliases are parsed, formatted device lists expose aliases instead of synthetic `audio=default`, default preferences fall back to concrete enumerated devices with actionable warnings, and recorder validation rejects unresolved DirectShow defaults before capture. Validation passed from `transcribe/`: `go test ./...`, `go vet ./...`, native `go build -o transcribe ./cmd/transcribe` with binary removal, linux/darwin/windows amd64+arm64 cross-compiles, and `go test -race ./...`.
+
 ## Governance
 
 - All meaningful changes require team consensus

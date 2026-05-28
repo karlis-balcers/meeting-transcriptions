@@ -18,6 +18,7 @@ const (
 type Device struct {
 	ID      string
 	Name    string
+	Aliases []string
 	Source  Source
 	Default bool
 	Backend string
@@ -96,27 +97,24 @@ func selectOne(devices []Device, source Source, preferredID, preferredName strin
 		}
 	}
 	if len(candidates) == 0 {
-		if source == SourceOutput {
-			return Device{}, nil, errors.New("no system-output capture device found; configure a Pulse/PipeWire monitor source, WASAPI loopback, or virtual loopback device")
-		}
-		return Device{}, nil, errors.New("no microphone capture device found; connect a microphone or configure audio.mic_device_id")
+		return Device{}, nil, missingDeviceError(source, preferredID, preferredName)
 	}
 
 	if strings.TrimSpace(preferredID) != "" {
 		for _, candidate := range candidates {
-			if candidate.ID == preferredID {
+			if candidate.ID == strings.TrimSpace(preferredID) {
 				return candidate, nil, nil
 			}
 		}
 		for _, candidate := range candidates {
-			if normalize(candidate.ID) == normalize(preferredID) || normalize(candidate.Name) == normalize(preferredID) {
+			if candidateMatches(candidate, preferredID) {
 				return candidate, nil, nil
 			}
 		}
 	}
 	if strings.TrimSpace(preferredName) != "" {
 		for _, candidate := range candidates {
-			if normalize(candidate.Name) == normalize(preferredName) {
+			if candidateMatches(candidate, preferredName) {
 				return candidate, nil, nil
 			}
 		}
@@ -131,11 +129,65 @@ func selectOne(devices []Device, source Source, preferredID, preferredName strin
 	return candidates[0], warnings, nil
 }
 
+func candidateMatches(candidate Device, value string) bool {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return false
+	}
+	if candidate.ID == trimmed || candidate.Name == trimmed {
+		return true
+	}
+	for _, alias := range candidate.Aliases {
+		if alias == trimmed {
+			return true
+		}
+	}
+	normalized := normalize(trimmed)
+	if normalize(candidate.ID) == normalized || normalize(candidate.Name) == normalized {
+		return true
+	}
+	for _, alias := range candidate.Aliases {
+		if normalize(alias) == normalized {
+			return true
+		}
+	}
+	return false
+}
+
+func missingDeviceError(source Source, preferredID, preferredName string) error {
+	configured := firstNonEmpty(preferredID, preferredName)
+	selectionHint := fmt.Sprintf("run transcribe --list-devices and choose a displayed %s device name/id", source)
+	if source == SourceOutput {
+		selectionHint = "run transcribe --list-devices and choose a displayed output-capture device name/id; on Windows this usually means Stereo Mix, virtual-audio-capturer, VB-CABLE, or another loopback/virtual DirectShow audio device"
+	}
+
+	message := fmt.Sprintf("no %s capture device found; %s", source, selectionHint)
+	if isDefaultPreference(configured) {
+		message += fmt.Sprintf("; configured %s device %q was unresolved because no concrete device was enumerated", source, configured)
+	} else if configured != "" {
+		message += fmt.Sprintf("; configured %s device %q was not found", source, configured)
+	}
+	return errors.New(message)
+}
+
 func stalePreferenceWarnings(source Source, preferredID, preferredName string, selected Device) []string {
-	if strings.TrimSpace(preferredID) == "" && strings.TrimSpace(preferredName) == "" {
+	configured := firstNonEmpty(preferredID, preferredName)
+	if configured == "" {
 		return nil
 	}
+	if isDefaultPreference(configured) {
+		return []string{fmt.Sprintf("configured %s device %q was not listed as a concrete device; using %q. Run transcribe --list-devices to choose a displayed device name/id if this is not correct", source, configured, selected.DisplayName())}
+	}
 	return []string{fmt.Sprintf("configured %s device was not found; using %q", source, selected.DisplayName())}
+}
+
+func isDefaultPreference(value string) bool {
+	switch normalize(value) {
+	case "default", "default windows microphone", "windows default microphone", "virtual audio capturer", "windows system audio capture virtual audio capturer wasapi compatible":
+		return true
+	default:
+		return false
+	}
 }
 
 func normalize(value string) string {

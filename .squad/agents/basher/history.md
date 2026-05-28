@@ -14,3 +14,5 @@
 - 2026-05-27: Go TUI review added workflow tests for silent stdout, API-key fail-fast, and P/R/M/U/S plus settings M/O shortcuts; build/test/vet/cross-compile passed, but live capture semantics still need independent revision.
 - 2026-05-27: Danny's Go TUI revision fixed the live-control rejection with cancellable short capture chunks, RMS-derived meter events, and real Windows Teams title polling; full Go validation matrix passed on Linux amd64.
 - 2026-05-27: Coordinator independently confirmed Basher's approval with clean editor diagnostics plus Go tests/vet/race/native build/cross-compile checks from `transcribe/`.
+- 2026-05-27: Windows DirectShow regressions need tests for stderr device parsing, audio-vs-video section boundaries, alternative-name aliases, default-to-concrete selection, and recorder validation before ffmpeg can receive `audio=default`.
+- 2026-05-27: Windows DirectShow audio fix is approved; regression coverage now verifies dshow parsing, aliases, default resolution, ffmpeg argument behavior, and recorder validation.

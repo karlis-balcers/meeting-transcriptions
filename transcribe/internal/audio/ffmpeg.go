@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 )
 
@@ -19,8 +20,14 @@ func (r ExternalRecorder) Validate(_ context.Context, selected Selection) error 
 	if selected.Mic.ID == "" {
 		return errors.New("microphone device is not selected")
 	}
+	if isUnresolvedDShowDevice(selected.Mic) {
+		return errors.New("microphone device \"default\" was unresolved for DirectShow; run transcribe --list-devices and choose a displayed Windows microphone device name/id")
+	}
 	if selected.Output.ID == "" {
 		return errors.New("system-output capture device is not selected")
+	}
+	if isUnresolvedDShowDevice(selected.Output) {
+		return errors.New("system-output DirectShow device was unresolved; run transcribe --list-devices and choose a displayed output-capture device name/id")
 	}
 	if _, err := r.ffmpeg(); err != nil {
 		return errors.New("ffmpeg was not found in PATH; install ffmpeg or configure a recorder backend before starting")
@@ -109,4 +116,17 @@ func inputArgs(device Device) []string {
 	default:
 		return []string{"-i", device.ID}
 	}
+}
+
+func isUnresolvedDShowDevice(device Device) bool {
+	if device.Backend != "dshow" {
+		return false
+	}
+	if normalize(device.ID) == "default" && normalize(device.Name) != "default" {
+		return true
+	}
+	if normalize(device.ID) == "default" && strings.TrimSpace(device.Name) == "" {
+		return true
+	}
+	return normalize(device.ID) == "virtual audio capturer" && strings.Contains(normalize(device.Name), "windows system audio capture")
 }
