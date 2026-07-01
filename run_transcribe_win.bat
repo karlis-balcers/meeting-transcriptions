@@ -1,49 +1,35 @@
 @echo off
+setlocal EnableExtensions
+
+set "ROOT_DIR=%~dp0"
+set "TRANSCRIBE_DIR=%ROOT_DIR%transcribe"
+set "TRANSCRIBE_EXE=%TRANSCRIBE_DIR%\build\windows-amd64\transcribe.exe"
+set "TRANSCRIBE_HELPER_BUILT=%TRANSCRIBE_DIR%\build\windows-amd64\audio_capture.py"
+set "TRANSCRIBE_HELPER_ROOT=%ROOT_DIR%audio_capture.py"
+set "TRANSCRIBE_WINDOWS_AUDIO_HELPER=%TRANSCRIBE_HELPER_BUILT%"
+if not exist "%TRANSCRIBE_WINDOWS_AUDIO_HELPER%" set "TRANSCRIBE_WINDOWS_AUDIO_HELPER=%TRANSCRIBE_HELPER_ROOT%"
+
+set "TRANSCRIBE_WINDOWS_PYTHON=%ROOT_DIR%.venv\Scripts\python.exe"
+if not exist "%TRANSCRIBE_WINDOWS_PYTHON%" set "TRANSCRIBE_WINDOWS_PYTHON=python"
+
 echo ===============================================
 echo Starting transcribe application
 echo ===============================================
 echo.
 
-REM Check if Poetry is available
-poetry --version >nul 2>&1
-if %errorlevel% neq 0 (
-    echo ERROR: Poetry is not installed or not in PATH.
-    echo Please run first_time_install_win.bat to set up the project.
+if not exist "%TRANSCRIBE_EXE%" (
+    echo ERROR: Windows build not found.
+    echo Run build_transcribe_win64.bat first.
     pause
     exit /b 1
 )
 
-REM Check if virtual environment exists
-if exist ".venv" (
-    echo Local virtual environment found: .venv
-    echo Starting with local environment...
-    .venv\Scripts\python.exe transcribe.py
-    if %errorlevel% neq 0 (
-        echo.
-        echo ERROR: Application failed to start with local environment.
-        echo Falling back to Poetry...
-        goto :poetry_run
-    )
-    goto :end
-) else (
-    echo Virtual environment not found in project directory.
-    echo Checking if Poetry has a virtual environment configured...
-    poetry env info >nul 2>&1
-    if %errorlevel% neq 0 (
-        echo ERROR: No virtual environment found.
-        echo Please run first_time_install_win.bat to set up the project.
-        echo Or run create_venv_manual_win.bat for a manual setup.
-        pause
-        exit /b 1
-    ) else (
-        echo Found Poetry virtual environment outside project directory.
-        echo.
-    )
-)
+echo Launching: %TRANSCRIBE_EXE%
+echo Helper:    %TRANSCRIBE_WINDOWS_AUDIO_HELPER%
+echo Python:    %TRANSCRIBE_WINDOWS_PYTHON%
+echo.
 
-:poetry_run
-echo Starting application with Poetry...
-poetry run python transcribe.py
+"%TRANSCRIBE_EXE%" %*
 
 if %errorlevel% neq 0 (
     echo.
@@ -53,4 +39,4 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
-:end
+endlocal

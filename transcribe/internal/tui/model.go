@@ -59,6 +59,12 @@ type Model struct {
 type eventMsg app.Event
 type tickMsg time.Time
 type stoppedMsg struct{ err error }
+type deviceAppliedMsg struct{ err error }
+
+type footerShortcut struct {
+	label  string
+	active bool
+}
 
 var (
 	titleStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("63"))
@@ -66,6 +72,13 @@ var (
 	warnStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
 	statusStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
 	shortcutStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	settingsFrameStyle = lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("63")).
+		Padding(0, 1)
+	settingsTitleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("63"))
+	settingsHintStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	settingsCursorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("63")).Bold(true)
 )
 
 func New(controller Controller, devices []audio.Device, warnings []string) Model {
@@ -98,10 +111,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.viewport.Width = max(20, msg.Width-2)
-		m.viewport.Height = max(6, msg.Height-12)
 		m.micMeter.Width = max(10, msg.Width/2-12)
 		m.outMeter.Width = max(10, msg.Width/2-12)
-		return m, nil
+		return m.applyLayout(), nil
 	case tickMsg:
 		m.lastTick = time.Time(msg)
 		m.refreshTranscript()
@@ -132,6 +144,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		return m, tea.Quit
+	case deviceAppliedMsg:
+		if msg.err != nil {
+			m.errorLine = msg.err.Error()
+			return m, m.waitEvent()
+		}
+		m.errorLine = ""
+		m.mode = ModeSettings
+		m.selected = 0
+		return m.applyLayout(), m.waitEvent()
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 	}
@@ -153,8 +174,8 @@ func (m Model) View() string {
 		b.WriteString(fmt.Sprintf("  %s", time.Since(snap.StartedAt).Truncate(time.Second)))
 	}
 	b.WriteString("\n")
-	b.WriteString(fmt.Sprintf("Mic: %s\n", snap.Mic.DisplayName()))
-	b.WriteString(fmt.Sprintf("Output: %s\n", snap.Output.DisplayName()))
+	b.WriteString(fmt.Sprintf("Selected mic: %s\n", snap.Mic.DisplayName()))
+	b.WriteString(fmt.Sprintf("Selected output: %s\n", snap.Output.DisplayName()))
 	b.WriteString(fmt.Sprintf("Transcript: %s\n", snap.TranscriptPath))
 	if len(m.warnings) > 0 {
 		b.WriteString(warnStyle.Render("Warning: " + m.warnings[len(m.warnings)-1]))
@@ -170,13 +191,13 @@ func (m Model) View() string {
 	}
 	b.WriteString(fmt.Sprintf("Mic     %s\n", m.micMeter.ViewAs(m.micLevel)))
 	b.WriteString(fmt.Sprintf("Output  %s\n\n", m.outMeter.ViewAs(m.outLevel)))
-	if m.mode == ModeSettings || m.mode == ModeMicSelect || m.mode == ModeOutputSelect {
-		b.WriteString(m.settingsView())
-		b.WriteString("\n")
-	}
 	b.WriteString(m.viewport.View())
+	if m.mode == ModeSettings || m.mode == ModeMicSelect || m.mode == ModeOutputSelect {
+		b.WriteString("\n")
+		b.WriteString(m.settingsView())
+	}
 	b.WriteString("\n")
-	b.WriteString(shortcutStyle.Render("P Pause  R Resume  M Mute mic  U Unmute  S Settings  Q Quit"))
+	b.WriteString(footerView(snap))
 	return b.String()
 }
 
@@ -187,14 +208,14 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "m":
 			m.mode = ModeMicSelect
 			m.selected = 0
-			return m, nil
+			return m.applyLayout(), nil
 		case "o":
 			m.mode = ModeOutputSelect
 			m.selected = 0
-			return m, nil
+			return m.applyLayout(), nil
 		case "esc", "s":
 			m.mode = ModeMain
-			return m, nil
+			return m.applyLayout(), nil
 		}
 	}
 	if m.mode == ModeMicSelect || m.mode == ModeOutputSelect {
@@ -220,7 +241,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "s":
 		m.mode = ModeSettings
-		return m, nil
+		return m.applyLayout(), nil
 	case "q", "ctrl+c":
 		m.quitting = true
 		return m, func() tea.Msg {
@@ -237,7 +258,7 @@ func (m Model) handleDeviceKey(key string) (tea.Model, tea.Cmd) {
 	if len(devices) == 0 {
 		m.errorLine = "No devices available for this source"
 		m.mode = ModeSettings
-		return m, nil
+		return m.applyLayout(), nil
 	}
 	switch key {
 	case "up", "k":
@@ -257,42 +278,59 @@ func (m Model) handleDeviceKey(key string) (tea.Model, tea.Cmd) {
 			} else {
 				err = m.controller.SetOutputDevice(device)
 			}
-			if err != nil {
-				return eventMsg{Kind: app.EventError, Message: err.Error()}
-			}
-			return eventMsg{Kind: app.EventStatus, Message: "Device selected"}
+			return deviceAppliedMsg{err: err}
 		}
 	case "esc", "s":
 		m.mode = ModeSettings
 	}
-	return m, nil
+	return m.applyLayout(), nil
 }
 
 func (m Model) settingsView() string {
 	if m.mode == ModeSettings {
-		return "Settings: M choose microphone, O choose output device, Esc close"
+		content := []string{
+			settingsTitleStyle.Render("▌ Settings"),
+			"  M choose microphone",
+			"  O choose output device",
+			"  Esc close",
+		}
+		return settingsFrameStyle.Width(max(24, m.width-2)).Render(strings.Join(content, "\n"))
 	}
 	devices := m.devicesForMode()
 	title := "Microphones"
 	if m.mode == ModeOutputSelect {
 		title = "Output capture devices"
 	}
-	var b strings.Builder
-	b.WriteString(title)
-	b.WriteString(" (↑/↓, Enter select, Esc back)\n")
+	var lines []string
+	lines = append(lines, settingsTitleStyle.Render("▌ "+title))
+	lines = append(lines, settingsHintStyle.Render("  ↑/↓ move • Enter select • Esc back"))
 	for i, device := range devices {
 		cursor := "  "
 		if i == m.selected {
-			cursor = "> "
+			cursor = settingsCursorStyle.Render("▸ ")
 		}
-		b.WriteString(cursor)
-		b.WriteString(settingsDeviceLabel(device))
+		line := cursor + settingsDeviceLabel(device)
 		if device.Default {
-			b.WriteString(" [default]")
+			line += " [default]"
 		}
-		b.WriteString("\n")
+		lines = append(lines, line)
 	}
-	return b.String()
+	return settingsFrameStyle.Width(max(24, m.width-2)).Render(strings.Join(lines, "\n"))
+}
+
+func (m Model) applyLayout() Model {
+	if m.height <= 0 {
+		return m
+	}
+	reserved := 12
+	switch m.mode {
+	case ModeSettings:
+		reserved = 16
+	case ModeMicSelect, ModeOutputSelect:
+		reserved = 18
+	}
+	m.viewport.Height = max(6, m.height-reserved)
+	return m
 }
 
 func (m Model) devicesForMode() []audio.Device {
@@ -325,6 +363,30 @@ func settingsDeviceLabel(device audio.Device) string {
 		label += " (" + strings.Join(details, "; ") + ")"
 	}
 	return label
+}
+
+func footerView(snap app.Snapshot) string {
+	shortcuts := []footerShortcut{
+		{label: "P Pause", active: snap.Paused},
+		{label: "R Record", active: !snap.Paused},
+		{label: "M Mute mic", active: snap.MutedMic},
+		{label: "U Unmute", active: !snap.MutedMic},
+		{label: "S Settings"},
+		{label: "Q Quit"},
+	}
+	var rendered []string
+	for _, shortcut := range shortcuts {
+		rendered = append(rendered, renderFooterShortcut(shortcut))
+	}
+	return strings.Join(rendered, "  ")
+}
+
+func renderFooterShortcut(shortcut footerShortcut) string {
+	style := shortcutStyle
+	if shortcut.active {
+		style = statusStyle
+	}
+	return style.Render(shortcut.label)
 }
 
 func (m *Model) refreshTranscript() {

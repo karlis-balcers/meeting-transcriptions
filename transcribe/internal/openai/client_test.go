@@ -76,3 +76,51 @@ func TestClientDoesNotRetryAuthFailure(t *testing.T) {
 		t.Fatalf("auth failure should not retry, got %d calls", calls.Load())
 	}
 }
+
+func TestClientSuppressesExactKeywordPromptEcho(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseMultipartForm(1 << 20); err != nil {
+			t.Fatal(err)
+		}
+		prompt := r.FormValue("prompt")
+		_ = json.NewEncoder(w).Encode(map[string]string{"text": "  " + prompt + "  "})
+	}))
+	defer server.Close()
+
+	file := filepath.Join(t.TempDir(), "chunk.wav")
+	if err := os.WriteFile(file, []byte("wav"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	client := Client{APIKey: "test-key", BaseURL: server.URL, HTTPClient: server.Client()}
+	text, err := client.Transcribe(context.Background(), file, Options{Model: "model", Keywords: []string{"Paymentology"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text != "" {
+		t.Fatalf("expected exact prompt echo to be suppressed, got %q", text)
+	}
+}
+
+func TestClientKeepsSpeechThatContainsPromptKeywords(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseMultipartForm(1 << 20); err != nil {
+			t.Fatal(err)
+		}
+		prompt := r.FormValue("prompt")
+		_ = json.NewEncoder(w).Encode(map[string]string{"text": prompt + " came up in the meeting agenda"})
+	}))
+	defer server.Close()
+
+	file := filepath.Join(t.TempDir(), "chunk.wav")
+	if err := os.WriteFile(file, []byte("wav"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	client := Client{APIKey: "test-key", BaseURL: server.URL, HTTPClient: server.Client()}
+	text, err := client.Transcribe(context.Background(), file, Options{Model: "model", Keywords: []string{"Paymentology"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(text, "Paymentology") {
+		t.Fatalf("expected normal speech containing the keyword prompt to be preserved, got %q", text)
+	}
+}

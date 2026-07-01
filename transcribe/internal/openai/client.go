@@ -128,7 +128,11 @@ func (c Client) once(ctx context.Context, httpClient *http.Client, url, filePath
 	if err := json.Unmarshal(respBody, &decoded); err != nil {
 		return "", false, fmt.Errorf("decode OpenAI transcription response: %w", err)
 	}
-	return strings.TrimSpace(decoded.Text), false, nil
+	text := strings.TrimSpace(decoded.Text)
+	if isPromptEcho(text, opts) {
+		return "", false, nil
+	}
+	return text, false, nil
 }
 
 func promptFromKeywords(keywords []string) string {
@@ -150,4 +154,12 @@ func promptFromKeywords(keywords []string) string {
 		return ""
 	}
 	return "Meeting vocabulary and names to preserve: " + strings.Join(cleaned, ", ")
+}
+
+func isPromptEcho(text string, opts Options) bool {
+	prompt := promptFromKeywords(opts.Keywords)
+	if prompt == "" {
+		return false
+	}
+	return strings.TrimSpace(text) == prompt
 }

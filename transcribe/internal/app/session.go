@@ -12,6 +12,7 @@ import (
 	"github.com/karlis-balcers/meeting-transcriptions/transcribe/internal/audio"
 	"github.com/karlis-balcers/meeting-transcriptions/transcribe/internal/config"
 	"github.com/karlis-balcers/meeting-transcriptions/transcribe/internal/filter"
+	"github.com/karlis-balcers/meeting-transcriptions/transcribe/internal/logging"
 	"github.com/karlis-balcers/meeting-transcriptions/transcribe/internal/transcript"
 )
 
@@ -60,15 +61,16 @@ type Session struct {
 	cancelTranscribe context.CancelFunc
 	wg               sync.WaitGroup
 
-	mu        sync.Mutex
-	status    string
-	errText   string
-	paused    bool
-	mutedMic  bool
-	started   bool
-	startedAt time.Time
-	selection audio.Selection
-	cfg       config.Config
+	mu                    sync.Mutex
+	status                string
+	errText               string
+	paused                bool
+	mutedMic              bool
+	outputCaptureDisabled bool
+	started               bool
+	startedAt             time.Time
+	selection             audio.Selection
+	cfg                   config.Config
 
 	micCaptureCancel    *captureCancel
 	outputCaptureCancel *captureCancel
@@ -120,6 +122,7 @@ func (s *Session) Start(ctx context.Context) error {
 	s.startedAt = s.prepared.Dependencies.Clock()
 	s.status = "Recording"
 	s.mu.Unlock()
+	logging.Printf("session started: mic=%q output=%q transcript=%q", s.selection.Mic.DisplayName(), s.selection.Output.DisplayName(), s.store.Path())
 
 	s.emit(Event{Kind: EventStatus, Message: "Recording"})
 	for _, warning := range s.prepared.Warnings {
@@ -145,6 +148,7 @@ func (s *Session) Stop(ctx context.Context) error {
 		s.cancel()
 	}
 	s.mu.Unlock()
+	logging.Printf("session stopping")
 
 	done := make(chan struct{})
 	go func() {
@@ -168,6 +172,7 @@ func (s *Session) Stop(ctx context.Context) error {
 	s.started = false
 	s.mu.Unlock()
 	s.emit(Event{Kind: EventStatus, Message: "Stopped"})
+	logging.Printf("session stopped")
 	return nil
 }
 
@@ -194,6 +199,7 @@ func (s *Session) Pause() error {
 	s.paused = true
 	s.status = "Paused"
 	s.mu.Unlock()
+	logging.Printf("session paused")
 	s.cancelCapture(audio.SourceMic)
 	s.cancelCapture(audio.SourceOutput)
 	s.notifyControl()
@@ -206,6 +212,7 @@ func (s *Session) Resume() error {
 	s.paused = false
 	s.status = "Recording"
 	s.mu.Unlock()
+	logging.Printf("session resumed")
 	s.notifyControl()
 	s.emit(Event{Kind: EventStatus, Message: "Recording"})
 	return nil
@@ -215,6 +222,7 @@ func (s *Session) MuteMic() error {
 	s.mu.Lock()
 	s.mutedMic = true
 	s.mu.Unlock()
+	logging.Printf("microphone muted")
 	s.cancelCapture(audio.SourceMic)
 	s.notifyControl()
 	s.emit(Event{Kind: EventStatus, Message: "Microphone muted"})
@@ -225,6 +233,7 @@ func (s *Session) UnmuteMic() error {
 	s.mu.Lock()
 	s.mutedMic = false
 	s.mu.Unlock()
+	logging.Printf("microphone unmuted")
 	s.notifyControl()
 	s.emit(Event{Kind: EventStatus, Message: "Microphone unmuted"})
 	return nil
@@ -232,11 +241,15 @@ func (s *Session) UnmuteMic() error {
 
 func (s *Session) SetMicDevice(device audio.Device) error {
 	s.mu.Lock()
+	currentOutput := s.selection.Output
 	cfg := s.cfg
-	cfg.Audio.MicDeviceID = device.ID
-	cfg.Audio.MicDeviceName = device.Name
 	path := s.prepared.ConfigPath
 	s.mu.Unlock()
+	if audio.SameDevice(device, currentOutput) {
+		return errors.New("microphone and output capture cannot be the same device; choose a distinct output-capture loopback/monitor device")
+	}
+	cfg.Audio.MicDeviceID = device.ID
+	cfg.Audio.MicDeviceName = device.Name
 	if path != "" {
 		if err := config.Save(path, cfg); err != nil {
 			return err
@@ -247,6 +260,7 @@ func (s *Session) SetMicDevice(device audio.Device) error {
 	s.cfg = cfg
 	s.status = "Microphone device changed; restarting capture"
 	s.mu.Unlock()
+	logging.Printf("microphone device changed: %q (%s)", device.DisplayName(), device.ID)
 	s.cancelCapture(audio.SourceMic)
 	s.notifyControl()
 	s.emit(Event{Kind: EventStatus, Message: "Microphone device changed; restarting capture"})
@@ -255,11 +269,15 @@ func (s *Session) SetMicDevice(device audio.Device) error {
 
 func (s *Session) SetOutputDevice(device audio.Device) error {
 	s.mu.Lock()
+	currentMic := s.selection.Mic
 	cfg := s.cfg
-	cfg.Audio.OutputDeviceID = device.ID
-	cfg.Audio.OutputDeviceName = device.Name
 	path := s.prepared.ConfigPath
 	s.mu.Unlock()
+	if audio.SameDevice(currentMic, device) {
+		return errors.New("microphone and output capture cannot be the same device; choose a distinct output-capture loopback/monitor device")
+	}
+	cfg.Audio.OutputDeviceID = device.ID
+	cfg.Audio.OutputDeviceName = device.Name
 	if path != "" {
 		if err := config.Save(path, cfg); err != nil {
 			return err
@@ -267,9 +285,11 @@ func (s *Session) SetOutputDevice(device audio.Device) error {
 	}
 	s.mu.Lock()
 	s.selection.Output = device
+	s.outputCaptureDisabled = false
 	s.cfg = cfg
 	s.status = "Output device changed; restarting capture"
 	s.mu.Unlock()
+	logging.Printf("output device changed: %q (%s)", device.DisplayName(), device.ID)
 	s.cancelCapture(audio.SourceOutput)
 	s.notifyControl()
 	s.emit(Event{Kind: EventStatus, Message: "Output device changed; restarting capture"})
@@ -303,13 +323,15 @@ func (s *Session) sourceLoop(sourceWG *sync.WaitGroup, source audio.Source) {
 		}
 		seq := s.sequence.Add(1)
 		started := s.prepared.Dependencies.Clock()
+		duration := s.captureDuration()
+		logging.Printf("%s capture starting: device=%q sequence=%d duration=%s", source, device.DisplayName(), seq, duration)
 		chunkCtx, cancel := context.WithCancel(s.ctx)
 		token := s.setCaptureCancel(source, cancel)
 		chunk, err := s.prepared.Dependencies.Recorder.RecordChunk(chunkCtx, audio.ChunkRequest{
 			Device:   device,
 			Source:   source,
 			TempDir:  s.prepared.TempDir,
-			Duration: s.captureDuration(),
+			Duration: duration,
 			Sequence: seq,
 			Started:  started,
 			Speaker:  speakerName,
@@ -323,12 +345,30 @@ func (s *Session) sourceLoop(sourceWG *sync.WaitGroup, source audio.Source) {
 			if errors.Is(err, context.Canceled) {
 				continue
 			}
+			if source == audio.SourceOutput {
+				if next, ok := s.nextOutputCaptureCandidate(device); ok {
+					s.setRuntimeOutputSelection(next)
+					warning := fmt.Sprintf("output capture failed for %s; falling back to %s", device.DisplayName(), next.DisplayName())
+					logging.Printf(warning)
+					s.emit(Event{Kind: EventWarning, Message: warning})
+					continue
+				}
+				message := fmt.Sprintf("output capture failed for %s: %v", device.DisplayName(), err)
+				logging.Printf(message)
+				s.setError(message)
+				if s.cancel != nil {
+					s.cancel()
+				}
+				return
+			}
+			logging.Printf("%s capture failed: %v", source, err)
 			s.setError(fmt.Sprintf("%s capture failed: %v", source, err))
 			if s.cancel != nil {
 				s.cancel()
 			}
 			return
 		}
+		logging.Printf("%s chunk recorded: %s", source, chunk.FilePath)
 		level, err := audio.RMSLevelFromWAV(chunk.FilePath)
 		if err != nil {
 			s.emit(Event{Kind: EventWarning, Message: fmt.Sprintf("could not compute %s loudness from captured audio: %v", source, err)})
@@ -347,18 +387,22 @@ func (s *Session) sourceLoop(sourceWG *sync.WaitGroup, source audio.Source) {
 func (s *Session) transcribeLoop() {
 	defer s.wg.Done()
 	for chunk := range s.chunks {
+		logging.Printf("sending %s chunk %d to OpenAI: %s", chunk.Source, chunk.Sequence, chunk.FilePath)
 		text, err := s.prepared.Dependencies.Transcriber.Transcribe(s.transcribeCtx, chunk.FilePath, openAIOptions(s.currentConfig()))
 		_ = os.Remove(chunk.FilePath)
 		if err != nil {
 			if s.transcribeCtx.Err() != nil {
 				return
 			}
+			logging.Printf("OpenAI transcription failed for %s chunk %d: %v", chunk.Source, chunk.Sequence, err)
 			s.emit(Event{Kind: EventError, Message: fmt.Sprintf("OpenAI transcription failed: %v", err)})
 			continue
 		}
 		if !s.filter.Keep(text) {
+			logging.Printf("filtered %s chunk %d after transcription", chunk.Source, chunk.Sequence)
 			continue
 		}
+		logging.Printf("transcribed %s chunk %d: %d characters kept", chunk.Source, chunk.Sequence, len(text))
 		event := transcript.Event{Source: string(chunk.Source), Speaker: chunk.Speaker, Text: text, Start: chunk.Started, End: chunk.Ended}
 		if err := s.store.Add(event); err != nil {
 			s.emit(Event{Kind: EventError, Message: err.Error()})
@@ -381,12 +425,33 @@ func (s *Session) captureState(source audio.Source) (bool, audio.Device, string)
 	s.mu.Lock()
 	selection := s.selection
 	cfg := s.cfg
-	skip := s.paused || (source == audio.SourceMic && s.mutedMic)
+	skip := s.paused || (source == audio.SourceMic && s.mutedMic) || (source == audio.SourceOutput && s.outputCaptureDisabled)
 	s.mu.Unlock()
 	if source == audio.SourceMic {
 		return skip, selection.Mic, cfg.UserName
 	}
 	return skip, selection.Output, s.prepared.Dependencies.Speaker.Current()
+}
+
+func (s *Session) nextOutputCaptureCandidate(current audio.Device) (audio.Device, bool) {
+	candidates := audio.OutputCaptureCandidates(s.prepared.Devices, current)
+	if len(candidates) < 2 {
+		return audio.Device{}, false
+	}
+	return candidates[1], true
+}
+
+func (s *Session) setRuntimeOutputSelection(device audio.Device) {
+	s.mu.Lock()
+	s.selection.Output = device
+	s.outputCaptureDisabled = false
+	s.mu.Unlock()
+}
+
+func (s *Session) disableOutputCapture() {
+	s.mu.Lock()
+	s.outputCaptureDisabled = true
+	s.mu.Unlock()
 }
 
 func (s *Session) currentConfig() config.Config {
@@ -466,6 +531,7 @@ func (s *Session) setError(message string) {
 	s.errText = message
 	s.status = "Error"
 	s.mu.Unlock()
+	logging.Printf("session error: %s", message)
 	s.emit(Event{Kind: EventError, Message: message})
 }
 

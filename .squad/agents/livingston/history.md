@@ -16,3 +16,7 @@
 - 2026-05-27: Initial implementation was revised by Danny after Basher's rejection and is now approved; the ffmpeg-backed architecture remains, with short cancellable chunks and a green validation matrix.
 - 2026-05-27: Windows DirectShow should never rely on synthetic `audio=default`; parse ffmpeg's dshow list, prefer concrete alternative-name IDs, and surface all dshow audio capture candidates because loopback-vs-mic classification is heuristic.
 - 2026-05-27: Basher approved the Windows DirectShow device enumeration/capture fix and Coordinator validation passed; concrete enumerated dshow devices are now the accepted Windows capture path.
+- 2026-05-28: Windows build wrappers should pass repo paths into Ubuntu WSL with `WSLENV=TRANSCRIBE_DIR/p` instead of manual `wslpath` argument juggling; the translated `TRANSCRIBE_DIR` keeps spaces safe and avoids batch quoting bugs.
+- 2026-05-28: Ubuntu WSL2 on this machine needed `golang-go` installed before the Windows amd64 build would run; the validated toolchain is `go version go1.22.2 linux/amd64`.
+- 2026-05-28: Windows amd64 build wrapper validated from PowerShell; `WSLENV=TRANSCRIBE_DIR/p` safely translates the repo path into Ubuntu and the pure-Go build lands at `transcribe/build/windows-amd64/transcribe.exe`.
+- 2026-05-28: The device-picker Enter flow now applies the selected mic/output device and returns to Settings immediately, and `--logging 1` writes `transcribe.log` in the current working directory for session/chunk/OpenAI diagnostics.

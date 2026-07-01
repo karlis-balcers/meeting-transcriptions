@@ -64,6 +64,7 @@
 
 #### Platform risks
 - Output/system audio capture is the highest risk. Windows WASAPI loopback is feasible; macOS/Linux may need OS permissions, PulseAudio/PipeWire monitor sources, BlackHole/Soundflower-style virtual devices, or equivalent. Treat missing output capture as a clear startup error.
+- 2026-05-29: On this Windows host, the current ffmpeg build only exposes DirectShow capture; synthesized `Speakers/Headphones [Loopback]` devices are display-only and fall back to microphone-only capture.
 - Go audio library choice should favor a cross-platform capture stack with loopback support where possible; validate build requirements early because CGo can complicate Windows/Linux/macOS ARM+Intel releases.
 - Teams speaker recognition is Windows-only and fragile. Implement behind build tags and warn/fallback cleanly everywhere else.
 - OpenAI file limits require bounded chunks; keep max segment duration conservative and surface API retry status in the TUI.
@@ -144,6 +145,64 @@ Full QA strategy artifact: `.squad/agents/basher/go-tui-qa-validation-strategy.m
 **By:** Basher
 **What:** APPROVED Livingston's Windows audio discovery fix after code review and validation. The Go `transcribe/` app now parses ffmpeg DirectShow audio sections from stderr, preserves alternative-name aliases, avoids treating video devices as audio, exposes every parsed DirectShow audio candidate for both microphone and output-capture settings, suppresses unresolved synthetic `default`/old placeholder selections when concrete devices exist, and provides list-devices guidance when defaults cannot resolve.
 **Why:** Regression coverage now pins the reported failure mode: multiple DirectShow audio devices and aliases are parsed, formatted device lists expose aliases instead of synthetic `audio=default`, default preferences fall back to concrete enumerated devices with actionable warnings, and recorder validation rejects unresolved DirectShow defaults before capture. Validation passed from `transcribe/`: `go test ./...`, `go vet ./...`, native `go build -o transcribe ./cmd/transcribe` with binary removal, linux/darwin/windows amd64+arm64 cross-compiles, and `go test -race ./...`.
+
+### 2026-05-28: DirectShow microphone defaults skip loopback candidates
+**By:** Rusty
+**What:** `devicesFromDShowAudioDevices` now marks the first non-loopback DirectShow audio device as the default microphone instead of always treating the first enumerated audio row as the mic default. Output capture still prefers obvious loopback/virtual devices when present.
+**Why:** ffmpeg often lists loopback or virtual output sources among the DirectShow audio devices, and the first enumerated row is not reliably a real microphone when several microphones and output devices are present.
+
+### 2026-05-28: PulseAudio numeric indices retained as aliases
+**By:** Basher
+**What:** `ParsePactlSources` now keeps the numeric column from `pactl list short sources` as a device alias, and PulseAudio duplicate suppression is alias-aware. This lets `--mic`, `--output`, `AUDIO_INPUT_DEVICE_INDEX`, and `AUDIO_OUTPUT_DEVICE_INDEX` select devices by the exact PulseAudio row index as well as by source name.
+**Why:** Multi-device Linux setups need stable selection across names and indices. Dropping the numeric index made it harder to target the intended microphone or output capture device when several similar sources were present.
+
+### 2026-05-28: Windows amd64 build script uses Ubuntu WSL with WSLENV path translation
+
+**By:** Livingston
+
+**What:** The new `build_transcribe_win64.bat` wrapper should invoke `wsl.exe -d Ubuntu -- bash -lc` and rely on `WSLENV=TRANSCRIBE_DIR/p` so the batch-resolved repo path is translated safely into Ubuntu before running `GOOS=windows GOARCH=amd64 go build` inside `transcribe/`.
+
+**Why:** Manual `wslpath` handoff through batch quoting was brittle. WSLENV keeps the path handling reliable for spaces and makes the Windows amd64 build output deterministic at `transcribe/build/windows-amd64/transcribe.exe`.
+
+**Notes:** The wrapper also fails fast if `wsl.exe` is unavailable or Ubuntu does not have `go` installed, and it uses `CGO_ENABLED=0` to keep the cross-compile path pure Go.
+
+### 2026-05-28: Windows audio fallback when DirectShow lists no audio rows
+
+**By:** Rusty
+
+**What:** If ffmpeg DirectShow device listing on Windows returns no audio devices, fall back to PowerShell `Get-PnpDevice -Class AudioEndpoint` enumeration instead of hard-failing discovery. Keep the existing DirectShow capture backend, surface the fallback devices through `--list-devices`, preserve `FriendlyName` as the capture ID, and keep `InstanceId` as an alias alongside the current loopback/default heuristics and warnings.
+
+**Why:** Some Windows hosts only surface a camera video row through ffmpeg DirectShow listing, which currently blocks startup and hides real audio choices. A fallback discovery path is the smallest robust fix that keeps the user visible to actual microphone/loopback candidates without changing the recording backend.
+
+**Validation:** WSL2 Ubuntu native Go 1.22.2 validation passed with `go test ./...` and `go build -o transcribe ./cmd/transcribe` from `transcribe/`.
+
+### 2026-05-28: Windows DirectShow video-first parser resilience
+
+**By:** Basher
+
+**What:** Windows DirectShow device discovery in `transcribe/` should classify each ffmpeg device row using row-level audio/video markers and audio-like aliases, instead of relying only on a later `DirectShow audio devices` section header.
+
+**Why:** Some ffmpeg outputs start with a camera row or omit the expected audio header, which can make real microphones and loopback devices disappear from `--list-devices` even though the rows are present.
+
+**Validation:** WSL2 Ubuntu native Go 1.22.2 validation passed with `go test ./...` and `go build -o transcribe ./cmd/transcribe` from `transcribe/`.
+
+### 2026-05-28: TUI logging and device picker flow
+**By:** Livingston
+**What:** `--logging 1` enables file logging via a small internal helper that writes `transcribe.log` in the current working directory. Device picker Enter now applies the selected device, then returns to Settings so the updated mic/output summary is visible immediately. Keep transcript content out of logs; log session lifecycle, chunk capture, and OpenAI transcription progress only.
+
+**Why:** The settings flow needs to confirm device changes immediately, and file logging must stay opt-in while still giving enough breadcrumbs to follow the capture/transcription path.
+
+### 2026-05-28: Fail fast on identical mic/output capture and add file logging
+**By:** Rusty
+**What:** Treat identical microphone and output-capture selections as invalid in `transcribe/` so the app does not silently record the same source twice. Also add opt-in file logging via `--logging 1`, writing `transcribe.log` in the current working directory.
+
+**Why:** Using the same physical headset for both roles produces duplicate or garbage transcription instead of meeting audio. Logging chunk lifecycle to a file makes it obvious whether the app is capturing short chunks and sending them to OpenAI, while the fail-fast validation prevents the bad selection from reaching the recorder.
+
+### 2026-05-28: Surface filtered transcript chunks and enable file logging
+**By:** Basher
+**What:** When the transcription pipeline receives non-empty text that is dropped by transcript filters, log the chunk so the behavior is visible instead of silent. Add `--logging 1` to write runtime logs to `transcribe.log` in the current working directory.
+
+**Why:** The app can look like it is looping or doing nothing when it is actually recording and filtering chunks. Logging makes the chunked transcription path diagnosable without changing the session model.
 
 ## Governance
 

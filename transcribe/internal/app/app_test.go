@@ -16,8 +16,10 @@ import (
 
 	"github.com/karlis-balcers/meeting-transcriptions/transcribe/internal/audio"
 	"github.com/karlis-balcers/meeting-transcriptions/transcribe/internal/config"
+	"github.com/karlis-balcers/meeting-transcriptions/transcribe/internal/logging"
 	"github.com/karlis-balcers/meeting-transcriptions/transcribe/internal/openai"
 	"github.com/karlis-balcers/meeting-transcriptions/transcribe/internal/speaker"
+	"github.com/karlis-balcers/meeting-transcriptions/transcribe/internal/transcript"
 )
 
 func TestPrepareRejectsMissingAPIKeyBeforeDeviceDiscovery(t *testing.T) {
@@ -100,6 +102,273 @@ func TestSetMicDevicePersistsConfigAndRestartsMicCapture(t *testing.T) {
 		t.Fatalf("config did not persist selected mic:\n%s", string(content))
 	}
 	stopSession(t, session)
+}
+
+func TestSetOutputDeviceRejectsDuplicateMicSelection(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Paths.OutputDir = t.TempDir()
+	cfg.Paths.TempDir = t.TempDir()
+	cfg.Audio.CaptureChunkDuration = config.NewDuration(5 * time.Second)
+	recorder := newBlockingRecorder()
+	prepared := prepareTestSession(t, cfg, filepath.Join(t.TempDir(), "config.yaml"), recorder)
+	session, err := NewSession(prepared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := session.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitForRequest(t, recorder.started, audio.SourceMic)
+	if err := session.SetOutputDevice(audio.Device{ID: "mic", Name: "QA Mic", Source: audio.SourceOutput, Backend: "fake"}); err == nil || !strings.Contains(err.Error(), "same device") {
+		t.Fatalf("expected duplicate output selection to be rejected, got %v", err)
+	}
+	stopSession(t, session)
+}
+
+func TestSetMicDeviceRejectsDuplicateOutputSelection(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Paths.OutputDir = t.TempDir()
+	cfg.Paths.TempDir = t.TempDir()
+	cfg.Audio.CaptureChunkDuration = config.NewDuration(5 * time.Second)
+	recorder := newBlockingRecorder()
+	prepared := prepareTestSession(t, cfg, filepath.Join(t.TempDir(), "config.yaml"), recorder)
+	session, err := NewSession(prepared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := session.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitForRequest(t, recorder.started, audio.SourceMic)
+	if err := session.SetMicDevice(audio.Device{ID: "out", Name: "QA Output", Source: audio.SourceMic, Backend: "fake"}); err == nil || !strings.Contains(err.Error(), "same device") {
+		t.Fatalf("expected duplicate microphone selection to be rejected, got %v", err)
+	}
+	stopSession(t, session)
+}
+
+func TestOutputCaptureFallsBackToNextDeviceAndKeepsMicRecording(t *testing.T) {
+	base := time.Date(2026, 5, 29, 12, 0, 0, 0, time.UTC)
+	cfg := config.Defaults()
+	cfg.UserName = "You"
+	cfg.Paths.OutputDir = t.TempDir()
+	cfg.Paths.TempDir = t.TempDir()
+	cfg.Audio.CaptureChunkDuration = config.NewDuration(50 * time.Millisecond)
+	cfg.Audio.MaxSegmentDuration = config.NewDuration(200 * time.Millisecond)
+	cfg.Audio.MicDeviceID = "mic-1"
+	cfg.Audio.MicDeviceName = "QA Mic"
+	cfg.Audio.OutputDeviceID = "out-a"
+	cfg.Audio.OutputDeviceName = "QA Output A"
+
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := config.Save(configPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+	originalConfig, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	recorder := newFallbackRecorder(base)
+	prepared, err := Prepare(ctx, cfg, configPath, "test-key", Dependencies{
+		Discoverer: fakeDiscoverer{devices: []audio.Device{
+			{ID: "mic-1", Name: "QA Mic", Source: audio.SourceMic, Default: true, Backend: "fake"},
+			{ID: "out-a", Name: "QA Output A", Source: audio.SourceOutput, Default: true, Backend: "fake"},
+			{ID: "out-b", Name: "QA Output B", Source: audio.SourceOutput, Backend: "fake"},
+		}},
+		Recorder:    recorder,
+		Speaker:     fixedSpeaker{current: "Alice"},
+		Transcriber: &cancelAfterTranscripts{cancel: cancel, want: 2},
+		Clock:       func() time.Time { return base },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	session, err := NewSession(prepared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-ctx.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for fallback session to complete")
+	}
+
+	stopSession(t, session)
+
+	snap := session.Snapshot()
+	if snap.Error != "" {
+		t.Fatalf("session should keep running after output fallback, got error %q", snap.Error)
+	}
+	if !transcriptContainsSource(snap.Transcript, string(audio.SourceMic)) {
+		t.Fatalf("expected microphone transcript after fallback, got %+v", snap.Transcript)
+	}
+	if !transcriptContainsSource(snap.Transcript, string(audio.SourceOutput)) {
+		t.Fatalf("expected output transcript after fallback, got %+v", snap.Transcript)
+	}
+
+	events := drainEvents(session.Events())
+	if !hasWarningContaining(events, "falling back to") {
+		t.Fatalf("expected output fallback warning, got events %+v", events)
+	}
+	if hasWarningContaining(events, "output capture unavailable") {
+		t.Fatalf("output capture should have fallen back to another device, got events %+v", events)
+	}
+
+	outputOrder := outputRequestOrder(recorder.RecordedRequests())
+	if len(outputOrder) < 2 || outputOrder[0] != "out-a" || outputOrder[1] != "out-b" {
+		t.Fatalf("expected deterministic output fallback order out-a -> out-b, got %v", outputOrder)
+	}
+
+	afterConfig, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(afterConfig, originalConfig) {
+		t.Fatalf("config file was rewritten during runtime fallback\nbefore:\n%s\nafter:\n%s", string(originalConfig), string(afterConfig))
+	}
+}
+
+func TestOutputCaptureFailureStopsSessionInsteadOfMicOnlyFallback(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.UserName = "You"
+	cfg.Paths.OutputDir = t.TempDir()
+	cfg.Paths.TempDir = t.TempDir()
+	cfg.Audio.CaptureChunkDuration = config.NewDuration(20 * time.Millisecond)
+	cfg.Audio.MaxSegmentDuration = config.NewDuration(200 * time.Millisecond)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	recorder := newOutputFailureRecorder()
+	prepared, err := Prepare(ctx, cfg, filepath.Join(t.TempDir(), "config.yaml"), "test-key", Dependencies{
+		Discoverer: fakeDiscoverer{devices: []audio.Device{
+			{ID: "mic", Name: "QA Mic", Source: audio.SourceMic, Default: true, Backend: "fake"},
+			{ID: "out", Name: "QA Output", Source: audio.SourceOutput, Default: true, Backend: "fake"},
+		}},
+		Recorder:    recorder,
+		Speaker:     fixedSpeaker{current: "Alice"},
+		Transcriber: &cancelAfterTranscripts{cancel: cancel, want: 1000},
+		Clock:       time.Now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	session, err := NewSession(prepared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-recorder.failed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the output recorder to fail")
+	}
+
+	deadline := time.After(2 * time.Second)
+	for {
+		snap := session.Snapshot()
+		if snap.Status == "Error" {
+			if !strings.Contains(strings.ToLower(snap.Error), "output capture failed") {
+				t.Fatalf("expected output capture failure in session error, got %+v", snap)
+			}
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("expected output capture failure to stop the session, got %+v", snap)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	micRequests, outputRequests := recorder.counts()
+	if outputRequests == 0 {
+		t.Fatal("expected the output recorder to be exercised")
+	}
+	if micRequests > 3 {
+		t.Fatalf("output failure should not degrade into mic-only recording, got %d microphone requests", micRequests)
+	}
+
+	stopSession(t, session)
+}
+
+func TestFilteredChunkIsLoggedAndNotStored(t *testing.T) {
+	oldWD, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	logDir := t.TempDir()
+	if err := os.Chdir(logDir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chdir(oldWD)
+		_ = logging.Close()
+	})
+	if _, err := logging.EnableCurrentDir(); err != nil {
+		t.Fatal(err)
+	}
+
+	base := time.Date(2026, 5, 28, 16, 0, 0, 0, time.UTC)
+	cfg := config.Defaults()
+	cfg.UserName = "You"
+	cfg.Paths.OutputDir = t.TempDir()
+	cfg.Paths.TempDir = t.TempDir()
+	cfg.Audio.CaptureChunkDuration = config.NewDuration(50 * time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	prepared, err := Prepare(ctx, cfg, filepath.Join(t.TempDir(), "config.yaml"), "test-key", Dependencies{
+		Discoverer: fakeDiscoverer{devices: []audio.Device{
+			{ID: "mic", Name: "QA Mic", Source: audio.SourceMic, Default: true, Backend: "fake"},
+			{ID: "out", Name: "QA Output", Source: audio.SourceOutput, Default: true, Backend: "fake"},
+		}},
+		Recorder:    &oneChunkPerSourceRecorder{base: base},
+		Speaker:     fixedSpeaker{current: "Alice"},
+		Transcriber: &cancelAfterTranscripts{cancel: cancel, want: 1, text: "LAMPA"},
+		Clock:       func() time.Time { return base },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	session, err := NewSession(prepared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-ctx.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for filtered chunk to be processed")
+	}
+	stopSession(t, session)
+
+	content, err := os.ReadFile(filepath.Join(logDir, "transcribe.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(content), "filtered") {
+		t.Fatalf("expected filtered chunk to be logged, got:\n%s", string(content))
+	}
+	if got := session.Snapshot().Transcript; len(got) != 0 {
+		t.Fatalf("filtered chunk should not be stored, got %+v", got)
+	}
 }
 
 func TestRunSilentWritesOnlyFinalTranscriptToStdout(t *testing.T) {
@@ -217,6 +486,7 @@ func (r *oneChunkPerSourceRecorder) RecordChunk(ctx context.Context, request aud
 type cancelAfterTranscripts struct {
 	cancel context.CancelFunc
 	want   int32
+	text   string
 	calls  atomic.Int32
 }
 
@@ -226,6 +496,9 @@ func (t *cancelAfterTranscripts) Transcribe(_ context.Context, filePath string, 
 			t.cancel()
 		}
 	}()
+	if t.text != "" {
+		return t.text, nil
+	}
 	if strings.Contains(filepath.Base(filePath), string(audio.SourceMic)) {
 		return "mic transcript", nil
 	}
@@ -272,6 +545,121 @@ func (r *blockingRecorder) RecordChunk(ctx context.Context, request audio.ChunkR
 	default:
 	}
 	return audio.Chunk{}, ctx.Err()
+}
+
+type fallbackRecorder struct {
+	mu       sync.Mutex
+	base     time.Time
+	attempts map[string]int
+	requests []audio.ChunkRequest
+}
+
+func newFallbackRecorder(base time.Time) *fallbackRecorder {
+	return &fallbackRecorder{base: base, attempts: map[string]int{}}
+}
+
+func (r *fallbackRecorder) Validate(context.Context, audio.Selection) error { return nil }
+
+func (r *fallbackRecorder) RecordChunk(ctx context.Context, request audio.ChunkRequest) (audio.Chunk, error) {
+	r.mu.Lock()
+	if r.attempts == nil {
+		r.attempts = map[string]int{}
+	}
+	r.requests = append(r.requests, request)
+	key := string(request.Source) + "|" + request.Device.ID
+	attempt := r.attempts[key]
+	r.attempts[key] = attempt + 1
+	r.mu.Unlock()
+
+	if request.Source == audio.SourceOutput && request.Device.ID == "out-a" && attempt == 0 {
+		return audio.Chunk{}, errors.New("ffmpeg failed to open output device out-a")
+	}
+	if attempt > 0 {
+		<-ctx.Done()
+		return audio.Chunk{}, ctx.Err()
+	}
+
+	if err := os.MkdirAll(request.TempDir, 0o700); err != nil {
+		return audio.Chunk{}, err
+	}
+	filePath := filepath.Join(request.TempDir, fmt.Sprintf("transcribe-%s-%s-%d.wav", request.Source, request.Device.ID, attempt+1))
+	if err := os.WriteFile(filePath, testPCM16WAV([]int16{0, 1000, -1000, 0}), 0o600); err != nil {
+		return audio.Chunk{}, err
+	}
+	started := r.base
+	if request.Source == audio.SourceOutput {
+		started = started.Add(time.Second)
+	}
+	return audio.Chunk{
+		Source:   request.Source,
+		Device:   request.Device,
+		FilePath: filePath,
+		Started:  started,
+		Ended:    started.Add(50 * time.Millisecond),
+		Sequence: request.Sequence,
+		Speaker:  request.Speaker,
+	}, nil
+}
+
+func (r *fallbackRecorder) RecordedRequests() []audio.ChunkRequest {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]audio.ChunkRequest(nil), r.requests...)
+}
+
+type outputFailureRecorder struct {
+	mu             sync.Mutex
+	micRequests    int
+	outputRequests int
+	failed         chan struct{}
+}
+
+func newOutputFailureRecorder() *outputFailureRecorder {
+	return &outputFailureRecorder{failed: make(chan struct{})}
+}
+
+func (r *outputFailureRecorder) Validate(context.Context, audio.Selection) error { return nil }
+
+func (r *outputFailureRecorder) RecordChunk(ctx context.Context, request audio.ChunkRequest) (audio.Chunk, error) {
+	if request.Source == audio.SourceOutput {
+		r.mu.Lock()
+		r.outputRequests++
+		if r.failed != nil {
+			close(r.failed)
+			r.failed = nil
+		}
+		r.mu.Unlock()
+		return audio.Chunk{}, errors.New("Windows output helper failed")
+	}
+
+	r.mu.Lock()
+	r.micRequests++
+	count := r.micRequests
+	r.mu.Unlock()
+
+	if err := os.MkdirAll(request.TempDir, 0o700); err != nil {
+		return audio.Chunk{}, err
+	}
+	filePath := filepath.Join(request.TempDir, fmt.Sprintf("mic-%d.wav", count))
+	if err := os.WriteFile(filePath, testPCM16WAV([]int16{0, 1000, -1000, 0}), 0o600); err != nil {
+		return audio.Chunk{}, err
+	}
+	started := time.Now()
+	return audio.Chunk{
+		Source:   request.Source,
+		Device:   request.Device,
+		FilePath: filePath,
+		Started:  started,
+		Ended:    started.Add(50 * time.Millisecond),
+		Sequence: request.Sequence,
+		Speaker:  request.Speaker,
+	}, nil
+}
+
+func (r *outputFailureRecorder) counts() (int, int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.micRequests, r.outputRequests
 }
 
 func prepareTestSession(t *testing.T, cfg config.Config, configPath string, recorder audio.Recorder) *Prepared {
@@ -336,6 +724,46 @@ func stopSession(t *testing.T, session *Session) {
 	if err := session.Stop(ctx); err != nil {
 		t.Fatalf("stop session: %v", err)
 	}
+}
+
+func drainEvents(ch <-chan Event) []Event {
+	var events []Event
+	for {
+		select {
+		case event := <-ch:
+			events = append(events, event)
+		default:
+			return events
+		}
+	}
+}
+
+func hasWarningContaining(events []Event, substr string) bool {
+	for _, event := range events {
+		if event.Kind == EventWarning && strings.Contains(event.Message, substr) {
+			return true
+		}
+	}
+	return false
+}
+
+func transcriptContainsSource(events []transcript.Event, source string) bool {
+	for _, event := range events {
+		if event.Source == source {
+			return true
+		}
+	}
+	return false
+}
+
+func outputRequestOrder(requests []audio.ChunkRequest) []string {
+	var order []string
+	for _, request := range requests {
+		if request.Source == audio.SourceOutput {
+			order = append(order, request.Device.ID)
+		}
+	}
+	return order
 }
 
 func testPCM16WAV(samples []int16) []byte {

@@ -13,6 +13,7 @@ import (
 	"github.com/karlis-balcers/meeting-transcriptions/transcribe/internal/audio"
 	"github.com/karlis-balcers/meeting-transcriptions/transcribe/internal/config"
 	"github.com/karlis-balcers/meeting-transcriptions/transcribe/internal/filter"
+	"github.com/karlis-balcers/meeting-transcriptions/transcribe/internal/logging"
 	"github.com/karlis-balcers/meeting-transcriptions/transcribe/internal/openai"
 	"github.com/karlis-balcers/meeting-transcriptions/transcribe/internal/speaker"
 	"github.com/karlis-balcers/meeting-transcriptions/transcribe/internal/transcript"
@@ -74,6 +75,10 @@ func Prepare(ctx context.Context, cfg config.Config, configPath string, apiKey s
 	if err != nil {
 		return nil, fmt.Errorf("discover audio devices: %w", err)
 	}
+	logging.Printf("discovered %d audio devices", len(devices))
+	for _, warning := range warnings {
+		logging.Printf("device discovery warning: %s", warning)
+	}
 	selection, selectionWarnings, err := audio.SelectDevices(devices, audio.Preferences{
 		MicDeviceID:      cfg.Audio.MicDeviceID,
 		MicDeviceName:    cfg.Audio.MicDeviceName,
@@ -81,6 +86,9 @@ func Prepare(ctx context.Context, cfg config.Config, configPath string, apiKey s
 		OutputDeviceName: cfg.Audio.OutputDeviceName,
 	})
 	warnings = append(warnings, selectionWarnings...)
+	for _, warning := range selectionWarnings {
+		logging.Printf("device selection warning: %s", warning)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -101,6 +109,7 @@ func Prepare(ctx context.Context, cfg config.Config, configPath string, apiKey s
 	}
 	absOutput, _ := filepath.Abs(outputDir)
 	absTemp, _ := filepath.Abs(tempDir)
+	logging.Printf("selected microphone=%s output=%s output_dir=%s temp_dir=%s", selection.Mic.DisplayName(), selection.Output.DisplayName(), absOutput, absTemp)
 	return &Prepared{
 		Config:       cfg,
 		ConfigPath:   configPath,
@@ -115,6 +124,7 @@ func Prepare(ctx context.Context, cfg config.Config, configPath string, apiKey s
 }
 
 func RunSilent(ctx context.Context, prepared *Prepared, stdout io.Writer, stderr io.Writer) error {
+	logging.Printf("running silent session: transcript_dir=%s", prepared.OutputDir)
 	for _, warning := range prepared.Warnings {
 		fmt.Fprintln(stderr, "warning:", warning)
 	}
@@ -127,12 +137,15 @@ func RunSilent(ctx context.Context, prepared *Prepared, stdout io.Writer, stderr
 		return err
 	}
 	if err := session.Start(ctx); err != nil {
+		logging.Printf("silent session start failed: %v", err)
 		return err
 	}
 	<-ctx.Done()
 	if err := session.Stop(context.Background()); err != nil {
+		logging.Printf("silent session stop failed: %v", err)
 		return err
 	}
+	logging.Printf("silent session completed")
 	_, err = io.WriteString(stdout, transcript.RenderPlain(session.Snapshot().Transcript))
 	return err
 }

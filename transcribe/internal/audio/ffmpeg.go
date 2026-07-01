@@ -13,7 +13,10 @@ import (
 )
 
 type ExternalRecorder struct {
-	FFmpegPath string
+	FFmpegPath       string
+	PythonPath       string
+	HelperScriptPath string
+	Platform         string
 }
 
 func (r ExternalRecorder) Validate(_ context.Context, selected Selection) error {
@@ -32,14 +35,21 @@ func (r ExternalRecorder) Validate(_ context.Context, selected Selection) error 
 	if _, err := r.ffmpeg(); err != nil {
 		return errors.New("ffmpeg was not found in PATH; install ffmpeg or configure a recorder backend before starting")
 	}
+	if r.platform() == "windows" && selected.Output.Source == SourceOutput {
+		if _, _, err := r.commandForRequest(ChunkRequest{
+			Device:   selected.Output,
+			Source:   SourceOutput,
+			TempDir:  os.TempDir(),
+			Duration: time.Second,
+			Sequence: 1,
+		}, filepath.Join(os.TempDir(), "transcribe-output-validation.wav")); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
 func (r ExternalRecorder) RecordChunk(ctx context.Context, request ChunkRequest) (Chunk, error) {
-	path, err := r.ffmpeg()
-	if err != nil {
-		return Chunk{}, err
-	}
 	if request.Duration <= 0 {
 		return Chunk{}, errors.New("chunk duration must be positive")
 	}
@@ -51,15 +61,10 @@ func (r ExternalRecorder) RecordChunk(ctx context.Context, request ChunkRequest)
 		started = time.Now()
 	}
 	filePath := filepath.Join(request.TempDir, fmt.Sprintf("transcribe-%s-%06d.wav", request.Source, request.Sequence))
-	args := []string{"-nostdin", "-hide_banner", "-loglevel", "error", "-y"}
-	args = append(args, inputArgs(request.Device)...)
-	args = append(args,
-		"-t", fmt.Sprintf("%.3f", request.Duration.Seconds()),
-		"-acodec", "pcm_s16le",
-		"-ar", "16000",
-		"-ac", "1",
-		filePath,
-	)
+	path, args, err := r.commandForRequest(request, filePath)
+	if err != nil {
+		return Chunk{}, err
+	}
 	cmd := exec.CommandContext(ctx, path, args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -67,7 +72,11 @@ func (r ExternalRecorder) RecordChunk(ctx context.Context, request ChunkRequest)
 			_ = os.Remove(filePath)
 			return Chunk{}, ctx.Err()
 		}
-		return Chunk{}, fmt.Errorf("ffmpeg failed for %s device %q: %w: %s", request.Source, request.Device.DisplayName(), err, string(output))
+		backendName := "ffmpeg"
+		if r.platform() == "windows" && request.Source == SourceOutput {
+			backendName = "Windows output helper"
+		}
+		return Chunk{}, fmt.Errorf("%s failed for %s device %q: %w: %s", backendName, request.Source, request.Device.DisplayName(), err, string(output))
 	}
 	info, err := os.Stat(filePath)
 	if err != nil {

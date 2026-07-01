@@ -6,6 +6,8 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"runtime"
+	"strings"
 	"syscall"
 
 	"github.com/spf13/cobra"
@@ -13,6 +15,7 @@ import (
 	"github.com/karlis-balcers/meeting-transcriptions/transcribe/internal/app"
 	"github.com/karlis-balcers/meeting-transcriptions/transcribe/internal/audio"
 	"github.com/karlis-balcers/meeting-transcriptions/transcribe/internal/config"
+	"github.com/karlis-balcers/meeting-transcriptions/transcribe/internal/logging"
 	"github.com/karlis-balcers/meeting-transcriptions/transcribe/internal/openai"
 	"github.com/karlis-balcers/meeting-transcriptions/transcribe/internal/speaker"
 	"github.com/karlis-balcers/meeting-transcriptions/transcribe/internal/tui"
@@ -32,6 +35,7 @@ type options struct {
 	output     string
 	language   string
 	model      string
+	logging    int
 	list       bool
 	version    bool
 }
@@ -66,15 +70,24 @@ func NewRootCommand(ioStreams IO, version string) *cobra.Command {
 	cmd.Flags().StringVar(&opts.output, "output", "", "system-output capture device ID or name for this run")
 	cmd.Flags().StringVar(&opts.language, "language", "", "OpenAI transcription language code for this run")
 	cmd.Flags().StringVar(&opts.model, "model", "", "OpenAI transcription model for this run")
+	cmd.Flags().IntVar(&opts.logging, "logging", 0, "write runtime logs to transcribe.log in the current directory when set to 1")
 	cmd.Flags().BoolVar(&opts.list, "list-devices", false, "list detected audio devices and exit")
 	cmd.Flags().BoolVar(&opts.version, "version", false, "print version and exit")
 	return cmd
 }
 
 func run(ctx context.Context, ioStreams IO, opts options) error {
+	cleanupLogging, err := setupLogging(opts.logging)
+	if err != nil {
+		return err
+	}
+	if cleanupLogging != nil {
+		defer cleanupLogging()
+	}
 	explicitConfig := opts.configPath != ""
 	cfg, warnings, err := config.Load(opts.configPath, explicitConfig, config.EnvMapFromOS())
 	if err != nil {
+		logging.Printf("config load failed: %v", err)
 		return err
 	}
 	if opts.configPath == "" {
@@ -99,10 +112,12 @@ func run(ctx context.Context, ioStreams IO, opts options) error {
 	if opts.list {
 		devices, deviceWarnings, err := discoverer.ListDevices(ctx)
 		if err != nil {
+			logging.Printf("list-devices failed: %v", err)
 			return err
 		}
 		for _, warning := range append(warnings, deviceWarnings...) {
 			fmt.Fprintln(ioStreams.Stderr, "warning:", warning)
+			logging.Printf("warning: %s", warning)
 		}
 		fmt.Fprint(ioStreams.Stdout, audio.FormatDevices(devices))
 		return nil
@@ -111,14 +126,23 @@ func run(ctx context.Context, ioStreams IO, opts options) error {
 	apiKey := os.Getenv("OPENAI_API_KEY")
 	prepared, err := app.Prepare(ctx, cfg, opts.configPath, apiKey, app.Dependencies{
 		Discoverer:  discoverer,
-		Recorder:    audio.ExternalRecorder{},
+		Recorder: audio.ExternalRecorder{
+			Platform:         runtime.GOOS,
+			PythonPath:       strings.TrimSpace(os.Getenv("TRANSCRIBE_WINDOWS_PYTHON")),
+			HelperScriptPath: strings.TrimSpace(os.Getenv("TRANSCRIBE_WINDOWS_AUDIO_HELPER")),
+		},
 		Speaker:     speaker.New(cfg.Teams.Enabled),
 		Transcriber: openai.Client{APIKey: apiKey},
 	})
 	if err != nil {
+		logging.Printf("prepare failed: %v", err)
 		return err
 	}
 	prepared.Warnings = append(warnings, prepared.Warnings...)
+	for _, warning := range prepared.Warnings {
+		logging.Printf("warning: %s", warning)
+	}
+	logging.Printf("selected devices: mic=%q output=%q transcript=%q temp=%q", prepared.Selection.Mic.DisplayName(), prepared.Selection.Output.DisplayName(), prepared.OutputDir, prepared.TempDir)
 	ctx, stopSignals := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
 	if opts.silent {

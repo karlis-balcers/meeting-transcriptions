@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import argparse
+import json
 import os
 import struct
 import sys
 import time
 import wave
+from pathlib import Path
+
 import numpy as np
 
 
@@ -337,9 +341,166 @@ def collect_from_stream(
 					stream.stop_stream()
 			except Exception:
 				pass
-			try:
-				stream.close()
-			except Exception:
-				pass
+				try:
+					stream.close()
+				except Exception:
+					pass
 
 	logger.info("[%s] collect_from_stream exiting.", input_device.get("name", "Unknown"))
+
+
+def _strip_quotes(value: str | None) -> str:
+	return str(value or "").strip().strip('"')
+
+
+def _load_pyaudio_module():
+	if sys.platform == "win32":
+		import pyaudiowpatch as pyaudio  # type: ignore
+	else:
+		import pyaudio  # type: ignore
+	return pyaudio
+
+
+def _open_pyaudio_runtime():
+	pyaudio = _load_pyaudio_module()
+	return pyaudio, pyaudio.PyAudio()
+
+
+def select_windows_output_device(p_instance, preferred_id: str | None = None, preferred_name: str | None = None) -> dict:
+	"""Select the best Windows WASAPI loopback output device for recording."""
+	catalog = enumerate_recording_devices(p_instance, platform_name=sys.platform)
+	outputs = catalog.get("outputs", [])
+	default_output = clone_device_info(catalog.get("default_output") or {})
+	selected = pick_preferred_device(
+		outputs,
+		preferred_name=preferred_name or preferred_id,
+		fallback_device=default_output,
+	)
+	if not selected:
+		raise RuntimeError("no Windows WASAPI loopback output device was found")
+	if not is_loopback_device(selected):
+		raise RuntimeError(f"selected Windows output device {selected.get('name')!r} is not a WASAPI loopback device")
+	return selected
+
+
+def record_output_chunk(
+	output_file: str,
+	preferred_id: str | None = None,
+	preferred_name: str | None = None,
+	duration_seconds: float = 2.0,
+	frame_duration_ms: int = 100,
+) -> None:
+	"""Record a single Windows loopback chunk to a PCM WAV file."""
+	_, p_instance = _open_pyaudio_runtime()
+	try:
+		device_info = select_windows_output_device(
+			p_instance,
+			preferred_id=preferred_id,
+			preferred_name=preferred_name,
+		)
+		channels = int(device_info.get("maxInputChannels", 0) or 0)
+		if channels <= 0:
+			raise RuntimeError(f"selected Windows output device {device_info.get('name')!r} has no input channels")
+		sample_rate = int(device_info.get("defaultSampleRate", 0) or 0)
+		if sample_rate <= 0:
+			raise RuntimeError(f"selected Windows output device {device_info.get('name')!r} has no default sample rate")
+		chunk_size = int(sample_rate * frame_duration_ms / 1000)
+		if chunk_size <= 0:
+			chunk_size = 1
+		frames: list[bytes] = []
+		stream = None
+		try:
+			stream = p_instance.open(
+				format=p_instance.get_format_from_width(2),
+				channels=channels,
+				rate=sample_rate,
+				frames_per_buffer=chunk_size,
+				input=True,
+				input_device_index=device_info["index"],
+			)
+			deadline = time.monotonic() + max(float(duration_seconds), 0.0)
+			while time.monotonic() < deadline:
+				frames.append(stream.read(chunk_size, exception_on_overflow=False))
+		finally:
+			if stream is not None:
+				try:
+					if stream.is_active():
+						stream.stop_stream()
+				except Exception:
+					pass
+				try:
+					stream.close()
+				except Exception:
+					pass
+		if not frames:
+			raise RuntimeError(f"recorded chunk for {device_info.get('name')!r} is empty")
+		output_path = Path(output_file)
+		output_path.parent.mkdir(parents=True, exist_ok=True)
+		with wave.open(str(output_path), "wb") as wf:
+			wf.setnchannels(channels)
+			wf.setsampwidth(2)
+			wf.setframerate(sample_rate)
+			wf.writeframes(b"".join(frames))
+	finally:
+		p_instance.terminate()
+
+
+def list_recording_devices(json_output: bool = False) -> None:
+	"""Print the current device catalog for manual Windows verification."""
+	_, p_instance = _open_pyaudio_runtime()
+	try:
+		catalog = enumerate_recording_devices(p_instance, platform_name=sys.platform)
+	finally:
+		p_instance.terminate()
+	if json_output:
+		print(json.dumps(catalog, indent=2, sort_keys=True, default=str))
+		return
+	for section in ("inputs", "outputs"):
+		print(f"[{section}]")
+		for device in catalog.get(section, []):
+			print(f"{device_label(device)}\t{device.get('name', '')}\tloopback={is_loopback_device(device)}")
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+	parser = argparse.ArgumentParser(description="Windows WASAPI loopback helper for transcribe")
+	subparsers = parser.add_subparsers(dest="command", required=True)
+
+	list_parser = subparsers.add_parser("list-devices", help="print the discovered recording device catalog")
+	list_parser.add_argument("--json", action="store_true", help="emit JSON instead of a human-readable list")
+
+	record_parser = subparsers.add_parser("record-output", help="record one Windows output chunk to a WAV file")
+	record_parser.add_argument("--output-file", required=True, help="path to write the recorded WAV chunk")
+	record_parser.add_argument("--device-id", default="", help="preferred Windows output device ID or name")
+	record_parser.add_argument("--device-name", default="", help="preferred Windows output device display name")
+	record_parser.add_argument("--duration", type=float, default=2.0, help="chunk duration in seconds")
+	record_parser.add_argument("--frame-duration-ms", type=int, default=100, help="audio frame size in milliseconds")
+
+	return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+	parser = build_arg_parser()
+	args = parser.parse_args(argv)
+	try:
+		if args.command == "list-devices":
+			list_recording_devices(json_output=bool(args.json))
+			return 0
+		if args.command == "record-output":
+			device_id = _strip_quotes(args.device_id)
+			device_name = _strip_quotes(args.device_name)
+			record_output_chunk(
+				args.output_file,
+				preferred_id=device_id or None,
+				preferred_name=device_name or None,
+				duration_seconds=args.duration,
+				frame_duration_ms=args.frame_duration_ms,
+			)
+			return 0
+		raise RuntimeError(f"unsupported command: {args.command}")
+	except Exception as exc:
+		print(f"audio_capture helper error: {exc}", file=sys.stderr)
+		return 1
+
+
+if __name__ == "__main__":
+	raise SystemExit(main())

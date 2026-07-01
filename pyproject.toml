@@ -41,3 +41,7 @@ build-backend = "poetry.core.masonry.api"
 name = "pytorch"
 url = "https://download.pytorch.org/whl/cu118"
 priority = "explicit"
+
+
+[tool.poetry.scripts]
+audio-capture-helper = "audio_capture:main"

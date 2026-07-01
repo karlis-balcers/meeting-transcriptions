@@ -1,11 +1,11 @@
 ---
-updated_at: 2026-05-27T17:19:54Z
-focus_area: Windows DirectShow audio fix approved
+updated_at: 2026-05-29T10:50:00Z
+focus_area: Windows output-capture validation remains blocked on DirectShow-only ffmpeg capture; UI polish and win64 validation are complete
 active_issues: []
 ---
 
 # What We're Focused On
 
-Windows DirectShow device enumeration/capture bug in Go `transcribe/` has been fixed, independently validated, and approved.
+Windows loopback/output capture still falls back to microphone-only on this host because the current ffmpeg build only supports DirectShow capture; synthesized `Speakers/Headphones [Loopback]` devices are display-only.
 
-Current focus: keep the working tree visible for user review. Scribe did not stage or commit changes.
+Completed this session: green active shortcut styling in the TUI footer, `R Resume` renamed to `R Record`, Windows amd64 binary rebuilt successfully, and tests passed.
