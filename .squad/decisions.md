@@ -2,210 +2,38 @@
 
 ## Active Decisions
 
-### 2026-05-27: Go TUI migration design
+### 2026-07-03: Standalone terminal binary — adopt Path C (ffmpeg-unified, drop Python helper)
 **By:** Danny
-**What:** Rebuild the Python window transcription app as a focused Go TUI/CLI under `transcribe/`, producing an executable named `transcribe`. Keep live mic + output transcription, device selection, Teams best-effort speaker detection, transcript persistence, filtering, OpenAI transcription retries, pause/resume/mute, and loudness feedback. Drop Tkinter, assistant panels, custom prompts, summaries, vector stores, local Whisper/faster-whisper, `.env` app config, context files, and agent features.
-**Why:** The requested product is a single-purpose recorder/transcriber with terminal UX and pipe-friendly silent mode. Keeping assistant/summary code would increase migration risk and conflict with the requirement to support only OpenAI transcription and no assistant/agents.
+**What:** Make `transcribe` a single self-contained terminal binary that works on Mac, Windows, and Linux with no Python helper and no staged `.venv`. Adopt **Path C**: keep the existing `ExternalRecorder` + `ffmpeg` cross-platform capture backend; extend Windows *output* capture onto that same ffmpeg/DirectShow path (the code already used by the Windows mic); delete the Python WASAPI layer (`windows_helper.go`, the venv stage in `build_transcribe_win64.bat`, the `TRANSCRIBE_WINDOWS_*` env plumbing). For the double-click "this is a command line tool" UX, keep the binary a plain **CONSOLE** subsystem (do **not** use `-H windowsgui`, which would detach the console and break the Bubble Tea TTY/TUI), and instead ship a `transcribe.cmd` launcher plus a Windows-only in-process `attachParentConsole()` guard in `main.go`.
+**Why:** This honors the team's prior 2026-05-27 choice of external ffmpeg over CGo/native audio (which keeps `CGO_ENABLED=0` static cross-compile builds working), achieves the requester's "stand-alone app, no UI, terminal, works on all three OSes" goal, and *removes* complexity (Python runtime + helper + venv) rather than adding it. Path A (ffmpeg `dshow` loopback on Windows) was rejected as a turnkey solution because stock Windows ffmpeg exposes only DirectShow and cannot reliably capture system-output without a real loopback source. Path B (Go-native WASAPI via `gen2brain/malgo`) was rejected for v1 because it is CGo and would break the static cross-compile matrix; it remains a documented future option behind an opt-in build tag if the Windows loopback limitation becomes blocker-tier.
+**Honest Windows contract:** This is the principal user-visible regression vs the prior Python WASAPI helper: output capture on Windows now requires a capture-able loopback source — enable **Stereo Mix**, or install a virtual loopback device (VB-CABLE / Voicemeeter / virtual-audio-capturer). When no loopback candidate is found, the app prints an actionable warning naming the fix and the `--list-devices` retry, rather than silently falling back to mic-only. This mirrors how Mac already needs BlackHole/Soundflower and Linux needs a `.monitor` Pulse source.
+**Supersedes:** the 2026-05-29 Rusty decision *"Windows output capture uses the Python WASAPI helper"* (archived today in `.squad/decisions/archive/2026-07-03-archive.md`). Embedding `ffmpeg` in-binary was also considered and rejected (binary bloat, license/AV false-positive risk, and it does not solve the loopback problem).
+**Full ADR (paths, §4 file-by-file handoff, risks, future options):** `.squad/decisions/archive/2026-07-03-archive.md` is the pre-rewrite record; the original long-form ADR was placed at `.squad/decisions/inbox/danny-cross-platform-audio-strategy.md` this session.
 
-#### Go module layout
-- `transcribe/go.mod` — standalone module for the new app.
-- `transcribe/cmd/transcribe/main.go` — CLI parsing, config load, mode selection, top-level exit codes.
-- `transcribe/internal/app` — lifecycle orchestration, signal handling, state machine.
-- `transcribe/internal/config` — `~/.transcribe/config.yaml` load/save, validation, defaults; never stores API keys.
-- `transcribe/internal/audio` — cross-platform device enumeration, default/preferred device selection, capture, segmentation, loudness samples.
-- `transcribe/internal/openai` — multipart transcription client, retry/backoff, timeout handling.
-- `transcribe/internal/transcript` — ordered aggregation, Markdown persistence, silent-mode final stdout rendering.
-- `transcribe/internal/filter` — carry forward artifact filtering and keyword-preserve behavior.
-- `transcribe/internal/speaker` — `speaker_windows.go` best-effort Teams UIA integration; non-Windows stubs warn once and return `Person_?`.
-- `transcribe/internal/tui` — Bubble Tea TUI, shortcuts, meters, device/settings overlays.
+### 2026-07-03: Cross-platform test plan pre-drafted ahead of implementation
+**By:** Basher (QA)
+**What:** Authored `transcribe/docs/cross-platform-test-plan.md` in advance of the Path-C implementation slices, covering: `go build`/`go vet`/`go test`/`go test -race` from `transcribe/`; native build; `CGO_ENABLED=0` cross-compile smoke across linux/darwin/windows × amd64/arm64; new unit assertions that Windows output capture uses the ffmpeg DirectShow command (not Python) and that the console-attach guard is a no-op on non-Windows build tags; the `transcribe.cmd` launcher / no "command line tool" message contract; and the missing-loopback-on-Windows actionable-warning regression.
+**Why:** Locking the QA expectations first kept Rusty's audio-core slice and Livingston's CLI/build slice aligned with the same acceptance bars during parallel implementation, so the final gate could assert the contracts rather than discover them. The smoke driver lives at `transcribe/docs/qa-cross-compile-smoke.sh` for re-runs.
 
-#### CLI contract
-- `transcribe` starts recording/transcribing immediately after validation.
-- `-s`, `--silent` disables TUI, records until interrupt, writes only final complete transcript to stdout; all status/errors go to stderr.
-- `-o`, `--output-dir <dir>` overrides configured transcript directory for this run.
-- `--config <path>` optional override for advanced/testing use; default remains `~/.transcribe/config.yaml`.
-- `--list-devices` prints detected mic/output candidates and exits.
-- Optional run overrides: `--mic <id-or-name>`, `--output <id-or-name>`, `--language <code>`, `--model <name>`; persisted only through runtime settings, not CLI flags.
-
-#### Config schema
-- Path: `~/.transcribe/config.yaml`; create parent directory with user-only permissions where supported.
-- API key: `OPENAI_API_KEY` environment variable only. Do not read/write API keys in YAML or `.env`.
-- Suggested keys:
-	- `user_name: "You"`
-	- `language: "en"`
-	- `keywords: []`
-	- `openai.model: "gpt-4o-mini-transcribe"`, `openai.timeout_seconds: 60`, `openai.max_retries: 3`, `openai.retry_base_seconds: 1`
-	- `audio.mic_device_id/name`, `audio.output_device_id/name`, `audio.frame_duration_ms: 100`, `audio.silence_threshold: 50`, `audio.silence_duration: "1s"`, `audio.max_segment_duration: "300s"`
-	- `paths.output_dir: ""` meaning current working directory, `paths.temp_dir: ""` meaning OS temp/cache location.
-	- `teams.enabled: true`, `tui.show_loudness_meters: true`
-	- `filter.min_chars`, `filter.exact/prefixes/contains/regex`
-
-#### Audio/transcription flow
-1. Validate `OPENAI_API_KEY`, config, output directory, temp directory, and audio devices before starting capture; fail fast with actionable errors.
-2. Select configured devices if present and healthy; otherwise use OS default microphone and default output-capture device. Show both selected devices at TUI start and on stderr in silent mode.
-3. Start mic and output capture goroutines. Output capture is required unless the user explicitly selects a valid output-capture device; if unsupported or unavailable, fail with clear platform guidance rather than silently recording only mic.
-4. Segment by silence and max segment duration, write temporary WAV chunks under temp storage, send to OpenAI transcription, delete chunks after successful/failed processing.
-5. Aggregate segments by capture timestamp. Mic segments use `user_name`; output segments use Teams speaker when available, otherwise `Person_?`.
-6. Preserve transcript artifact filtering and keyword prompts from the Python implementation.
-7. Pause (`P`) stops capture ingestion without losing already queued transcription work; resume (`R`) restarts capture; mute (`M`) suppresses mic stream only; unmute (`U`) resumes mic stream.
-
-#### TUI states and shortcuts
-- States: `Starting`, `Recording`, `Paused`, `Settings`, `DeviceSelectMic`, `DeviceSelectOutput`, `Stopping`, `Error`.
-- Bottom shortcut bar: `P Pause`, `R Resume`, `M Mute mic`, `U Unmute mic`, `S Settings`, `Q Quit`.
-- `S` opens settings overlay; then `M` selects microphone, `O` selects output device. Selection persists to YAML and restarts the affected stream if recording.
-- Main screen shows selected devices, session timer, status/errors, last transcript entries, Teams speaker status, and horizontal loudness meters for mic and output.
-- Professional TUI defaults: no stdout noise outside silent mode transcript output, resize-aware layout, accessible contrast, clear degraded-mode warnings, graceful terminal restore on panic/signals.
-
-#### File output strategy
-- Default transcript directory: `paths.output_dir` if set; otherwise current working directory; CLI `--output-dir` wins for the run.
-- Filename: `transcription-YYYYMMDD_HHMMSS.md`; include created timestamp, selected devices, language, and model metadata.
-- Append accepted segments incrementally in chronological order; keep in-memory ordered transcript for TUI and silent final stdout.
-- Silent mode still saves the Markdown transcript by default and prints the complete final transcript to stdout only after interrupt/drain.
-
-#### Platform risks
-- Output/system audio capture is the highest risk. Windows WASAPI loopback is feasible; macOS/Linux may need OS permissions, PulseAudio/PipeWire monitor sources, BlackHole/Soundflower-style virtual devices, or equivalent. Treat missing output capture as a clear startup error.
-- 2026-05-29: On this Windows host, the current ffmpeg build only exposes DirectShow capture; synthesized `Speakers/Headphones [Loopback]` devices are display-only and fall back to microphone-only capture.
-- Go audio library choice should favor a cross-platform capture stack with loopback support where possible; validate build requirements early because CGo can complicate Windows/Linux/macOS ARM+Intel releases.
-- Teams speaker recognition is Windows-only and fragile. Implement behind build tags and warn/fallback cleanly everywhere else.
-- OpenAI file limits require bounded chunks; keep max segment duration conservative and surface API retry status in the TUI.
-- macOS microphone/screen/audio permissions and terminal raw mode restoration need explicit test coverage.
-
-#### Implementation/testing responsibilities
-- Lead Engineer: own migration architecture, package boundaries, acceptance criteria, and cut/drop decisions.
-- Audio/platform implementer: device enumeration, default selection, loopback capture, loudness meters, pause/mute semantics, cross-platform build matrix.
-- TUI implementer: Bubble Tea state model, shortcuts, settings/device overlays, silent mode behavior, terminal safety.
-- API/transcript implementer: OpenAI transcription client, chunk lifecycle, filtering, ordered persistence, stdout contract.
-- Windows/platform specialist: Teams UIA speaker detection and WASAPI validation.
-- QA/release: unit tests for config/device selection/filtering/aggregation, integration smoke tests with fake audio/OpenAI client, manual OS matrix checks, release build scripts for Windows, Linux, macOS ARM, and macOS Intel.
-
-### 2026-05-27: Python behavior map decisions for Go core
+### 2026-07-03: Audio core unified on ffmpeg (Danny §4a)
 **By:** Rusty
-**What:** Preserve the core capture -> chunk -> transcribe -> transcript-store semantics for the Go TUI rebuild, but do not line-copy Tkinter/global-key/empty-file side effects. The Go core should create transcript files only when a session starts, allow mic-only operation when output capture is unavailable, expose speaker detection as an optional event source, and replace any-letter manual split behavior with explicit split/speaker controls.
-**Why:** These choices keep user-visible transcript behavior while removing brittle GUI, PyAudio, and Windows UI Automation coupling from the core. They also fix shutdown/drain risks in the Python thread model without changing the intended session semantics.
+**What:** Deleted `transcribe/internal/audio/windows_helper.go` entirely (the Python WASAPI layer: `windowsOutputHelperCommand`, `windowsPythonPath`, `windowsHelperScriptPath`, `windowsPythonCandidates`, `resolveExistingFile`, `normalizeExecutableCandidate`, and the Windows-output early-return). Simplified `ffmpeg.go`: moved `commandForRequest` + `platform()` here with the Windows-output Python branch removed (Windows output now flows through the existing ffmpeg DirectShow path `-f dshow -i audio=<id>`, same as the mic); removed the `backendName = "Windows output helper"` error-path branch; removed the Windows-output-specific `commandForRequest` probe from `Validate`; removed the `PythonPath` and `HelperScriptPath` fields from the `ExternalRecorder` struct. Refined `windowsOutputCaptureWarning` in `discover.go` to name the actionable fix (Stereo Mix / VB-CABLE / Voicemeeter / `--list-devices`) while preserving the `loopback` + `output-capture` literals existing tests assert. Added a selection-time warning in `SelectDevices` (`audio.go`) via the existing `likelyDShowLoopback` classifier. Updated `ffmpeg_test.go`: deleted the three Python-helper tests and added `TestWindowsOutputRecorderUsesFFmpegDirectShow` + `TestWindowsOutputRecorderValidationRequiresFFmpegOnly`.
+**Why:** Delivers the §4a audio-core slice of Danny's Path-C ADR — a single uniform ffmpeg capture backend across mic and output on all three OSes, with the Python runtime removed and the honest missing-loopback contract surfaced. Validated on WSL2 Ubuntu (go1.22.2): `go vet ./internal/audio/...` clean; `go test ./internal/audio/...` ok; full `go build ./...` green once Livingston's matching `root.go` field-removal landed.
 
-### 2026-05-27: Go TUI/CLI stack for transcription rebuild
+### 2026-07-03: Console-attach guard + Python-free Windows build (Danny §4b)
 **By:** Livingston
-**What:** Use a Bubble Tea-based TUI with Cobra commands, typed YAML config at `~/.transcribe/config.yaml`, an OpenAI-only transcription adapter, and platform-isolated audio/speaker packages behind build tags. Prefer native release-matrix builds for audio-enabled binaries instead of promising frictionless single-host cross-compilation.
-**Why:** CLI/TUI, config, silent stdout mode, and OpenAI transcription are straightforward in Go, but default mic plus system-output capture is inherently platform-specific. Windows should use WASAPI loopback, Linux should use PulseAudio/PipeWire monitor sources, and macOS should start with virtual loopback-device support or a native ScreenCaptureKit/CoreAudio helper path before claiming full built-in system-output capture.
+**What:** Added `attachParentConsole()` as the first statement of `cmd/transcribe/main.go`. Implemented it build-tagged: new `cmd/transcribe/console_windows.go` (`//go:build windows`, stdlib `syscall` only — `kernel32` `GetConsoleWindow` + `AttachConsole(ATTACH_PARENT_PROCESS)` then reopen `CONOUT$`/`CONIN$`; no-op-then-log on attach failure so detached parents like Task Scheduler degrade gracefully) and new `cmd/transcribe/console_other.go` (`//go:build !windows` no-op stub) so `main.go` stays build-tag-free. Used **stdlib `syscall`, not** `golang.org/x/sys/windows`, because `x/sys` is only an indirect dep here. Removed `TRANSCRIBE_WINDOWS_PYTHON`/`TRANSCRIBE_WINDOWS_AUDIO_HELPER` reads and the `PythonPath`/`HelperScriptPath` assignments from `internal/cli/root.go` (recorder is now `audio.ExternalRecorder{Platform: runtime.GOOS}`; dropped the now-unused `strings` import). Stripped the Python footprint from `build_transcribe_win64.bat` (no more `audio_capture.py` copy, `PYTHON_BOOTSTRAP`, `%BUILD_VENV%`, or `pip install pyaudiowpatch numpy`), kept the WSL `CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build` step byte-for-byte, and added a `transcribe.cmd` launcher generator (`@echo off` / `cmd /k "%~dp0transcribe.exe" %*`) so double-click keeps a persistent TTY for the TUI. Rewrote `transcribe/README.md` to state the honest Windows loopback contract and drop the Python-helper/`TRANSCRIBE_WINDOWS_*` paragraph.
+**Why:** Delivers the §4b CLI/build slice of Danny's Path-C ADR — the binary stays a plain CONSOLE-subsystem exe (no `-H windowsgui`, so the Bubble Tea `tea.WithAltScreen()` TUI keeps a real TTY), double-click works via launcher + in-process console guard, and no new dependency or CGo is introduced. Validated on WSL2 Ubuntu (go1.22.2): `go vet ./cmd/... ./internal/cli/...` rc=0; `go test ./internal/cli/...` ok; `GOOS=windows go vet ./cmd/transcribe/...` rc=0 (parses `console_windows.go`).
 
-Recommended libraries:
-- TUI: `github.com/charmbracelet/bubbletea`, `github.com/charmbracelet/bubbles`, `github.com/charmbracelet/lipgloss`
-- CLI/config: `github.com/spf13/cobra`, typed config loaded with `gopkg.in/yaml.v3` or `github.com/goccy/go-yaml`; keep Viper optional rather than central
-- OpenAI transcription: `github.com/openai/openai-go` behind an internal interface; use a thin standard-library multipart fallback if the audio API surface is insufficient
-- Audio/WAV: platform-specific capture under `internal/audio` plus `github.com/go-audio/wav` for PCM WAV chunk writing
-- Windows audio/speaker: WASAPI loopback and Windows UI Automation behind `//go:build windows`
-- Linux audio: PulseAudio/PipeWire monitor source capture, preferably through the Pulse protocol/client path
-- macOS audio: microphone capture plus detected virtual loopback devices for v1; evaluate ScreenCaptureKit/CoreAudio process tap helper for later built-in system audio
-
-Suggested module layout:
-- `cmd/transcribe/` for the binary entry point
-- `internal/cli/` for Cobra commands and silent-mode routing
-- `internal/tui/` for Bubble Tea models/views/update loop
-- `internal/config/` for defaults, validation, atomic saves, and `~/.transcribe/config.yaml`
-- `internal/app/` for orchestration/session lifecycle
-- `internal/audio/` for capture interfaces, segmenting, WAV chunking, and platform build-tag implementations
-- `internal/transcribe/openai/` for the OpenAI transcription client
-- `internal/transcript/` for transcript events, ordering, Markdown/stdout sinks
-- `internal/speaker/` for Teams best-effort detection plus no-op fallbacks
-- `internal/logging/` for stderr/file logging that never pollutes silent stdout
-
-### 2026-05-27: Go TUI tests require dependency-injected external seams
-**By:** Basher
-**What:** The Go TUI rebuild must keep audio capture, OpenAI/transcription, device discovery, Teams speaker detection, filesystem/clock/stdout, and TUI driver behavior behind injectable interfaces from the first implementation.
-**Why:** Regression and workflow tests need deterministic fakes across Linux, macOS, and Windows. CI must validate silent-mode stdout, transcript files, keyboard/TUI state, and failure paths without real audio hardware, Teams, OpenAI credentials, or live network access.
-
-Full QA strategy artifact: `.squad/agents/basher/go-tui-qa-validation-strategy.md`.
-
-### 2026-05-27: Go TUI implementation boundaries
-**By:** Livingston
-**What:** Implemented the new `transcribe/` app as a standalone pure-Go module with Cobra CLI, Bubble Tea TUI, YAML config, ffmpeg external recording backend, PulseAudio/PipeWire `pactl` discovery on Linux, manual/default fallback devices on Windows/macOS, OpenAI multipart transcription via `net/http`, ordered Markdown transcript persistence, and non-Windows Teams speaker fallback to `Person_?`.
-**Why:** This satisfies the requested shippable CLI/TUI contract while avoiding cgo/native audio bindings that would break cross-platform builds. Real loopback capture remains delegated to OS audio setup plus `ffmpeg`, so unsupported/missing devices fail before recording with actionable guidance instead of pretending capture works.
-
-### 2026-05-27: Go TUI QA review rejected pending live workflow fixes
-**By:** Basher
-**What:** Reject the current Go TUI implementation as production-ready despite passing tests, vet, native build, and linux/darwin/windows amd64/arm64 cross-compile smoke checks. I added tests for silent-mode stdout, API-key fail-fast behavior, and TUI shortcuts/settings, but remaining runtime gaps need another owner.
-**Why:** The ffmpeg chunk recorder runs bounded chunks up to the configured max duration, so pause, mute, device changes, and loudness feedback are delayed/fake rather than live workflow controls. Windows Teams detection is also explicitly stubbed instead of best-effort UI Automation. Revision should be owned by a new audio/platform specialist or Danny, not Livingston, per reviewer protocol.
-
-### 2026-05-27: Go TUI revision addresses live-control rejection
-**By:** Danny
-**What:** Revised the Go `transcribe` implementation to use configurable short ffmpeg capture chunks (`audio.capture_chunk_duration`, default `2s`), cancel active per-source recorder contexts on pause/mute/device changes, persist settings-driven device changes before restarting the affected stream, compute TUI loudness from captured WAV/PCM RMS levels, and replace the Windows Teams stub with best-effort PowerShell window-title polling behind the Windows build tag.
-**Why:** Basher's rejection was correct: long max-duration chunks delayed runtime controls, fake meters hid capture reality, and an explicit Windows Teams stub failed the migration contract. This keeps the pure-Go/cross-compile boundary while making controls responsive and telemetry real enough for the TUI revision.
-
-### 2026-05-27: Go TUI re-review approved
-**By:** Basher
-**What:** APPROVED Danny's Go TUI revision after re-reviewing the original rejection points and the broader CLI/TUI/silent/config/OpenAI/transcript contract. Runtime controls now cancel active recorder contexts and use short configurable capture chunks, loudness meters are computed from captured WAV/PCM RMS levels, Windows Teams detection makes a genuine best-effort title-polling attempt, and non-Windows fallback is explicit.
-**Why:** Validation passed on Linux amd64 with Go 1.26.3: `go test ./...`, `go vet ./...`, native build, cross-compiles for linux/darwin/windows amd64/arm64, `go test -race ./...`, formatting/module/whitespace/final-newline hygiene, plus CLI smoke checks for help/version/list-devices and missing API-key stderr/no-stdout behavior.
-
-### 2026-05-27: Windows DirectShow devices must be concrete enumerated choices
-**By:** Livingston
-**What:** Windows audio discovery now parses ffmpeg DirectShow device-list output, stores DirectShow alternative names as aliases/selectable IDs, suppresses old synthetic `default`/`virtual-audio-capturer` placeholders unless actually enumerated, and exposes all DirectShow audio capture devices in both microphone and output-capture settings with clear output-candidate labeling.
-**Why:** Passing `audio=default` to DirectShow failed on real Windows hosts and hid most available microphones. ffmpeg can list concrete DirectShow audio devices without cgo, preserving pure-Go cross-compilation while giving users actionable names/IDs and documenting that DirectShow alone cannot reliably classify system-output loopbacks.
-
-### 2026-05-27: Windows DirectShow audio fix review approved
-**By:** Basher
-**What:** APPROVED Livingston's Windows audio discovery fix after code review and validation. The Go `transcribe/` app now parses ffmpeg DirectShow audio sections from stderr, preserves alternative-name aliases, avoids treating video devices as audio, exposes every parsed DirectShow audio candidate for both microphone and output-capture settings, suppresses unresolved synthetic `default`/old placeholder selections when concrete devices exist, and provides list-devices guidance when defaults cannot resolve.
-**Why:** Regression coverage now pins the reported failure mode: multiple DirectShow audio devices and aliases are parsed, formatted device lists expose aliases instead of synthetic `audio=default`, default preferences fall back to concrete enumerated devices with actionable warnings, and recorder validation rejects unresolved DirectShow defaults before capture. Validation passed from `transcribe/`: `go test ./...`, `go vet ./...`, native `go build -o transcribe ./cmd/transcribe` with binary removal, linux/darwin/windows amd64+arm64 cross-compiles, and `go test -race ./...`.
-
-### 2026-05-28: DirectShow microphone defaults skip loopback candidates
-**By:** Rusty
-**What:** `devicesFromDShowAudioDevices` now marks the first non-loopback DirectShow audio device as the default microphone instead of always treating the first enumerated audio row as the mic default. Output capture still prefers obvious loopback/virtual devices when present.
-**Why:** ffmpeg often lists loopback or virtual output sources among the DirectShow audio devices, and the first enumerated row is not reliably a real microphone when several microphones and output devices are present.
-
-### 2026-05-28: PulseAudio numeric indices retained as aliases
-**By:** Basher
-**What:** `ParsePactlSources` now keeps the numeric column from `pactl list short sources` as a device alias, and PulseAudio duplicate suppression is alias-aware. This lets `--mic`, `--output`, `AUDIO_INPUT_DEVICE_INDEX`, and `AUDIO_OUTPUT_DEVICE_INDEX` select devices by the exact PulseAudio row index as well as by source name.
-**Why:** Multi-device Linux setups need stable selection across names and indices. Dropping the numeric index made it harder to target the intended microphone or output capture device when several similar sources were present.
-
-### 2026-05-28: Windows amd64 build script uses Ubuntu WSL with WSLENV path translation
-
-**By:** Livingston
-
-**What:** The new `build_transcribe_win64.bat` wrapper should invoke `wsl.exe -d Ubuntu -- bash -lc` and rely on `WSLENV=TRANSCRIBE_DIR/p` so the batch-resolved repo path is translated safely into Ubuntu before running `GOOS=windows GOARCH=amd64 go build` inside `transcribe/`.
-
-**Why:** Manual `wslpath` handoff through batch quoting was brittle. WSLENV keeps the path handling reliable for spaces and makes the Windows amd64 build output deterministic at `transcribe/build/windows-amd64/transcribe.exe`.
-
-**Notes:** The wrapper also fails fast if `wsl.exe` is unavailable or Ubuntu does not have `go` installed, and it uses `CGO_ENABLED=0` to keep the cross-compile path pure Go.
-
-### 2026-05-28: Windows audio fallback when DirectShow lists no audio rows
-
-**By:** Rusty
-
-**What:** If ffmpeg DirectShow device listing on Windows returns no audio devices, fall back to PowerShell `Get-PnpDevice -Class AudioEndpoint` enumeration instead of hard-failing discovery. Keep the existing DirectShow capture backend, surface the fallback devices through `--list-devices`, preserve `FriendlyName` as the capture ID, and keep `InstanceId` as an alias alongside the current loopback/default heuristics and warnings.
-
-**Why:** Some Windows hosts only surface a camera video row through ffmpeg DirectShow listing, which currently blocks startup and hides real audio choices. A fallback discovery path is the smallest robust fix that keeps the user visible to actual microphone/loopback candidates without changing the recording backend.
-
-**Validation:** WSL2 Ubuntu native Go 1.22.2 validation passed with `go test ./...` and `go build -o transcribe ./cmd/transcribe` from `transcribe/`.
-
-### 2026-05-28: Windows DirectShow video-first parser resilience
-
-**By:** Basher
-
-**What:** Windows DirectShow device discovery in `transcribe/` should classify each ffmpeg device row using row-level audio/video markers and audio-like aliases, instead of relying only on a later `DirectShow audio devices` section header.
-
-**Why:** Some ffmpeg outputs start with a camera row or omit the expected audio header, which can make real microphones and loopback devices disappear from `--list-devices` even though the rows are present.
-
-**Validation:** WSL2 Ubuntu native Go 1.22.2 validation passed with `go test ./...` and `go build -o transcribe ./cmd/transcribe` from `transcribe/`.
-
-### 2026-05-28: TUI logging and device picker flow
-**By:** Livingston
-**What:** `--logging 1` enables file logging via a small internal helper that writes `transcribe.log` in the current working directory. Device picker Enter now applies the selected device, then returns to Settings so the updated mic/output summary is visible immediately. Keep transcript content out of logs; log session lifecycle, chunk capture, and OpenAI transcription progress only.
-
-**Why:** The settings flow needs to confirm device changes immediately, and file logging must stay opt-in while still giving enough breadcrumbs to follow the capture/transcription path.
-
-### 2026-05-28: Fail fast on identical mic/output capture and add file logging
-**By:** Rusty
-**What:** Treat identical microphone and output-capture selections as invalid in `transcribe/` so the app does not silently record the same source twice. Also add opt-in file logging via `--logging 1`, writing `transcribe.log` in the current working directory.
-
-**Why:** Using the same physical headset for both roles produces duplicate or garbage transcription instead of meeting audio. Logging chunk lifecycle to a file makes it obvious whether the app is capturing short chunks and sending them to OpenAI, while the fail-fast validation prevents the bad selection from reaching the recorder.
-
-### 2026-05-28: Surface filtered transcript chunks and enable file logging
-**By:** Basher
-**What:** When the transcription pipeline receives non-empty text that is dropped by transcript filters, log the chunk so the behavior is visible instead of silent. Add `--logging 1` to write runtime logs to `transcribe.log` in the current working directory.
-
-**Why:** The app can look like it is looping or doing nothing when it is actually recording and filtering chunks. Logging makes the chunked transcription path diagnosable without changing the session model.
+### 2026-07-03: Cross-platform standalone Go binary — QA gate APPROVED
+**By:** Basher (QA)
+**What:** APPROVED the cross-platform standalone-binary redesign (Path C) after running the full QA gate from `transcribe/` (WSL2 Ubuntu, go1.22.2). Gate results: `go build ./...` ✅; `go vet ./...` ✅; `go test ./...` ✅ (all 10 packages ok); `go test -race -count=1 ./...` ✅ race-clean after fixing one **pre-existing** harness data race; `CGO_ENABLED=0` cross-compile smoke **6/6** green across linux/darwin/windows × amd64/arm64 (~10 MB static binaries each); Windows output → ffmpeg DirectShow (not Python) assertion present and passing; console-attach guard proven no-op off-Windows by the linux/darwin cross-compiles; missing-loopback actionable-warning assertion present and strengthened; `transcribe.cmd` launcher present with no "command line tool" message; `windows_helper.go` gone with zero stale Go references; README carries no Python-helper claim.
+**Test-fix during gate (regression authority exercised):** Found and fixed a **pre-existing** data race in `internal/app/app_test.go`'s `outputFailureRecorder` (test harness only — goroutine wrote `r.failed = nil` under lock while the test body read the field without the lock; `app_test.go` predates this redesign, so it was not a regression). Fix: `newOutputFailureRecorder()` now returns a channel + uses `sync.Once` for a race-free single close; the field mutation under lock is removed. Also strengthened `TestWindowsDShowMicOnlyListDoesNotExposeOutputCapture` in `internal/audio/discover_test.go` to pin the exact `windowsOutputCaptureWarning` literal and its actionable remediation tokens (Stereo Mix, VB-CABLE, Voicemeeter, `--list-devices`).
+**Follow-ups (non-blocking):** stale build artifacts in `transcribe/build/windows-amd64/` (`.venv/`, `audio_capture.py`) are leftover from a previous Python-staging run and will vanish on a clean rebuild — flag for cleanup; DirectShow device-name localization (English-biased classifier) remains a documented follow-up.
 
 ## Governance
 
 - All meaningful changes require team consensus
 - Document architectural decisions here
 - Keep history focused on work, decisions focused on direction
+- Entries older than 30 days are archived under `.squad/decisions/archive/`; the 2026-07-03 archive contains the full pre-rewrite record of decisions 2026-05-27 through 2026-05-28.
