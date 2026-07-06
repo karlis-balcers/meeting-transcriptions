@@ -17,7 +17,7 @@ The OpenAI API key is never read from or written to the YAML config file.
 
 ## Build
 
-From this directory:
+Run build and test commands from the repository root:
 
 ```sh
 go test ./...
@@ -35,7 +35,22 @@ GOOS=windows GOARCH=amd64 go build -o /tmp/transcribe-windows-amd64.exe ./cmd/tr
 GOOS=windows GOARCH=arm64 go build -o /tmp/transcribe-windows-arm64.exe ./cmd/transcribe
 ```
 
-On Windows, `build_transcribe_win64.bat` cross-compiles the pure-Go main binary via WSL, builds the `wasapi-loopback-recorder.exe` sidecar helper, and emits a `transcribe.cmd` launcher beside `transcribe.exe` that keeps a persistent `cmd.exe` attached so the Bubble Tea TUI has a real TTY when launched by double-click.
+On Windows, run `build_transcribe_win64.bat` from the repository root. It cross-compiles the pure-Go main binary via WSL, builds the sidecar from `./cmd/wasapi-loopback-recorder`, and emits `transcribe.exe`, `wasapi-loopback-recorder.exe`, and a `transcribe.cmd` launcher to the root-level `build/windows-amd64/` package directory. The launcher keeps a persistent `cmd.exe` attached so the Bubble Tea TUI has a real TTY when launched by double-click.
+
+## Project layout
+
+- `cmd/transcribe` — main CLI/TUI entry point and Windows console-launch glue.
+- `cmd/wasapi-loopback-recorder` — Windows WASAPI loopback sidecar executable for built-in speaker/headphone capture.
+- `internal/app` — session orchestration, recorder/transcriber wiring, and runtime lifecycle.
+- `internal/audio` — device discovery, recorder backends, WAV/RMS helpers, and ffmpeg/WASAPI dispatch.
+- `internal/cli` — Cobra command setup, config loading, logging flags, and command execution.
+- `internal/config` — YAML config model, defaults, environment compatibility, and validation.
+- `internal/openai` — OpenAI audio transcription client.
+- `internal/speaker` — best-effort speaker naming helpers, including Windows Teams title probing.
+- `internal/transcript` — ordered Markdown transcript storage.
+- `internal/tui` — Bubble Tea model and interaction flow.
+- `docs` — cross-platform QA and Windows WASAPI sidecar test plans.
+- `build/windows-amd64` — generated Windows package artifacts from `build_transcribe_win64.bat`.
 
 ## Configuration
 

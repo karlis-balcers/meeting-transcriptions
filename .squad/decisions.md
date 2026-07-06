@@ -44,6 +44,18 @@
 **Why:** Stock Windows built-in speakers/headphones must capture system output without requiring Stereo Mix, VB-CABLE, or Voicemeeter, matching Audacity's Windows WASAPI loopback mode. Keeping the implementation in a helper preserves the cross-platform pure-Go main binary and avoids reintroducing Python.
 **Caveats:** Hardware live validation is still required on Realtek/USB/Bluetooth render endpoints. The helper writes converted PCM16 16 kHz mono WAV rather than native mix-format WAV so existing RMS/OpenAI paths remain unchanged. DirectShow loopback/virtual devices remain fallback/diagnostic options if the helper is missing or a device-specific WASAPI path fails.
 
+### 2026-07-06: Squad operating context follows the root-level Go layout
+**By:** Danny
+**What:** Updated the squad roster, routing, active charters, current identity focus, and agent learnings so agents operate against the repository root Go module: `go.mod` at root, entrypoints under `cmd/`, core packages under `internal/`, docs under `docs/`, and Windows packaging from `build_transcribe_win64.bat` into `build/windows-amd64/`. The old `transcribe/` path is obsolete for current work except stale artifacts under `transcribe/build/` if present.
+**Why:** The Python application and nested Go module layout have been removed. Keeping team operating context aligned with the root layout prevents routing, testing, and edits against obsolete paths.
+**Validation:** Coordinator searches found no stale `Python Developer`, placeholder routing, nested `transcribe/README`, `transcribe/go.mod`, `transcribe/docs`, `.py`, `.venv`, Poetry, Tkinter, pyaudio, or pyaudiowpatch references in the updated squad context files.
+
+### 2026-07-06: README documents the root Go layout
+**By:** Livingston
+**What:** Updated `README.md` to treat the repository root as the only Go module/workspace entry point. Build and test examples now use root-relative commands such as `go test ./...` and `go build -o transcribe ./cmd/transcribe`; Windows packaging is documented as `build_transcribe_win64.bat` emitting artifacts to root `build/windows-amd64/`; and the layout section names root `cmd/*`, `internal/*`, and `docs` paths.
+**Why:** Current documentation must not imply a separate nested `transcribe/` module, nested README, nested docs directory, or remaining Python application.
+**Validation:** Coordinator validation used WSL because PowerShell did not have `go` on PATH; `WSLENV`-based root validation ran `go test ./...` and passed.
+
 ### 2026-07-03: Cross-platform standalone Go binary — QA gate APPROVED
 **By:** Basher (QA)
 **What:** APPROVED the cross-platform standalone-binary redesign (Path C) after running the full QA gate from `transcribe/` (WSL2 Ubuntu, go1.22.2). Gate results: `go build ./...` ✅; `go vet ./...` ✅; `go test ./...` ✅ (all 10 packages ok); `go test -race -count=1 ./...` ✅ race-clean after fixing one **pre-existing** harness data race; `CGO_ENABLED=0` cross-compile smoke **6/6** green across linux/darwin/windows × amd64/arm64 (~10 MB static binaries each); Windows output → ffmpeg DirectShow (not Python) assertion present and passing; console-attach guard proven no-op off-Windows by the linux/darwin cross-compiles; missing-loopback actionable-warning assertion present and strengthened; `transcribe.cmd` launcher present with no "command line tool" message; `windows_helper.go` gone with zero stale Go references; README carries no Python-helper claim.

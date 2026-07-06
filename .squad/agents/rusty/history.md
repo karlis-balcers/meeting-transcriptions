@@ -2,8 +2,8 @@
 
 ## Core Context
 
-- **Project:** A Python meeting transcription application that will be migrated from a Windows GUI to a TUI/CLI experience.
-- **Role:** Python Developer
+- **Project:** A root-level Go meeting transcription CLI/TUI application with Windows WASAPI sidecar validation in progress.
+- **Role:** Go/Core Developer
 - **Joined:** 2026-05-27T15:26:08.956Z
 
 ## Learnings
@@ -28,3 +28,4 @@
 	- `ffmpeg_test.go`: replaced the 3 Python-helper tests with `TestWindowsOutputRecorderUsesFFmpegDirectShow` (asserts `-f dshow` + `audio=<raw output name>`, no `audio_capture.py`) and `TestWindowsOutputRecorderValidationRequiresFFmpegOnly`.
 	- Test-environment gotcha (for future Rusty): a "Validate must fail when ffmpeg missing" assertion is fragile because `Validate` only calls `r.ffmpeg()`, which trusts any non-empty `FFmpegPath` without stat-ing the binary, and `exec.LookPath("ffmpeg")` succeeds on hosts with ffmpeg installed (e.g. WSL where I validate). Don't write that assertion; instead pin behavior via a configured `FFmpegPath`.
 - 2026-07-03: Full validation in WSL2 Ubuntu go1.22.2: `go vet ./internal/audio/...` clean, `go test ./internal/audio/...` all pass, and `go build ./...` is GREEN — Livingston's matching `root.go` call-site removal had already landed, so no struct-field coordination gap remains. Team note dropped at `.squad/decisions/inbox/rusty-audio-unify-ffmpeg.md`.
+- 2026-07-06: Core work now starts from the repo root Go module: `go.mod` is at root, app entrypoints are in `cmd/`, shared logic is in `internal/`, docs are in `docs/`, Windows builds use `build_transcribe_win64.bat`, and outputs land in `build/windows-amd64/`; do not navigate to old `transcribe/` except to recognize stale `transcribe/build/` artifacts.

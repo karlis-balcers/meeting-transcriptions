@@ -2,7 +2,7 @@
 
 ## Core Context
 
-- **Project:** A Python meeting transcription application that will be migrated from a Windows GUI to a TUI/CLI experience.
+- **Project:** A root-level Go meeting transcription CLI/TUI application with Windows WASAPI sidecar validation in progress.
 - **Role:** QA Engineer
 - **Joined:** 2026-05-27T15:26:08.967Z
 
@@ -30,3 +30,4 @@
 - 2026-07-03: `windows_helper.go` is fully deleted; the only `audio_capture.py` / `TRANSCRIBE_WINDOWS_*` references left in `*.go` are the **intentional negative assertions** in `internal/audio/ffmpeg_test.go` (lines 95/102/116) that guard against the helper leaking back — correct by design. Document this so the next grep doesn't flag them.
 - 2026-07-03: Non-blocking note for Karlis — stale leftovers `transcribe/build/windows-amd64/.venv/` and `transcribe/build/windows-amd64/audio_capture.py` are from a previous Python-staging build; the new `build_transcribe_win64.bat` no longer stages them and they vanish on a clean rebuild.
 - 2026-07-06: Recorder-sidecar QA pivot drafted in `transcribe/docs/windows-wasapi-sidecar-test-plan.md`. New Windows acceptance target is stock Windows WASAPI loopback (Audacity-equivalent) on built-in Realtek speakers with no Stereo Mix/VB-CABLE required; OS-specific recording code should stay behind recorder executable/adapters, while WAV/RMS/filter/transcript/OpenAI processing remains OS-independent. Existing DirectShow/Path-C Windows-output tests will need rewrite when Livingston lands the sidecar protocol.
+- 2026-07-06: QA gates now run from the repo root Go module: `go.mod` is at root; app code is under `cmd/` and `internal/`; test plans are under `docs/`; Windows packaging uses `build_transcribe_win64.bat` and emits `build/windows-amd64/`. The old `transcribe/` path is obsolete except stale artifacts under `transcribe/build/` if present.
