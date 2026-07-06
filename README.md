@@ -1,180 +1,218 @@
-# Meeting Transcription Service
+# transcribe
 
-Real-time meeting transcription desktop app with a built-in AI meeting assistant.
+`transcribe` is a focused Go TUI/CLI recorder for meeting transcription. It records a microphone plus a system-output capture device, sends WAV chunks to OpenAI audio transcription, and writes a Markdown transcript.
 
-It captures microphone and system audio, transcribes speech, detects active speakers in Microsoft Teams (Windows), and can generate assistant replies or meeting summaries using OpenAI.
-
-## What it does
-
-- Live transcription from:
-  - Microphone input
-  - System output (WASAPI loopback on Windows)
-- Speaker tracking from Microsoft Teams window metadata (Windows)
-- Tkinter UI with Start/Stop workflow and live status line
-- AI assistant answers to user-entered prompts during meetings
-- Optional internet search for assistant custom prompts (configurable)
-- Optional auto-summary generation when transcription stops
-- Transcript filtering to suppress common artifacts/hallucinations
-- Markdown output for transcripts and summaries
-
-## Current UI behavior
-
-- `Start` begins a **fully new transcription session**:
-  - clears in-memory transcript view
-  - creates a fresh transcript file
-  - resets pending queues/buffers
-- `Stop` ends active transcription.
-- There is **no "Reset Log" button** (Start already resets).
-- There is **no "Generate Summary" button** in the main window.
-  - Summaries are generated through auto-summary flow if enabled.
-
-## Architecture at a glance
-
-- `transcribe.py` - app orchestration, UI lifecycle, settings dialog, thread startup/shutdown
-- `assistant.py` - assistant messaging, OpenAI Responses API calls, retries/backoff
-- `openai_transcribe.py` - OpenAI transcription integration with retry handling
-- `audio_capture.py` - audio stream capture and segmentation helpers
-- `speaker_detection.py` - Teams speaker/title detection (Windows)
-- `transcript_store.py` - thread-safe transcript storage + persistence
-- `transcript_filter.py` - configurable filtering logic
-- `ui.py` - transcript rendering + status color helpers
-- `summary_utils.py` - summary title filename sanitization
-- `env_utils.py` - reusable env parsing helpers
+This is intentionally not a port of the old assistant/summarizer stack: no summaries, no assistant panels, no vector stores, no agents, and no local Whisper.
 
 ## Requirements
 
-- Python `3.11+`
-- Poetry
-- Windows recommended for full feature set:
-  - WASAPI loopback capture
-  - Teams speaker detection via `pywinauto`
+- Go 1.22+
+- `ffmpeg` available on `PATH`
+- `OPENAI_API_KEY` set in the environment
+- A selectable microphone device
+- A selectable system-output/loopback capture device
+- Windows: `ffmpeg` on PATH for microphone/DirectShow fallback capture, plus the bundled `wasapi-loopback-recorder.exe` sidecar beside `transcribe.exe` for built-in speaker/headphone capture via WASAPI loopback. DirectShow loopback tools such as Stereo Mix, VB-CABLE, Voicemeeter, or `virtual-audio-capturer` remain optional fallback/diagnostic devices.
 
-On Linux/macOS, transcription works with reduced feature set (no Teams speaker integration).
+The OpenAI API key is never read from or written to the YAML config file.
 
-## Installation
+## Build
 
-1. Clone repository and enter project folder.
-2. Run first-time setup script for your OS:
-   - Windows: `first_time_install_win.bat`
-   - Linux: `first_time_install_linux.sh`
-   - macOS: `first_time_install_mac.sh`
-3. Create `.env` from `env.sample` and fill required values.
+From this directory:
+
+```sh
+go test ./...
+go build -o transcribe ./cmd/transcribe
+```
+
+Cross-compile smoke checks:
+
+```sh
+GOOS=linux GOARCH=amd64 go build -o /tmp/transcribe-linux-amd64 ./cmd/transcribe
+GOOS=linux GOARCH=arm64 go build -o /tmp/transcribe-linux-arm64 ./cmd/transcribe
+GOOS=darwin GOARCH=amd64 go build -o /tmp/transcribe-darwin-amd64 ./cmd/transcribe
+GOOS=darwin GOARCH=arm64 go build -o /tmp/transcribe-darwin-arm64 ./cmd/transcribe
+GOOS=windows GOARCH=amd64 go build -o /tmp/transcribe-windows-amd64.exe ./cmd/transcribe
+GOOS=windows GOARCH=arm64 go build -o /tmp/transcribe-windows-arm64.exe ./cmd/transcribe
+```
+
+On Windows, `build_transcribe_win64.bat` cross-compiles the pure-Go main binary via WSL, builds the `wasapi-loopback-recorder.exe` sidecar helper, and emits a `transcribe.cmd` launcher beside `transcribe.exe` that keeps a persistent `cmd.exe` attached so the Bubble Tea TUI has a real TTY when launched by double-click.
+
+## Configuration
+
+Default config path:
+
+```text
+~/.transcribe/config.yaml
+```
+
+Use `--config <path>` to override it for tests or alternate profiles.
+
+Example:
+
+```yaml
+user_name: "You"
+language: "en"
+keywords:
+  - "Paymentology"
+  - "Banking.Live"
+
+openai:
+  model: "gpt-4o-mini-transcribe"
+  timeout: "60s"
+  max_retries: 3
+  retry_base: "1s"
+  retry_max_interval: "8s"
+
+audio:
+  mic_device_id: ""
+  mic_device_name: ""
+  output_device_id: "alsa_output.pci-0000_00_1f.3.analog-stereo.monitor"
+  output_device_name: ""
+  capture_chunk_duration: "2s"
+  frame_duration_ms: 100
+  silence_threshold: 50
+  silence_duration: "1s"
+  max_segment_duration: "300s"
+
+paths:
+  output_dir: ""
+  temp_dir: ""
+
+teams:
+  enabled: true
+
+tui:
+  show_loudness_meters: true
+
+filter:
+  min_chars: 2
+  exact: ["LAMPA", "MEMMEE"]
+  prefixes: ["[Music]", "(Music)", "♪"]
+  contains: ["thank you for watching"]
+  regex: []
+```
+
+If `paths.output_dir` is empty, transcripts are written to the current working directory. `--output-dir <dir>` overrides it for one run.
+
+## Environment
+
+Required:
+
+```sh
+export OPENAI_API_KEY="<your key>"
+```
+
+Optional compatibility environment variables are also accepted for non-secret settings, including `YOUR_NAME`, `LANGUAGE`, `KEYWORDS`, `OPENAI_MODEL_FOR_TRANSCRIPT`, `OUTPUT_DIR`, `TEMP_DIR`, `CAPTURE_CHUNK_DURATION`, `FRAME_DURATION_MS`, `SILENCE_THRESHOLD`, `SILENCE_DURATION`, `RECORD_SECONDS`, and transcription retry settings.
+
+Config file values override those compatibility environment values. CLI flags override both.
 
 ## Running
 
-- Windows: `run_transcribe_win.bat`
-- Linux: `run_transcribe_linux.sh`
-- macOS: `run_transcribe_mac.sh`
+Start immediately with the TUI:
 
-## Configuration (`.env`)
+```sh
+./transcribe
+```
 
-Use `env.sample` as the source of truth. Important settings:
+Enable runtime logs in the current directory:
 
-### Required
+```sh
+./transcribe --logging 1
+```
 
-- `OPENAI_API_KEY` - required for OpenAI transcription and assistant features
+When enabled, the app writes `transcribe.log` beside the directory you launched it from and records device selection, chunk capture, and transcription progress there.
 
-### Identity and language
+List detected devices:
 
-- `YOUR_NAME` - your speaker label in transcript
-- `LANGUAGE` - transcription language code(s):
-  - single code: `en`
-  - comma-separated list: `en,no,lv`
-  - when multiple codes are configured, manual `Start` prompts you to pick one language for that recording session
-  - with `AUTO_START_TRANSCRIPTION=True`, the app uses the first configured language automatically (no prompt)
+```sh
+./transcribe --list-devices
+```
 
-### Session behavior
+Override devices for one run:
 
-- `AUTO_START_TRANSCRIPTION` - auto-start on app launch
-- `AUTO_SUMMARIZE_ON_STOP` - generate summary when stopping transcription
+```sh
+./transcribe --mic default --output alsa_output.pci-0000_00_1f.3.analog-stereo.monitor
+```
 
-### Assistant behavior
+On Windows, prefer a concrete device shown by `--list-devices` instead of `default`. DirectShow device IDs may be long `@device_...` alternative names; those are safe to paste into `--mic`, `--output`, `audio.mic_device_id`, or `audio.output_device_id`.
 
-- `OPENAI_MODEL_FOR_ASSISTANT` - assistant model (default in sample: `gpt-5.2`)
-- `OPENAI_VECTOR_STORE_ID_FOR_ANSWERS` - optional file search source
-- `ASSISTANT_ENABLE_WEB_SEARCH_FOR_CUSTOM_PROMPTS` - enable/disable internet search tool for user-entered prompts
+## TUI shortcuts
 
-### Transcription behavior
+- `P` pause
+- `R` resume
+- `M` mute microphone
+- `U` unmute microphone
+- `S` settings
+- In settings: `M` choose microphone, `O` choose output capture device
+- Device list: `↑`/`↓` or `k`/`j`, `Enter` selects, `Esc` backs out
+- `Q` or `Ctrl+C` quits safely
 
-- `OPENAI_MODEL_FOR_TRANSCRIPT` - OpenAI transcription model
-- `KEYWORDS` - domain keywords to improve recognition quality
+The TUI shows selected devices, current status/error, session timer, transcript viewport, degraded warnings, and horizontal loudness meters.
 
-### Audio segmentation
+After choosing a device in the picker and pressing `Enter`, the TUI returns to the settings screen and shows the updated mic/output selection summary.
 
-- `RECORD_SECONDS`
-- `SILENCE_THRESHOLD`
-- `SILENCE_DURATION`
-- `FRAME_DURATION_MS`
+Runtime controls are applied between short external-recorder chunks and also cancel the active recorder context when possible. `capture_chunk_duration` controls that responsiveness for the ffmpeg backend and is capped by `max_segment_duration`; the default is `2s` so pause, mute, and device changes do not wait for a long transcription segment. Loudness meters are computed from captured WAV/PCM chunks by parsing sample RMS levels, so unsupported or malformed chunks show a warning rather than fake meter data.
 
-### Output paths
+## Silent mode
 
-- `OUTPUT_DIR` - transcript markdown output directory
-- `TEMP_DIR` - temporary WAV chunk directory (default `tmp`)
-- `SUMMARIES_DIR` - summary markdown output directory
+Silent mode disables the TUI and records until interrupted:
 
-### Reliability and logging
+```sh
+./transcribe --silent > transcript.txt
+```
 
-- `ASSISTANT_API_*` timeout/retry settings
-- `TRANSCRIBE_API_*` timeout/retry settings
-- `LOG_LEVEL`, `LOG_FILE_MAX_MB`, `LOG_FILE_BACKUP_COUNT`
+Contract:
 
-### Filtering
+- final complete transcript goes to stdout only after interrupt and drain
+- status, selected devices, warnings, and errors go to stderr
+- no ANSI UI, progress, logs, or diagnostics are written to stdout
+- Markdown transcript files are still written
 
-- `TRANSCRIPT_FILTER_MIN_CHARS`
-- Optional extension lists: `TRANSCRIPT_FILTER_EXACT`, `TRANSCRIPT_FILTER_PREFIXES`, `TRANSCRIPT_FILTER_CONTAINS`, `TRANSCRIPT_FILTER_REGEX`
+## OS audio notes
 
-## Settings window
+### Linux
 
-The app settings dialog allows runtime updates and persists them to `.env`:
+Device discovery parses `pactl info` and `pactl list short sources` when PulseAudio/PipeWire is available. System output capture expects a monitor source such as:
 
-- Auto-start transcription
-- Transcription language(s) (single code or comma-separated list)
-- Auto-summarize on stop
-- Enable internet search for assistant custom prompts
-- Transcriptions folder
-- Summaries folder
+```text
+alsa_output.<device>.monitor
+```
 
-## Output files
+If no monitor source exists, create/enable one in your audio stack or set `audio.output_device_id` to a valid ffmpeg/Pulse input.
 
-- Transcriptions are written as Markdown:
-  - `output/transcription-YYYYMMDD_HHMMSS.md` (or custom `OUTPUT_DIR`)
-- Summaries are written as Markdown:
-  - `output_summaries/YYYYMMDD_HHMMSS_<ai_title>.md` (or custom `SUMMARIES_DIR`)
-- Temporary `.wav` files are written to `tmp/` (or custom `TEMP_DIR`) and cleaned up.
+The numeric index column from `pactl list short sources` is preserved as a selectable alias, so `--mic`, `--output`, `AUDIO_INPUT_DEVICE_INDEX`, and `AUDIO_OUTPUT_DEVICE_INDEX` can target the exact listed row in multi-device setups.
 
-## Development and testing
+### Windows
 
-Run tests locally:
+The main app is pure Go and cross-compiles. Mic capture still uses an ffmpeg external recorder with DirectShow device names from:
 
-- `python -m unittest discover -s tests -p "test_*.py"`
+```sh
+ffmpeg -hide_banner -list_devices true -f dshow -i dummy
+```
 
-CI:
+`transcribe --list-devices` parses that output, shows all DirectShow audio capture devices as microphone candidates, and includes DirectShow `Alternative name` values as selectable IDs/aliases. A configured `default` or old synthetic placeholder is resolved to a concrete enumerated DirectShow audio device before capture; the app should not start ffmpeg with `audio=default` unless DirectShow actually listed a device with that exact name.
 
-- GitHub Actions workflow at `.github/workflows/tests.yml`
-- Runs unit tests on Python `3.11` and `3.12`
+DirectShow does not reliably label which audio capture devices are system-output loopbacks. The output-device settings therefore surface concrete DirectShow loopback/virtual devices such as `Stereo Mix`, `virtual-audio-capturer`, VB-CABLE, Voicemeeter, BlackHole, or Soundflower when present, and also supplement normal Windows render endpoints from PowerShell as `wasapi-loopback` output candidates.
 
-## Troubleshooting
+Windows render endpoints discovered from `Get-PnpDevice -Class AudioEndpoint` are labeled with the `wasapi-loopback` backend and routed through the bundled sidecar protocol, keeping Windows-specific recording concerns out of the main TUI/CLI. The helper is a pure-Go, no-cgo Windows executable that uses WASAPI loopback through COM, captures the endpoint's native mix format, downmixes/resamples to PCM16 16 kHz mono, and writes a normal WAV chunk for the shared RMS/OpenAI path. This is the stock Windows path for built-in speakers/headphones, equivalent in intent to Audacity's Windows WASAPI loopback recording mode.
 
-- No audio captured:
-  - verify input/output devices and OS audio permissions
-- Teams speaker name not detected:
-  - feature is Windows-only and depends on Teams window state/title patterns
-- API failures/timeouts:
-  - verify `OPENAI_API_KEY`
-  - tune retry/timeout env variables
-- Empty/low-value transcript fragments:
-  - tune filter settings and `KEYWORDS`
+DirectShow fallback output capture remains available when a real capture-able loopback source exists: enable **Stereo Mix** in the Windows audio control panel, or install a virtual loopback device such as **VB-CABLE**, **Voicemeeter**, or `virtual-audio-capturer`. These are fallback/remediation tools if the WASAPI sidecar is missing or a specific endpoint cannot be captured, not the primary stock-Windows requirement.
 
-## Security notes
+If system audio capture fails or records the wrong source, run `transcribe --list-devices` and choose a displayed `wasapi-loopback` render endpoint such as `Speakers (...) [Loopback]` or `Headphones (...) [Loopback]` for `audio.output_device_id` or `--output`. For helper diagnostics, `wasapi-loopback-recorder.exe list --json` lists active WASAPI render endpoints and marks the current default endpoint. If the bundled helper is missing, set `TRANSCRIBE_WINDOWS_WASAPI_HELPER` to its path or rebuild the Windows package.
 
-- Do not commit `.env`
-- Keep API keys in environment variables only
-- Review transcript and summary storage locations for sensitive meeting data
+MS Teams speaker recognition is best-effort on Windows via PowerShell process/window-title polling. It avoids native UI Automation/cgo for cross-compilation safety, updates output speaker labels when a recognizable Teams title is found, and otherwise falls back to `Person_?` with a warning.
 
-## Project status notes
+### macOS
 
-- This project currently does not include a `LICENSE` file in the repository.
+Microphone capture uses an AVFoundation-style default. System output capture requires a virtual loopback device such as BlackHole/Soundflower or a future native ScreenCaptureKit/CoreAudio helper. Configure `audio.output_device_id` to the ffmpeg AVFoundation input for that virtual device.
 
----
+MS Teams speaker recognition is not available on macOS and falls back to `Person_?`.
 
-If you are actively iterating on features, keep `env.sample` and `README.md` updated together to avoid config drift.
+## Limitations
+
+- Chunking is short bounded-duration for the external ffmpeg backend; config keeps frame/silence fields for the future native segmenter.
+- Windows WASAPI render-device capture is implemented in the bundled sidecar helper; unusual endpoint formats/devices may still need manual validation on real hardware.
+- Other system-output capture depends on OS audio setup and `ffmpeg` support.
+- Windows Teams speaker detection is best-effort title probing, not full UI Automation.
+- OpenAI transcription is the only transcription provider.
+- No summaries, assistant, vector store, agents, or local Whisper are included.
