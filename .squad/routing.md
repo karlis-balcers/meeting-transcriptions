@@ -6,13 +6,15 @@ How to decide who handles what.
 
 | Work Type | Route To | Examples |
 |-----------|----------|----------|
-| {domain 1} | {Name} | {example tasks} |
-| {domain 2} | {Name} | {example tasks} |
-| {domain 3} | {Name} | {example tasks} |
-| Code review | {Name} | Review PRs, check quality, suggest improvements |
-| Testing | {Name} | Write tests, find edge cases, verify fixes |
-| Scope & priorities | {Name} | What to build next, trade-offs, decisions |
+| Migration / architecture strategy | Danny | Root Go architecture, module/root layout, recorder strategy, team-relevant decisions |
+| Go core / audio / session logic | Rusty | `internal/audio`, `internal/app`, transcript/filter behavior, recorder dispatch, session lifecycle |
+| CLI / TUI / platform / build | Livingston | `cmd/transcribe`, `cmd/wasapi-loopback-recorder`, `internal/cli`, `internal/tui`, Windows launcher/build packaging |
+| QA / regression validation | Basher | Root `go test ./...`, `go vet ./...`, builds, cross-platform smoke, Windows WASAPI sidecar validation |
+| Code review | Danny | Review architecture, route domain details to Rusty/Livingston/Basher as needed |
+| Testing | Basher | Write tests, find edge cases, verify fixes |
+| Scope & priorities | Danny | What to build next, trade-offs, decisions |
 | Session logging | Scribe | Automatic — never needs routing |
+| Work monitoring | Ralph | Monitor long-running work, stale handoffs, and coordination gaps |
 
 ## Issue Routing
 
@@ -42,8 +44,10 @@ How to decide who handles what.
 
 | Work Type | Primary | Secondary |
 |-----------|---------|----------|
-| migration strategy ownership | Danny | — |
-| threading and core logic | Rusty | — |
-| CLI and TUI architecture | Livingston | — |
-| regression and workflow tests | Basher | — |
+| root Go migration / architecture strategy ownership | Danny | — |
+| Go core, audio, and session logic | Rusty | Livingston |
+| CLI, TUI, platform, and build packaging | Livingston | Rusty |
+| regression, workflow, and release validation | Basher | Danny |
+| session logging | Scribe | — |
+| work monitoring | Ralph | — |
 
