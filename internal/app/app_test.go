@@ -156,8 +156,7 @@ func TestOutputCaptureFallsBackToNextDeviceAndKeepsMicRecording(t *testing.T) {
 	cfg.UserName = "You"
 	cfg.Paths.OutputDir = t.TempDir()
 	cfg.Paths.TempDir = t.TempDir()
-	cfg.Audio.CaptureChunkDuration = config.NewDuration(50 * time.Millisecond)
-	cfg.Audio.MaxSegmentDuration = config.NewDuration(200 * time.Millisecond)
+	segmenterFlushConfig(&cfg, 50*time.Millisecond)
 	cfg.Audio.MicDeviceID = "mic-1"
 	cfg.Audio.MicDeviceName = "QA Mic"
 	cfg.Audio.OutputDeviceID = "out-a"
@@ -244,8 +243,7 @@ func TestOutputCaptureFailureStopsSessionInsteadOfMicOnlyFallback(t *testing.T) 
 	cfg.UserName = "You"
 	cfg.Paths.OutputDir = t.TempDir()
 	cfg.Paths.TempDir = t.TempDir()
-	cfg.Audio.CaptureChunkDuration = config.NewDuration(20 * time.Millisecond)
-	cfg.Audio.MaxSegmentDuration = config.NewDuration(200 * time.Millisecond)
+	segmenterFlushConfig(&cfg, 50*time.Millisecond)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -316,8 +314,7 @@ func TestSynthesizedRenderEndpointFailureDisablesOutputAndKeepsMicRecording(t *t
 	cfg.UserName = "You"
 	cfg.Paths.OutputDir = t.TempDir()
 	cfg.Paths.TempDir = t.TempDir()
-	cfg.Audio.CaptureChunkDuration = config.NewDuration(20 * time.Millisecond)
-	cfg.Audio.MaxSegmentDuration = config.NewDuration(200 * time.Millisecond)
+	segmenterFlushConfig(&cfg, 50*time.Millisecond)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -409,7 +406,7 @@ func TestFilteredChunkIsLoggedAndNotStored(t *testing.T) {
 	cfg.UserName = "You"
 	cfg.Paths.OutputDir = t.TempDir()
 	cfg.Paths.TempDir = t.TempDir()
-	cfg.Audio.CaptureChunkDuration = config.NewDuration(50 * time.Millisecond)
+	segmenterFlushConfig(&cfg, 50*time.Millisecond)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -459,7 +456,7 @@ func TestRunSilentWritesOnlyFinalTranscriptToStdout(t *testing.T) {
 	cfg.UserName = "You"
 	cfg.Paths.OutputDir = t.TempDir()
 	cfg.Paths.TempDir = t.TempDir()
-	cfg.Audio.MaxSegmentDuration = config.NewDuration(50 * time.Millisecond)
+	segmenterFlushConfig(&cfg, 50*time.Millisecond)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -547,7 +544,7 @@ func (r *oneChunkPerSourceRecorder) RecordChunk(ctx context.Context, request aud
 		return audio.Chunk{}, err
 	}
 	filePath := filepath.Join(request.TempDir, fmt.Sprintf("%s-%d.wav", request.Source, seen))
-	if err := os.WriteFile(filePath, testPCM16WAV([]int16{0, 1000, -1000, 0}), 0o600); err != nil {
+	if err := writeLoudWAV(filePath, int(request.Duration.Milliseconds())); err != nil {
 		return audio.Chunk{}, err
 	}
 	started := r.base
@@ -665,7 +662,7 @@ func (r *fallbackRecorder) RecordChunk(ctx context.Context, request audio.ChunkR
 		return audio.Chunk{}, err
 	}
 	filePath := filepath.Join(request.TempDir, fmt.Sprintf("transcribe-%s-%s-%d.wav", request.Source, request.Device.ID, attempt+1))
-	if err := os.WriteFile(filePath, testPCM16WAV([]int16{0, 1000, -1000, 0}), 0o600); err != nil {
+	if err := writeLoudWAV(filePath, int(request.Duration.Milliseconds())); err != nil {
 		return audio.Chunk{}, err
 	}
 	started := r.base
@@ -729,7 +726,7 @@ func (r *outputFailureRecorder) RecordChunk(ctx context.Context, request audio.C
 		return audio.Chunk{}, err
 	}
 	filePath := filepath.Join(request.TempDir, fmt.Sprintf("mic-%d.wav", count))
-	if err := os.WriteFile(filePath, testPCM16WAV([]int16{0, 1000, -1000, 0}), 0o600); err != nil {
+	if err := writeLoudWAV(filePath, int(request.Duration.Milliseconds())); err != nil {
 		return audio.Chunk{}, err
 	}
 	started := time.Now()
@@ -877,4 +874,63 @@ func testPCM16WAV(samples []int16) []byte {
 	_ = binary.Write(&wav, binary.LittleEndian, dataSize)
 	wav.Write(data.Bytes())
 	return wav.Bytes()
+}
+
+// loudTestWAV writes a PCM16 16kHz mono WAV to dest whose contents are full-
+// amplitude alternating samples for roughly durationMs milliseconds. It is the
+// realistic-speech fixture used by recorders in session-level tests so the
+// segmenter's energy detector actually recognizes the frame as speech (the old
+// 4-sample fixtures were shorter than one analysis frame and got discarded by
+// the silence gate). The caller owns cleanup of the returned path.
+func loudTestWAV(t *testing.T, dest string, durationMs int) {
+	t.Helper()
+	if err := writeLoudWAV(dest, durationMs); err != nil {
+		t.Fatalf("write loud WAV: %v", err)
+	}
+}
+
+// writeLoudWAV is the non-test helper recorders use (they don't carry a
+// *testing.T). It writes the same realistic-speech fixture and returns an
+// error the recorder surfaces to the session.
+func writeLoudWAV(dest string, durationMs int) error {
+	if durationMs <= 0 {
+		durationMs = 150
+	}
+	sampleCount := 16000 * durationMs / 1000
+	samples := make([]int16, sampleCount)
+	for i := range samples {
+		if i%2 == 0 {
+			samples[i] = 32767
+		} else {
+			samples[i] = -32767
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(dest), 0o700); err != nil {
+		return err
+	}
+	out, err := os.OpenFile(dest, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	return audio.WritePCM16WAV(out, samples, audio.ConcatSampleRateHz())
+}
+
+// segmenterFlushConfig returns the audio config tweaks a test needs so a single
+// recorded loud chunk is immediately flushed by the segmenter (rather than held
+// forever waiting for trailing silence). Tests set CaptureChunkDuration /
+// MaxSegmentDuration / FrameDurationMS to these values when they want the legacy
+// "one chunk == one transcription" timing without waiting for real silence.
+func segmenterFlushConfig(cfg *config.Config, captureChunkDuration time.Duration) {
+	cfg.Audio.CaptureChunkDuration = config.NewDuration(captureChunkDuration)
+	// Small analysis frames so even short capture chunks yield at least one
+	// complete frame; must be <= CaptureChunkDuration.
+	cfg.Audio.FrameDurationMS = 20
+	// The capture duration is capped by MaxSegmentDuration, so make the cap
+	// exactly one complete analysis frame. The resulting request is 20 ms and
+	// the first loud frame reaches the cap deterministically.
+	cfg.Audio.MaxSegmentDuration = config.NewDuration(20 * time.Millisecond)
+	// Disable the trailing-silence rule in tests; we flush via max-duration.
+	cfg.Audio.SilenceDuration = config.NewDuration(time.Hour)
+	cfg.Audio.SilenceThreshold = 0.02
 }

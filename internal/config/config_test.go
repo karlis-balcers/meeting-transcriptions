@@ -70,6 +70,12 @@ func TestLoadMissingDefaultUsesDefaults(t *testing.T) {
 	if cfg.UserName != "You" || cfg.Language != "en" {
 		t.Fatalf("unexpected defaults: %+v", cfg)
 	}
+	if cfg.Audio.SilenceDuration.Duration != 2*time.Second {
+		t.Fatalf("expected two-second silence default, got %s", cfg.Audio.SilenceDuration.Duration)
+	}
+	if cfg.Audio.MaxSegmentDuration.Duration != 15*time.Minute {
+		t.Fatalf("expected fifteen-minute segment default, got %s", cfg.Audio.MaxSegmentDuration.Duration)
+	}
 	if src.Found || src.Path != missing || src.Explicit {
 		t.Fatalf("default-path miss should not report found, got %+v", src)
 	}
