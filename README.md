@@ -86,8 +86,8 @@ audio:
   capture_chunk_duration: "2s"
   frame_duration_ms: 100
   silence_threshold: 50
-  silence_duration: "1s"
-  max_segment_duration: "300s"
+  silence_duration: "2s"
+  max_segment_duration: "15m"
 
 paths:
   output_dir: ""
@@ -120,6 +120,16 @@ export OPENAI_API_KEY="<your key>"
 Optional compatibility environment variables are also accepted for non-secret settings, including `YOUR_NAME`, `LANGUAGE`, `KEYWORDS`, `OPENAI_MODEL_FOR_TRANSCRIPT`, `OUTPUT_DIR`, `TEMP_DIR`, `CAPTURE_CHUNK_DURATION`, `FRAME_DURATION_MS`, `SILENCE_THRESHOLD`, `SILENCE_DURATION`, `RECORD_SECONDS`, and transcription retry settings.
 
 Config file values override those compatibility environment values. CLI flags override both.
+
+Capture is silence-gated. Each source is analyzed in PCM16 RMS frames: leading
+silent chunks are discarded and are never uploaded to OpenAI, while speech and
+following audio are accumulated into one WAV. A segment is finalized after two
+seconds of trailing silence, when the detected speaker changes, or when the
+accumulated audio reaches the fifteen-minute maximum. The default
+`silence_threshold: 50` preserves the legacy signed-16-bit amplitude scale;
+values from `0` through `1` can instead be supplied as normalized RMS values.
+The trailing silence that triggers a split remains in the finalized segment,
+but silent-only segments are not sent for transcription.
 
 ## Running
 
@@ -225,7 +235,7 @@ MS Teams speaker recognition is not available on macOS and falls back to `Person
 
 ## Limitations
 
-- Chunking is short bounded-duration for the external ffmpeg backend; config keeps frame/silence fields for the future native segmenter.
+- The external ffmpeg backend records short bounded-duration chunks, which the per-source segmenter combines into speech-oriented segments before transcription.
 - Windows WASAPI render-device capture is implemented in the bundled sidecar helper; unusual endpoint formats/devices may still need manual validation on real hardware.
 - Other system-output capture depends on OS audio setup and `ffmpeg` support.
 - Windows Teams speaker detection is best-effort title probing, not full UI Automation.

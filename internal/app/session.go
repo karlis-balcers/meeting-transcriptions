@@ -75,6 +75,12 @@ type Session struct {
 	micCaptureCancel    *captureCancel
 	outputCaptureCancel *captureCancel
 
+	micSegmenter    *Segmenter
+	outputSegmenter *Segmenter
+
+	lastMicSpeaker    string
+	lastOutputSpeaker string
+
 	sequence atomic.Uint64
 }
 
@@ -104,10 +110,64 @@ func NewSession(prepared *Prepared) (*Session, error) {
 		selection: prepared.Selection,
 		cfg:       prepared.Config,
 	}
+	session.micSegmenter = NewSegmenter(segmenterConfig(prepared.Config, audio.SourceMic, prepared.TempDir))
+	session.outputSegmenter = NewSegmenter(segmenterConfig(prepared.Config, audio.SourceOutput, prepared.TempDir))
 	for _, warning := range filterWarnings {
 		session.emit(Event{Kind: EventWarning, Message: warning})
 	}
 	return session, nil
+}
+
+// segmenterConfig builds the per-source silence-gating configuration from the
+// app config. The recorder writes PCM16 mono 16kHz WAVs, so the segmenter's
+// sample-rate / channel constants must match those exactly. Legacy int16
+// silence_threshold values are scaled into the normalized [0, 1]
+// RMS domain so an RMS-based detector speaks the same language as the old
+// Python amplitude check. Values already in [0, 1] are treated as normalized
+// RMS thresholds.
+func segmenterConfig(cfg config.Config, source audio.Source, tempDir string) SegmentConfig {
+	return SegmentConfig{
+		Source:             source,
+		TempDir:            tempDir,
+		FrameDurationMS:    cfg.Audio.FrameDurationMS,
+		SampleRateHz:       audio.ConcatSampleRateHz(),
+		Channels:           audio.ConcatChannels(),
+		SilenceThreshold:   normalizeSilenceThreshold(cfg.Audio.SilenceThreshold),
+		SilenceDuration:    cfg.Audio.SilenceDuration.Duration,
+		MinSegmentDuration: minSegmentDurationFor(cfg, source),
+		MaxSegmentDuration: cfg.Audio.MaxSegmentDuration.Duration,
+	}
+}
+
+// normalizeSilenceThreshold maps the legacy signed-int16 amplitude scalar
+// into the normalized [0, 1] RMS domain used by FramesWithEnergy. Values
+// already in [0, 1] (e.g. a YAML author writes `0.02` directly) pass through
+// unchanged so operators can tune the detector with a precise RMS target if
+// they prefer.
+func normalizeSilenceThreshold(raw float64) float64 {
+	switch {
+	case raw <= 0:
+		// A small non-zero default so a literal 0 still gates near-silence;
+		// absolute digital zero is rarely useful.
+		return 0.01
+	case raw <= 1:
+		return raw
+	default:
+		return raw / 32768.0
+	}
+}
+
+// minSegmentDurationFor returns the minimum amount of speech a segment must
+// accumulate before a trailing silence is allowed to end it. The frame
+// duration bounds it so we never wait an entire segment for a single frame of
+// audio; everything else comes from the configured capture chunk duration,
+// which the recorder emits as one analysis window.
+func minSegmentDurationFor(cfg config.Config, source audio.Source) time.Duration {
+	frame := time.Duration(cfg.Audio.FrameDurationMS) * time.Millisecond
+	if frame <= 0 {
+		frame = 100 * time.Millisecond
+	}
+	return frame
 }
 
 func (s *Session) Start(ctx context.Context) error {
@@ -308,6 +368,11 @@ func (s *Session) captureLoops() {
 
 func (s *Session) sourceLoop(sourceWG *sync.WaitGroup, source audio.Source) {
 	defer sourceWG.Done()
+	// When the source loop exits (session stop, fatal capture error), flush any
+	// speech the segmenter is still holding so the final partial utterance is
+	// transcribed rather than stranded. Only this goroutine mutates the
+	// segmenter, so the deferred flush is race-free.
+	defer s.flushPendingSegment(source)
 	for {
 		select {
 		case <-s.ctx.Done():
@@ -316,6 +381,10 @@ func (s *Session) sourceLoop(sourceWG *sync.WaitGroup, source audio.Source) {
 		}
 		skip, device, speakerName := s.captureState(source)
 		if skip {
+			// A pause, mute, device restart, or disabled output source is a
+			// segment boundary. Flush here, inside the source loop that owns
+			// the segmenter, rather than mutating it from the control method.
+			s.flushPendingSegment(source)
 			if !s.waitForControlOrStop() {
 				return
 			}
@@ -382,13 +451,207 @@ func (s *Session) sourceLoop(sourceWG *sync.WaitGroup, source audio.Source) {
 		} else {
 			s.emitLoudness(source, level)
 		}
-		select {
-		case <-s.ctx.Done():
+		// Hand the raw frame to the per-source segmenter. It either discards
+		// silence, holds the frame, or signals that enough speech has
+		// accumulated (silence after speech, max segment length) to flush a
+		// single transcription-ready WAV. Speaker changes are handled here too:
+		// any pending speech under the previous speaker is flushed first so the
+		// new speaker's audio is not mis-attributed.
+		segmenter := s.segmenterFor(source)
+		if segmenter == nil {
+			// Defensive: should never happen; degrade to the legacy per-frame
+			// behavior so audio still reaches the transcriber.
+			logging.Printf("%s segmenter missing; falling back to direct transcription", source)
+			s.sendChunk(chunk)
+			continue
+		}
+		segmentStart := chunk.Started
+		if segmentStart.IsZero() {
+			segmentStart = started
+		}
+		segmentEnd := chunk.Ended
+		if segmentEnd.IsZero() {
+			segmentEnd = s.prepared.Dependencies.Clock()
+		}
+
+		// Speaker change: flush whatever we have under the previous speaker
+		// before accumulating the new frame.
+		if chunk.Speaker != "" {
+			if prev, ok := s.lastSpeakerFor(source); ok && prev != chunk.Speaker && segmenter.HasPending() {
+				if segment, flushed, flushErr := segmenter.Flush(segmentStart, prev); flushErr != nil {
+					logging.Printf("%s segmenter flush on speaker change failed: %v", source, flushErr)
+					s.emit(Event{Kind: EventWarning, Message: fmt.Sprintf("could not finalize %s segment on speaker change: %v", source, flushErr)})
+				} else if flushed {
+					logging.Printf("%s segment flushed for speaker change %q -> %q: %s", source, prev, chunk.Speaker, segment.FilePath)
+					s.sendSegmentChunk(segment, source, chunk.Device, seq)
+				}
+			}
+			s.setLastSpeakerFor(source, chunk.Speaker)
+		}
+
+		loud, energy, loudErr := segmenter.IsLoud(chunk.FilePath)
+		if loudErr != nil {
+			logging.Printf("%s loudness analysis failed: %v", source, loudErr)
 			_ = os.Remove(chunk.FilePath)
-			return
-		case s.chunks <- chunk:
+			continue
+		}
+		decision := segmenter.Accumulate(chunk.FilePath, loud, energy, func() time.Time { return segmentStart })
+		if decision.Discarded {
+			logging.Printf("%s frame discarded (silent, no speech started): %s", source, chunk.FilePath)
+			continue
+		}
+		if decision.Flush {
+			speaker := chunk.Speaker
+			if segment, flushed, flushErr := segmenter.Flush(segmentEnd, speaker); flushErr != nil {
+				logging.Printf("%s segmenter flush failed: %v", source, flushErr)
+				s.emit(Event{Kind: EventWarning, Message: fmt.Sprintf("could not finalize %s segment: %v", source, flushErr)})
+			} else if flushed {
+				logging.Printf("%s segment flushed (%s): %s", source, decision.Reason, segment.FilePath)
+				s.sendSegmentChunk(segment, source, chunk.Device, seq)
+			}
+		} else {
+			logging.Printf("%s frame held (%s, speech=%s trailing-silence=%s)", source, decision.Reason, decision.ElapsedSpeech, decision.TrailingSilent)
 		}
 	}
+}
+
+// segmenterFor returns the per-source Segmenter that accumulates recorded
+// frames into silence-gated segments, or nil if the source has no segmenter.
+func (s *Session) segmenterFor(source audio.Source) *Segmenter {
+	switch source {
+	case audio.SourceMic:
+		return s.micSegmenter
+	case audio.SourceOutput:
+		return s.outputSegmenter
+	default:
+		return nil
+	}
+}
+
+// sendChunk enqueues a captured frame/segment WAV for transcription, honoring
+// the stop context. It is the legacy direct-send path used when the segmenter
+// is not configured (defensive) and remains the chokepoint all flushes funnel
+// through as sendSegmentChunk.
+func (s *Session) sendChunk(chunk audio.Chunk) {
+	select {
+	case <-s.ctx.Done():
+		_ = os.Remove(chunk.FilePath)
+	case s.chunks <- chunk:
+	}
+}
+
+// sendFinalChunk enqueues a finalized segment even after capture has been
+// canceled. Capture cancellation happens before chunks is closed, while the
+// transcription loop remains alive until it drains that channel. Checking the
+// transcription context prevents a shutdown timeout from leaving a source
+// goroutine blocked forever after the consumer has been canceled.
+func (s *Session) sendFinalChunk(chunk audio.Chunk) {
+	if s.transcribeCtx == nil {
+		_ = os.Remove(chunk.FilePath)
+		return
+	}
+	select {
+	case s.chunks <- chunk:
+	case <-s.transcribeCtx.Done():
+		_ = os.Remove(chunk.FilePath)
+	}
+}
+
+// sendSegmentChunk wraps a finalized Segment in an audio.Chunk carrying the
+// correct start/end timestamps, speaker, and source/device so the downstream
+// transcription loop and transcript store see all the metadata they expect
+// from a single concatenated utterance WAV.
+func (s *Session) sendSegmentChunk(segment Segment, source audio.Source, device audio.Device, seq uint64) {
+	chunk := audio.Chunk{
+		Source:   source,
+		Device:   device,
+		FilePath: segment.FilePath,
+		Started:  segment.Started,
+		Ended:    segment.Ended,
+		Sequence: seq,
+		Speaker:  segment.Speaker,
+	}
+	// A finalized segment is safe to drain after capture cancellation. Using
+	// the stop-aware path here also closes the race where Stop happens between
+	// Accumulate/Flush and enqueueing a segment.
+	s.sendFinalChunk(chunk)
+}
+
+// lastSpeakerFor returns the most recent detected speaker label for the source
+// and whether one has been recorded yet. Speaker-change flushes use it to
+// attribute pending speech to the previous speaker before accumulating audio
+// under the new speaker label.
+func (s *Session) lastSpeakerFor(source audio.Source) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	switch source {
+	case audio.SourceMic:
+		return s.lastMicSpeaker, s.lastMicSpeaker != ""
+	case audio.SourceOutput:
+		return s.lastOutputSpeaker, s.lastOutputSpeaker != ""
+	default:
+		return "", false
+	}
+}
+
+// setLastSpeakerFor records the latest detected speaker label for the source.
+func (s *Session) setLastSpeakerFor(source audio.Source, speaker string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	switch source {
+	case audio.SourceMic:
+		s.lastMicSpeaker = speaker
+	case audio.SourceOutput:
+		s.lastOutputSpeaker = speaker
+	}
+}
+
+// flushPendingSegment finalizes any accumulated speech for the source so a
+// pause/mute/device-change/stop does not strand half an utterance in the
+// segmenter's pending buffer. Speaker comes from the last detected label for
+// the source so the partial WAV is transcribed under the correct speaker. It
+// is a no-op when the segmenter has no pending speech and never returns an
+// error to the caller; failures are surfaced as a warning event.
+func (s *Session) flushPendingSegment(source audio.Source) {
+	segmenter := s.segmenterFor(source)
+	if segmenter == nil || !segmenter.HasPending() {
+		return
+	}
+	speaker := ""
+	if last, ok := s.lastSpeakerFor(source); ok {
+		speaker = last
+	}
+	segment, flushed, err := segmenter.Flush(s.prepared.Dependencies.Clock(), speaker)
+	if err != nil {
+		logging.Printf("%s flush pending segment failed: %v", source, err)
+		s.emit(Event{Kind: EventWarning, Message: fmt.Sprintf("could not finalize pending %s segment: %v", source, err)})
+		return
+	}
+	if !flushed {
+		return
+	}
+	device := s.deviceFor(source)
+	logging.Printf("%s segment flushed on interrupt: %s", source, segment.FilePath)
+	s.sendSegmentChunk(segment, source, device, s.sequence.Add(1))
+}
+
+// resetPendingSegment drops any accumulated-but-unflushed frames for a source
+// without transcribing them. Used when a session is stopping abruptly and the
+// partial segment is either too short to transcribe or timing-critical.
+func (s *Session) resetPendingSegment(source audio.Source) {
+	if segmenter := s.segmenterFor(source); segmenter != nil {
+		segmenter.Reset()
+	}
+}
+
+// deviceFor returns the currently selected capture device for a source.
+func (s *Session) deviceFor(source audio.Source) audio.Device {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if source == audio.SourceMic {
+		return s.selection.Mic
+	}
+	return s.selection.Output
 }
 
 func (s *Session) transcribeLoop() {
