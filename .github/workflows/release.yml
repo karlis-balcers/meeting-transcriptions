@@ -16,6 +16,7 @@ on:
       - requirements*.txt
       - ui/export_presets.cfg
       - .github/workflows/release.yml
+      - engine/__main__.py
 
 permissions:
   contents: write
@@ -77,6 +78,15 @@ jobs:
 
       - name: Build app
         run: python build.py --godot "${{ env.GODOT_BIN }}" --zip
+
+      - name: Smoke test the packaged engine
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            python packaging/smoke_engine.py dist/windows/engine/meeting-engine.exe
+          else
+            python packaging/smoke_engine.py dist/macos/MeetingTranscriptions.app/Contents/MacOS/engine/meeting-engine
+          fi
 
       - name: Upload build
         uses: actions/upload-artifact@v4

@@ -10,16 +10,54 @@ import logging
 import os
 import signal
 import sys
+import tempfile
+import time
+import traceback
 from pathlib import Path
 
-from .logging_utils import setup_logging
-from .server import Engine, EngineServer, EventHub
-from .settings import SettingsStore
-
 DEFAULT_PORT = 47321
+CRASH_LOG = "engine-crash.log"
+
+
+def crash_log_path() -> Path:
+    """Where a failed start is written. The packaged engine has no console, so
+    this file is the only trace the UI (and the user) gets of what went wrong."""
+    override = os.getenv("MT_ENGINE_CRASH_DIR")
+    if override:
+        return Path(override) / CRASH_LOG
+    try:
+        from .settings import default_config_dir
+
+        return default_config_dir() / CRASH_LOG
+    except Exception:
+        return Path(tempfile.gettempdir()) / CRASH_LOG
+
+
+def write_crash_log(text: str) -> None:
+    try:
+        path = crash_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"--- {time.strftime('%Y-%m-%d %H:%M:%S')} pid {os.getpid()} ---\n{text.rstrip()}\n")
+    except Exception:
+        pass
 
 
 def main(argv: list[str] | None = None) -> int:
+    try:
+        return _main(argv)
+    except SystemExit:
+        raise
+    except BaseException:
+        write_crash_log(traceback.format_exc())
+        raise
+
+
+def _main(argv: list[str] | None) -> int:
+    from .logging_utils import setup_logging
+    from .server import Engine, EngineServer, EventHub
+    from .settings import SettingsStore
+
     parser = argparse.ArgumentParser(prog="engine", description="Meeting transcription engine")
     parser.add_argument("--port", type=int, default=int(os.getenv("MT_ENGINE_PORT", DEFAULT_PORT)))
     parser.add_argument("--settings", type=Path, default=None, help="settings.json path")
@@ -59,6 +97,7 @@ def main(argv: list[str] | None = None) -> int:
         server = EngineServer(engine, args.port, exit_when_alone=args.exit_when_alone)
     except OSError as e:
         log.error("Cannot listen on 127.0.0.1:%s (%s). Is another engine running?", args.port, e)
+        write_crash_log(f"Cannot listen on 127.0.0.1:{args.port} ({e}). Is another engine running?")
         return 2
 
     def on_signal(_signum, _frame):
