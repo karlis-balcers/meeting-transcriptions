@@ -46,7 +46,8 @@ class SettingsTests(unittest.TestCase):
         reloaded = SettingsStore(path).get()
         self.assertEqual(reloaded["frame_duration_ms"], 10)
         self.assertEqual(reloaded["record_seconds"], 60)
-        self.assertEqual(reloaded["llm_api"], "ollama")
+        self.assertEqual(reloaded["llm_api"], "laya")
+        self.assertEqual(reloaded["llm_base_url"], "http://127.0.0.1:8765")
         self.assertEqual(reloaded["languages"], "en")
 
     def test_normalize_checks_drops_invalid_and_dedupes_ids(self):

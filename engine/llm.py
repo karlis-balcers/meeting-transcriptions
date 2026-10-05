@@ -308,6 +308,12 @@ def install_ollama(on_progress: Callable[[str, float], None]) -> str:
 
 def status(settings: dict) -> dict[str, Any]:
     """What the UI shows on the local AI chip."""
+    if settings.get("llm_api") == "laya":
+        from . import laya
+
+        base_url = settings.get("llm_base_url") or laya.DEFAULT_URL
+        return {"enabled": bool(settings.get("llm_enabled")), "api": "laya", "base_url": base_url,
+                "model": "Laya", **laya.status(base_url)}
     client = LLMClient.from_settings(settings)
     info: dict[str, Any] = {
         "enabled": bool(settings.get("llm_enabled")),

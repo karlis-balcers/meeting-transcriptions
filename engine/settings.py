@@ -36,6 +36,9 @@ DEFAULT_FACT_PROMPT = (
 )
 
 APPLIES_TO = ("everyone", "others", "me")
+LLM_APIS = ("laya", "ollama", "openai")
+LAYA_URL = "http://127.0.0.1:8765"
+OLLAMA_URL = "http://127.0.0.1:11434"
 
 
 def default_config_dir() -> Path:
@@ -92,8 +95,9 @@ def default_settings() -> dict[str, Any]:
         "log_file_backup_count": 5,
         # Local LLM (Ollama or any OpenAI-compatible local server)
         "llm_enabled": False,
-        "llm_api": "ollama",  # "ollama" or "openai" (OpenAI-compatible, e.g. llama.cpp server / LM Studio)
-        "llm_base_url": "http://127.0.0.1:11434",
+        # "laya" (local decision model), "ollama", or "openai" (OpenAI-compatible, e.g. llama.cpp / LM Studio)
+        "llm_api": "laya",
+        "llm_base_url": LAYA_URL,
         "llm_model": "llama3.2:3b",
         "llm_timeout_seconds": 30.0,
         "llm_context_lines": 6,
@@ -282,8 +286,14 @@ def normalize(values: dict[str, Any]) -> dict[str, Any]:
     for key in ("fact_check_applies_to",):
         if result[key] not in APPLIES_TO:
             result[key] = "everyone"
-    if result["llm_api"] not in ("ollama", "openai"):
-        result["llm_api"] = "ollama"
+    if result["llm_api"] not in LLM_APIS:
+        result["llm_api"] = "laya"
+    # Switching server type with the other one's default URL still in place: use this one's default.
+    url = result["llm_base_url"].strip().rstrip("/")
+    if result["llm_api"] == "laya" and url in ("", OLLAMA_URL):
+        result["llm_base_url"] = LAYA_URL
+    elif result["llm_api"] == "ollama" and url in ("", LAYA_URL):
+        result["llm_base_url"] = OLLAMA_URL
     result["languages"] = ",".join(parse_language_candidates(result["languages"]))
     for key in ("output_dir", "temp_dir"):
         result[key] = os.path.expanduser(str(result[key]).strip()) or defaults[key]

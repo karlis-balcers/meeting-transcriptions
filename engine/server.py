@@ -17,7 +17,7 @@ import threading
 import time
 from typing import Any, Callable, Optional
 
-from . import __version__, llm
+from . import __version__, laya, llm
 from .session import Session
 from .settings import SettingsStore
 
@@ -60,6 +60,7 @@ class Engine:
         self.hub = hub
         self.session = session_factory(store, hub.send)
         self._llm_busy = threading.Lock()
+        self._laya_autostarted = False
 
     def hello(self) -> dict[str, Any]:
         return {
@@ -86,7 +87,16 @@ class Engine:
         return {k: v for k, v in result.items() if not k.startswith("_")}
 
     def llm_status(self) -> dict[str, Any]:
-        info = llm.status(self.store.get())
+        settings = self.store.get()
+        info = llm.status(settings)
+        # Laya runs as our own background server; bring it up once when it's installed but not running.
+        if (info["api"] == "laya" and info["enabled"] and info["installed"] and not info["running"]
+                and not self._laya_autostarted):
+            self._laya_autostarted = True
+            if laya.start_server(info["base_url"]):
+                info["starting"] = True
+                threading.Thread(target=lambda: laya.wait_until_up(info["base_url"]) and self.llm_status(),
+                                 name="laya-start", daemon=True).start()
         self.hub.send({"type": "llm", "state": "status", **info})
         return info
 
@@ -113,7 +123,28 @@ class Engine:
         threading.Thread(target=run, name=name, daemon=True).start()
         return {"ok": True}
 
+    def _enable_llm(self) -> None:
+        if not self.store.get().get("llm_enabled"):
+            self.store.update({"llm_enabled": True})
+            self.hub.send({"type": "settings", "settings": self.store.public()})
+
+    def _install_laya(self, progress: Callable[[str, float], None]) -> str:
+        laya.install(progress)
+        base_url = self.store.get().get("llm_base_url") or laya.DEFAULT_URL
+        try:
+            laya.health(base_url)
+        except laya.LayaError:
+            progress("Starting Laya", -1.0)
+            laya.start_server(base_url)
+            if not laya.wait_until_up(base_url):
+                raise laya.LayaError(f"Laya installed but did not start, see {laya.home() / 'laya-serve.log'}")
+        laya.warm_up(base_url, progress)
+        self._enable_llm()
+        return "Local AI ready (Laya)"
+
     def _install_and_pull(self, progress: Callable[[str, float], None]) -> str:
+        if self.store.get().get("llm_api") == "laya":
+            return self._install_laya(progress)
         message = llm.install_ollama(progress)
         settings = self.store.get()
         client = llm.LLMClient.from_settings(settings)
@@ -133,9 +164,7 @@ class Engine:
             return message + ", but it is not running yet. Start Ollama and press Check."
         progress(f"Downloading model {client.model}", 0.0)
         client.pull(progress)
-        if not settings.get("llm_enabled"):
-            self.store.update({"llm_enabled": True})
-            self.hub.send({"type": "settings", "settings": self.store.public()})
+        self._enable_llm()
         return f"Local AI ready ({client.model})"
 
     def handle(self, cmd: str, args: dict[str, Any]) -> Any:
@@ -189,6 +218,25 @@ class Engine:
             return self.llm_status()
         if cmd == "llm_install":
             return self._llm_task("llm-install", self._install_and_pull)
+        settings = self.store.get()
+        on_laya = settings.get("llm_api") == "laya"
+        laya_url = settings.get("llm_base_url") or laya.DEFAULT_URL
+        if cmd == "llm_pull" and on_laya:
+            return self._llm_task("llm-pull", lambda progress: (laya.warm_up(laya_url, progress), "Laya model ready")[1])
+        if cmd == "llm_start" and on_laya:
+            started = laya.start_server(laya_url)
+            return {"ok": started, "error": None if started else "Laya is not installed, press Install"}
+        if cmd == "llm_test" and on_laya:
+            def test_laya(progress: Callable[[str, float], None]) -> str:
+                progress("Asking Laya...", -1.0)
+                started = time.time()
+                answers = laya.predict(laya_url, "Sure, I'll send you the slides tomorrow morning.",
+                                       {"promise": {"type": "noul", "instructions": "Does the speaker promise to do something?"}},
+                                       timeout=300.0)
+                return (f"Laya answered in {time.time() - started:.1f}s: "
+                        f"promise = {answers['promise'].get('noul', 0):.0%} yes")
+
+            return self._llm_task("llm-test", test_laya, refresh=False)
         if cmd == "llm_pull":
             client = llm.LLMClient.from_settings(self.store.get())
             return self._llm_task("llm-pull", lambda progress: (client.pull(progress), f"Model {client.model} ready")[1])
