@@ -3,6 +3,8 @@
     python -m pip install -r requirements-build.txt
     python build.py --godot "C:/Tools/Godot_v4.4.1-stable_win64.exe"      # on Windows
     python build.py --godot /Applications/Godot.app/Contents/MacOS/Godot  # on macOS
+    add --zip to also pack dist/MeetingTranscriptions-<platform>.zip (what the
+    release workflow uploads and install.ps1 / install.sh download)
 
 Godot export templates for the same Godot version must be installed
 (Editor > Manage Export Templates). Output goes to dist/<platform>/.
@@ -12,10 +14,10 @@ macOS is MeetingTranscriptions.app/Contents/MacOS/engine/.
 from __future__ import annotations
 
 import argparse
+import platform
 import shutil
 import subprocess
 import sys
-import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -49,6 +51,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--godot", required=True, help="path to the Godot 4.4+ executable")
     parser.add_argument("--skip-engine", action="store_true")
+    parser.add_argument("--zip", action="store_true", help="also pack a release zip into dist/")
     args = parser.parse_args()
 
     engine_dir = DIST / "engine-build" / "meeting-engine"
@@ -59,20 +62,28 @@ def main() -> int:
         target = DIST / "windows"
         export_ui(args.godot, "Windows Desktop", target / "MeetingTranscriptions.exe")
         shutil.copytree(engine_dir, target / "engine", dirs_exist_ok=True)
+        if args.zip:
+            archive = shutil.make_archive(str(DIST / "MeetingTranscriptions-windows-x64"), "zip", target)
+            print(f"Release zip: {archive}")
         print(f"Done: {target}")
     elif sys.platform == "darwin":
         target = DIST / "macos"
         archive = target / "MeetingTranscriptions.zip"
         export_ui(args.godot, "macOS", archive)
-        with zipfile.ZipFile(archive) as zf:
-            zf.extractall(target)
+        for old_app in target.glob("*.app"):
+            shutil.rmtree(old_app)
+        run(["ditto", "-x", "-k", str(archive), str(target)])
         app = next(target.glob("*.app"))
-        # zipfile drops exec bits, so restore them on the app binary.
-        for exe in (app / "Contents" / "MacOS").iterdir():
-            exe.chmod(0o755)
         shutil.copytree(engine_dir, app / "Contents" / "MacOS" / "engine", dirs_exist_ok=True)
         # Re-sign ad hoc after adding the sidecar so Gatekeeper accepts the bundle locally.
         subprocess.run(["codesign", "--force", "--deep", "--sign", "-", str(app)], check=False)
+        if args.zip:
+            arch = "arm64" if platform.machine() == "arm64" else "x86_64"
+            release = DIST / f"MeetingTranscriptions-macos-{arch}.zip"
+            release.unlink(missing_ok=True)
+            # ditto keeps the bundle's symlinks and exec bits, zipfile would not.
+            run(["ditto", "-c", "-k", "--keepParent", str(app), str(release)])
+            print(f"Release zip: {release}")
         print(f"Done: {app}")
     else:
         print("Release builds are for Windows and macOS. On Linux use ./run.sh.")

@@ -6,6 +6,28 @@ Optionally, a local LLM (Ollama) runs live checks on every line: mood of each sp
 
 ![speakers in a circle around the live transcript](docs/screenshot.png)
 
+## Install
+
+No Godot or Python needed, the release is a normal app with everything inside.
+
+**Windows** (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/karlis-balcers/meeting-transcriptions/main/install.ps1 | iex
+```
+
+Installs to `%LOCALAPPDATA%\Programs\MeetingTranscriptions` and adds Start menu and Desktop shortcuts. Run it again to update.
+
+**macOS** (Apple Silicon):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/karlis-balcers/meeting-transcriptions/main/install.sh | bash
+```
+
+Installs `MeetingTranscriptions.app` to `/Applications` (or `~/Applications`). The app isn't notarized, so the script removes the download quarantine flag for you. For the other side of the call you need BlackHole, see below. Intel Macs: run from source for now.
+
+Or grab the zip yourself from the [Releases](https://github.com/karlis-balcers/meeting-transcriptions/releases) page. Then open **Settings**, paste your OpenAI API key and press **Start**.
+
 ## How it's built
 
 - **UI: Godot 4.4 (GDScript)** in `ui/`. A 2D scene with the speaker circle, transcript, a speaker sidebar with stats and mood over time, an insights feed, settings and saved profiles.
@@ -62,9 +84,18 @@ Stored as JSON in `%APPDATA%\MeetingTranscriptions\settings.json` (Windows) or `
 
 ## Build a release
 
+Push a version tag and GitHub Actions does it (`.github/workflows/release.yml`): it builds the Windows and macOS apps and publishes them as a GitHub Release, which is what the install scripts download.
+
+```sh
+git tag v2.0.0
+git push origin v2.0.0
+```
+
+To build locally instead:
+
 ```sh
 python -m pip install -r requirements-build.txt
-python build.py --godot <path to Godot 4.4 executable>
+python build.py --godot <path to Godot 4.4 executable> --zip
 ```
 
 Run it on the platform you build for. It bundles the engine with PyInstaller and exports the Godot project with `ui/export_presets.cfg` (needs Godot export templates). Result in `dist/windows/` or `dist/macos/MeetingTranscriptions.app`, with the engine sidecar inside.

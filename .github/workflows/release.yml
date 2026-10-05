@@ -1,0 +1,96 @@
+name: Release
+
+# Push a tag like v2.0.0 to build Windows and macOS apps and publish them as a
+# GitHub Release (that's what install.ps1 / install.sh download). Running it by
+# hand (workflow_dispatch) builds the same zips as workflow artifacts only.
+
+on:
+  push:
+    tags: [ "v*" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  GODOT_VERSION: 4.4.1
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x64
+            os: windows-latest
+          - name: macos-arm64
+            os: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install PortAudio (macOS)
+        if: runner.os == 'macOS'
+        run: brew install portaudio
+
+      - name: Install build dependencies
+        run: python -m pip install -r requirements-build.txt
+
+      - name: Run engine tests
+        run: python -m unittest discover -s tests -t .
+
+      - name: Download Godot and export templates
+        shell: bash
+        run: |
+          base="https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-stable"
+          curl -fsSL -o templates.tpz "$base/Godot_v${GODOT_VERSION}-stable_export_templates.tpz"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            curl -fsSL -o godot.zip "$base/Godot_v${GODOT_VERSION}-stable_win64.exe.zip"
+            unzip -q godot.zip -d godot
+            echo "GODOT_BIN=$(cygpath -w "$PWD/godot/Godot_v${GODOT_VERSION}-stable_win64_console.exe")" >> "$GITHUB_ENV"
+            tpl_dir="$(cygpath -u "$APPDATA")/Godot/export_templates/${GODOT_VERSION}.stable"
+          else
+            curl -fsSL -o godot.zip "$base/Godot_v${GODOT_VERSION}-stable_macos.universal.zip"
+            unzip -q godot.zip -d godot
+            echo "GODOT_BIN=$PWD/godot/Godot.app/Contents/MacOS/Godot" >> "$GITHUB_ENV"
+            tpl_dir="$HOME/Library/Application Support/Godot/export_templates/${GODOT_VERSION}.stable"
+          fi
+          mkdir -p "$tpl_dir"
+          unzip -q templates.tpz -d tpl
+          cp -R tpl/templates/. "$tpl_dir/"
+
+      - name: Build app
+        run: python build.py --godot "${{ env.GODOT_BIN }}" --zip
+
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: MeetingTranscriptions-${{ matrix.name }}
+          path: dist/MeetingTranscriptions-*.zip
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download builds
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
+          generate_release_notes: true

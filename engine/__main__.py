@@ -29,6 +29,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--exit-when-alone", action="store_true", help="quit when the last UI disconnects")
     args = parser.parse_args(argv)
 
+    # Packaged without a console (PyInstaller --noconsole on Windows) there is no
+    # stdout/stderr; give print and logging somewhere harmless to write.
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, "w")
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, "w")
+
     store = SettingsStore(args.settings, env_file=args.import_env)
     settings = store.get()
     setup_logging(
