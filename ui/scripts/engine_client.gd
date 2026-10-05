@@ -19,6 +19,7 @@ const MAX_SPAWNS := 3
 ## it too), so give it a while before calling it stuck.
 const START_TIMEOUT_SECONDS := 60.0
 const CRASH_LOG := "MeetingTranscriptions/engine-crash.log"
+const PORT_FILE := "MeetingTranscriptions/engine-port"
 
 var port: int = DEFAULT_PORT
 var is_connected_to_engine := false
@@ -81,6 +82,13 @@ func _watch_spawned_engine() -> void:
 	if _spawned_pid < 0 or _spawned_at <= 0.0:
 		return
 	var waited := Time.get_ticks_msec() / 1000.0 - _spawned_at
+	var port_file := OS.get_data_dir().path_join(PORT_FILE)
+	if FileAccess.file_exists(port_file):
+		# The engine may have had to pick another port than ours.
+		var written := FileAccess.get_file_as_string(port_file).strip_edges()
+		if written.is_valid_int() and int(written) != port:
+			port = int(written)
+			_try_connect()
 	if not OS.is_process_running(_spawned_pid):
 		var why := "The engine stopped right after starting."
 		var crash := _read_crash_log()
@@ -182,7 +190,9 @@ func _spawn_engine() -> void:
 		engine_log.emit("No engine found. Run the engine with: python -m engine")
 		return
 	var args: PackedStringArray = launch["args"]
-	args.append_array(PackedStringArray(["--port", str(port), "--exit-when-alone"]))
+	var port_file := OS.get_data_dir().path_join(PORT_FILE)
+	DirAccess.remove_absolute(port_file)
+	args.append_array(PackedStringArray(["--port", str(port), "--exit-when-alone", "--port-file", port_file]))
 	if launch.has("pythonpath"):
 		var existing := OS.get_environment("PYTHONPATH")
 		var sep := ";" if OS.get_name() == "Windows" else ":"
