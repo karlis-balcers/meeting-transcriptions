@@ -10,16 +10,54 @@ import logging
 import os
 import signal
 import sys
+import tempfile
+import time
+import traceback
 from pathlib import Path
 
-from .logging_utils import setup_logging
-from .server import Engine, EngineServer, EventHub
-from .settings import SettingsStore
-
 DEFAULT_PORT = 47321
+CRASH_LOG = "engine-crash.log"
+
+
+def crash_log_path() -> Path:
+    """Where a failed start is written. The packaged engine has no console, so
+    this file is the only trace the UI (and the user) gets of what went wrong."""
+    override = os.getenv("MT_ENGINE_CRASH_DIR")
+    if override:
+        return Path(override) / CRASH_LOG
+    try:
+        from .settings import default_config_dir
+
+        return default_config_dir() / CRASH_LOG
+    except Exception:
+        return Path(tempfile.gettempdir()) / CRASH_LOG
+
+
+def write_crash_log(text: str) -> None:
+    try:
+        path = crash_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"--- {time.strftime('%Y-%m-%d %H:%M:%S')} pid {os.getpid()} ---\n{text.rstrip()}\n")
+    except Exception:
+        pass
 
 
 def main(argv: list[str] | None = None) -> int:
+    try:
+        return _main(argv)
+    except SystemExit:
+        raise
+    except BaseException:
+        write_crash_log(traceback.format_exc())
+        raise
+
+
+def _main(argv: list[str] | None) -> int:
+    from .logging_utils import setup_logging
+    from .server import Engine, EngineServer, EventHub
+    from .settings import SettingsStore, default_config_dir
+
     parser = argparse.ArgumentParser(prog="engine", description="Meeting transcription engine")
     parser.add_argument("--port", type=int, default=int(os.getenv("MT_ENGINE_PORT", DEFAULT_PORT)))
     parser.add_argument("--settings", type=Path, default=None, help="settings.json path")
@@ -27,6 +65,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="old .env to import on first run (default: ./.env)")
     parser.add_argument("--demo", action="store_true", help="play a scripted meeting instead of recording")
     parser.add_argument("--exit-when-alone", action="store_true", help="quit when the last UI disconnects")
+    parser.add_argument("--port-file", type=Path, default=None,
+                        help="write the port we listen on here; if --port is taken, pick a free one")
     args = parser.parse_args(argv)
 
     # Packaged without a console (PyInstaller --noconsole on Windows) there is no
@@ -38,12 +78,14 @@ def main(argv: list[str] | None = None) -> int:
 
     store = SettingsStore(args.settings, env_file=args.import_env)
     settings = store.get()
-    setup_logging(
-        log_dir=os.path.join(settings["output_dir"], "logs"),
-        level_name=settings["log_level"],
-        max_mb=settings["log_file_max_mb"],
-        backup_count=settings["log_file_backup_count"],
-    )
+    log_options = dict(level_name=settings["log_level"], max_mb=settings["log_file_max_mb"],
+                       backup_count=settings["log_file_backup_count"])
+    try:
+        setup_logging(log_dir=os.path.join(settings["output_dir"], "logs"), **log_options)
+    except OSError as e:
+        # An output folder that no longer exists (old .env, unplugged drive) must not stop the engine.
+        setup_logging(log_dir=str(default_config_dir() / "logs"), **log_options)
+        logging.getLogger("engine").warning("Cannot log to the output folder %s (%s)", settings["output_dir"], e)
     log = logging.getLogger("engine")
     log.info("Settings: %s", store.path)
 
@@ -58,8 +100,18 @@ def main(argv: list[str] | None = None) -> int:
     try:
         server = EngineServer(engine, args.port, exit_when_alone=args.exit_when_alone)
     except OSError as e:
-        log.error("Cannot listen on 127.0.0.1:%s (%s). Is another engine running?", args.port, e)
-        return 2
+        if args.port_file is None:
+            log.error("Cannot listen on 127.0.0.1:%s (%s). Is another engine running?", args.port, e)
+            write_crash_log(f"Cannot listen on 127.0.0.1:{args.port} ({e}). Is another engine running?")
+            return 2
+        # Windows can reserve port ranges (Hyper-V, WSL, Docker); any free port will do,
+        # the UI reads the one we got from the port file.
+        log.warning("Port %s is not available (%s), picking a free one", args.port, e)
+        server = EngineServer(engine, 0, exit_when_alone=args.exit_when_alone)
+    port = server.server_address[1]
+    if args.port_file is not None:
+        args.port_file.parent.mkdir(parents=True, exist_ok=True)
+        args.port_file.write_text(str(port), encoding="utf-8")
 
     def on_signal(_signum, _frame):
         import threading
@@ -70,8 +122,8 @@ def main(argv: list[str] | None = None) -> int:
     if hasattr(signal, "SIGTERM"):
         signal.signal(signal.SIGTERM, on_signal)
 
-    log.info("Engine listening on 127.0.0.1:%s", args.port)
-    print(f"ENGINE_READY {args.port}", flush=True)
+    log.info("Engine listening on 127.0.0.1:%s", port)
+    print(f"ENGINE_READY {port}", flush=True)
     try:
         server.serve_forever(poll_interval=0.3)
     finally:

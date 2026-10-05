@@ -24,6 +24,7 @@ var _mic: OptionButton
 var _out: OptionButton
 var _ai_btn: Button
 var _status: Label
+var _engine_error_dialog: AcceptDialog
 var _path: Label
 var _rec_dot: Label
 var _feed: VBoxContainer
@@ -77,6 +78,7 @@ func _ready() -> void:
 	engine.disconnected.connect(_on_disconnected)
 	engine.event_received.connect(_on_event)
 	engine.engine_log.connect(func(t): _set_status(t, "info"))
+	engine.engine_failed.connect(_on_engine_failed)
 	add_child(engine)
 	_set_status("Connecting to the engine...", "info")
 	_update_controls()
@@ -381,6 +383,16 @@ func _unhandled_input(event: InputEvent) -> void:
 
 
 # ------------------------------------------------------------------- engine
+
+func _on_engine_failed(text: String) -> void:
+	_set_status(text.get_slice("\n", 0), "error")
+	if _engine_error_dialog == null:
+		_engine_error_dialog = AcceptDialog.new()
+		_engine_error_dialog.title = "Engine problem"
+		add_child(_engine_error_dialog)
+	_engine_error_dialog.dialog_text = text
+	_engine_error_dialog.popup_centered(Vector2i(640, 0))
+
 
 func _on_connected() -> void:
 	_set_status("Engine connected", "info")
