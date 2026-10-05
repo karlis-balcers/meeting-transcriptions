@@ -6,19 +6,58 @@ on:
   pull_request:
 
 jobs:
-  unit-tests:
-    name: Unit tests (Go)
+  engine:
+    name: Engine unit tests (Python)
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          go-version-file: go.mod
-          cache: true
+          python-version: "3.11"
+
+      - name: Install test dependencies
+        # pyaudio needs PortAudio headers and isn't used by the tests (they fake it).
+        run: python -m pip install numpy openai
 
       - name: Run unit tests
-        run: go test ./...
+        run: python -m unittest discover -s tests -t . -v
+
+  ui:
+    name: Godot UI smoke test
+    runs-on: ubuntu-latest
+    env:
+      GODOT_VERSION: 4.4.1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install engine dependencies
+        run: python -m pip install numpy openai
+
+      - name: Download Godot
+        run: |
+          curl -sSL -o godot.zip "https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_linux.x86_64.zip"
+          unzip -q godot.zip
+          mv "Godot_v${GODOT_VERSION}-stable_linux.x86_64" godot
+
+      - name: Import project and check scripts
+        run: |
+          ./godot --headless --path ui --import 2>&1 | tee import.log
+          ! grep -q "SCRIPT ERROR" import.log
+
+      - name: Run UI against the demo engine
+        run: |
+          mkdir -p "$RUNNER_TEMP/cfg/meeting-transcriptions"
+          echo '{"auto_start": true, "output_dir": "'"$RUNNER_TEMP"'/out"}' > "$RUNNER_TEMP/cfg/meeting-transcriptions/settings.json"
+          export XDG_CONFIG_HOME="$RUNNER_TEMP/cfg" MT_ENGINE_DEMO=1 MT_ENGINE_PORT=47390
+          timeout 120 ./godot --headless --path ui -s res://tests/smoke.gd 2>&1 | tee smoke.log
+          grep -q "SMOKE" smoke.log
+          ! grep -q "SCRIPT ERROR" smoke.log

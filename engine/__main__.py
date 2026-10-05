@@ -23,10 +23,13 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="engine", description="Meeting transcription engine")
     parser.add_argument("--port", type=int, default=int(os.getenv("MT_ENGINE_PORT", DEFAULT_PORT)))
     parser.add_argument("--settings", type=Path, default=None, help="settings.json path")
+    parser.add_argument("--import-env", type=Path, default=None,
+                        help="old .env to import on first run (default: ./.env)")
+    parser.add_argument("--demo", action="store_true", help="play a scripted meeting instead of recording")
     parser.add_argument("--exit-when-alone", action="store_true", help="quit when the last UI disconnects")
     args = parser.parse_args(argv)
 
-    store = SettingsStore(args.settings)
+    store = SettingsStore(args.settings, env_file=args.import_env)
     settings = store.get()
     setup_logging(
         log_dir=os.path.join(settings["output_dir"], "logs"),
@@ -38,7 +41,13 @@ def main(argv: list[str] | None = None) -> int:
     log.info("Settings: %s", store.path)
 
     hub = EventHub()
-    engine = Engine(store, hub)
+    if args.demo or os.getenv("MT_ENGINE_DEMO") == "1":
+        from .demo import DemoSession
+
+        engine = Engine(store, hub, session_factory=DemoSession)
+        log.info("Demo mode: playing a scripted meeting")
+    else:
+        engine = Engine(store, hub)
     try:
         server = EngineServer(engine, args.port, exit_when_alone=args.exit_when_alone)
     except OSError as e:

@@ -1,243 +1,87 @@
-# transcribe
+# Meeting Transcriptions
 
-`transcribe` is a focused Go TUI/CLI recorder for meeting transcription. It records a microphone plus a system-output capture device, sends WAV chunks to OpenAI audio transcription, and writes a Markdown transcript.
+Near real-time transcription of both sides of a call: your microphone and whatever comes out of your speakers (the people on the other side of Teams/Zoom/Meet). Everyone who talks shows up as a node in a circle, the live transcript runs in the middle, and the app builds a profile with stats for each speaker over time.
 
-This is intentionally not a port of the old assistant/summarizer stack: no summaries, no assistant panels, no vector stores, no agents, and no local Whisper.
+Optionally, a local LLM (Ollama) runs live checks on every line: mood of each speaker, a fact check, and any custom checks you write yourself. Nothing of that leaves your machine.
 
-## Requirements
+![speakers in a circle around the live transcript](docs/screenshot.png)
 
-- Go 1.22+
-- `ffmpeg` available on `PATH`
-- `OPENAI_API_KEY` set in the environment
-- A selectable microphone device
-- A selectable system-output/loopback capture device
-- Windows: `ffmpeg` on PATH for microphone/DirectShow fallback capture, plus the bundled `wasapi-loopback-recorder.exe` sidecar beside `transcribe.exe` for built-in speaker/headphone capture via WASAPI loopback. DirectShow loopback tools such as Stereo Mix, VB-CABLE, Voicemeeter, or `virtual-audio-capturer` remain optional fallback/diagnostic devices.
+## How it's built
 
-The OpenAI API key is never read from or written to the YAML config file.
+- **UI: Godot 4.4 (GDScript)** in `ui/`. A 2D scene with the speaker circle, transcript, a speaker sidebar with stats and mood over time, an insights feed, settings and saved profiles.
+- **Engine: Python 3.11+** in `engine/`. Audio capture, transcription and speaker detection are restored from the last Python version (commit `c1d41bc`, before the Go rewrite), because that's the part that worked well. On top of it the engine adds per-speaker stats, saved profiles and the local AI checks.
+- They talk over a localhost socket (newline-delimited JSON on `127.0.0.1:47321`). The UI starts the engine by itself and the engine quits when the UI closes.
 
-## Build
+Why this split: the hard platform parts (WASAPI loopback on Windows, Teams UI automation for speaker names, OpenAI audio upload) already worked in Python, and Godot gives a proper 2D canvas that runs the same on Windows and macOS.
 
-Run build and test commands from the repository root:
+## What it does
 
-```sh
-go test ./...
-go build -o transcribe ./cmd/transcribe
-```
+- Records mic + output device, cuts chunks on silence (or on a speaker change in Teams, or when you press **Split** / `S`), transcribes them with OpenAI (`gpt-4o-mini-transcribe` by default) and filters the usual hallucinations ("thanks for watching", URLs...).
+- Speaker names: your mic is you; the remote side gets the active speaker name from Microsoft Teams on Windows (same as the Python version). When that's not available (macOS, other apps) the remote side is one speaker called "Remote", and you can **rename** it in the sidebar. Renaming into an existing name merges the two.
+- Writes the transcript as Markdown to your output folder (`transcription-YYYYMMDD_HHMMSS.md`), the same format as before, plus a `-stats.json` next to it.
+- Live stats per speaker: talk time and share, turns, words, pace (wpm), questions, interruptions, filler words, longest turn, topics. Lines between speakers show who answers whom.
+- Speaker profiles across meetings in `<output folder>/speaker-profiles.json`: meetings, total talk time, average share, pace, questions per meeting, usual mood and topics. See them under **Profiles**.
+- Local AI checks (optional): mood per line (shown as the color ring around the speaker and a mood line in the sidebar), fact check (from the model's own knowledge, no internet), and your own yes/no checks with a name, color and who they apply to (everyone, others, me). Default custom check example: "Action item".
+- **Install** button in Settings > Local AI: installs Ollama (winget or the installer on Windows, Homebrew or the app download on macOS), starts it and downloads the model (`llama3.2:3b` by default). Any OpenAI-compatible local server works too (llama.cpp server, LM Studio): set *Server type* to `openai` and the URL.
+- No AI summaries or assistant panels anymore, that was dropped on purpose.
 
-Cross-compile smoke checks:
+## Run it from source
 
-```sh
-GOOS=linux GOARCH=amd64 go build -o /tmp/transcribe-linux-amd64 ./cmd/transcribe
-GOOS=linux GOARCH=arm64 go build -o /tmp/transcribe-linux-arm64 ./cmd/transcribe
-GOOS=darwin GOARCH=amd64 go build -o /tmp/transcribe-darwin-amd64 ./cmd/transcribe
-GOOS=darwin GOARCH=arm64 go build -o /tmp/transcribe-darwin-arm64 ./cmd/transcribe
-GOOS=windows GOARCH=amd64 go build -o /tmp/transcribe-windows-amd64.exe ./cmd/transcribe
-GOOS=windows GOARCH=arm64 go build -o /tmp/transcribe-windows-arm64.exe ./cmd/transcribe
-```
+You need Python 3.11+ and Godot 4.4+.
 
-On Windows, run `build_transcribe_win64.bat` from the repository root. It cross-compiles the pure-Go main binary via WSL, builds the sidecar from `./cmd/wasapi-loopback-recorder`, and emits `transcribe.exe`, `wasapi-loopback-recorder.exe`, and a `transcribe.cmd` launcher to the root-level `build/windows-amd64/` package directory. The launcher keeps a persistent `cmd.exe` attached so the Bubble Tea TUI has a real TTY when launched by double-click.
+- **Windows**: double-click `run_win.bat`. First run creates `.venv` and installs `requirements.txt`. Godot must be on `PATH` (`winget install GodotEngine.GodotEngine`) or set `GODOT=C:\path\to\Godot.exe`.
+- **macOS**: `./run.sh`. It installs `portaudio` with Homebrew if needed. Godot from `brew install --cask godot` or set `GODOT=/path/to/Godot`.
 
-## Project layout
+Then open **Settings**, paste your OpenAI API key and press **Start**.
 
-- `cmd/transcribe` — main CLI/TUI entry point and Windows console-launch glue.
-- `cmd/wasapi-loopback-recorder` — Windows WASAPI loopback sidecar executable for built-in speaker/headphone capture.
-- `internal/app` — session orchestration, recorder/transcriber wiring, and runtime lifecycle.
-- `internal/audio` — device discovery, recorder backends, WAV/RMS helpers, and ffmpeg/WASAPI dispatch.
-- `internal/cli` — Cobra command setup, config loading, logging flags, and command execution.
-- `internal/config` — YAML config model, defaults, environment compatibility, and validation.
-- `internal/openai` — OpenAI audio transcription client.
-- `internal/speaker` — best-effort speaker naming helpers, including Windows Teams title probing.
-- `internal/transcript` — ordered Markdown transcript storage.
-- `internal/tui` — Bubble Tea model and interaction flow.
-- `docs` — cross-platform QA and Windows WASAPI sidecar test plans.
-- `build/windows-amd64` — generated Windows package artifacts from `build_transcribe_win64.bat`.
+If you used the Python version, your old `.env` (name, language, keywords, folders, audio tuning, filters, API key) is imported on the first run.
 
-## Configuration
-
-Default config path:
-
-```text
-~/.transcribe/config.yaml
-```
-
-Use `--config <path>` to override it for tests or alternate profiles.
-
-Example:
-
-```yaml
-user_name: "You"
-language: "en"
-keywords:
-  - "Paymentology"
-  - "Banking.Live"
-
-openai:
-  model: "gpt-4o-mini-transcribe"
-  timeout: "60s"
-  max_retries: 3
-  retry_base: "1s"
-  retry_max_interval: "8s"
-
-audio:
-  mic_device_id: ""
-  mic_device_name: ""
-  output_device_id: "alsa_output.pci-0000_00_1f.3.analog-stereo.monitor"
-  output_device_name: ""
-  capture_chunk_duration: "2s"
-  frame_duration_ms: 100
-  silence_threshold: 50
-  silence_duration: "2s"
-  max_segment_duration: "15m"
-
-paths:
-  output_dir: ""
-  temp_dir: ""
-
-teams:
-  enabled: true
-
-tui:
-  show_loudness_meters: true
-
-filter:
-  min_chars: 2
-  exact: ["LAMPA", "MEMMEE"]
-  prefixes: ["[Music]", "(Music)", "♪"]
-  contains: ["thank you for watching"]
-  regex: []
-```
-
-If `paths.output_dir` is empty, transcripts are written to the current working directory. `--output-dir <dir>` overrides it for one run.
-
-## Environment
-
-Required:
+Want to see the UI without a mic or API key? Run the engine in demo mode and then open the UI:
 
 ```sh
-export OPENAI_API_KEY="<your key>"
+python -m engine --demo
+godot --path ui
 ```
 
-Optional compatibility environment variables are also accepted for non-secret settings, including `YOUR_NAME`, `LANGUAGE`, `KEYWORDS`, `OPENAI_MODEL_FOR_TRANSCRIPT`, `OUTPUT_DIR`, `TEMP_DIR`, `CAPTURE_CHUNK_DURATION`, `FRAME_DURATION_MS`, `SILENCE_THRESHOLD`, `SILENCE_DURATION`, `RECORD_SECONDS`, and transcription retry settings.
+### Capturing the other side on macOS
 
-Config file values override those compatibility environment values. CLI flags override both.
+macOS has no loopback capture out of the box, same as with the Python version. Install [BlackHole](https://existential.audio/blackhole/) (2ch), create a Multi-Output Device in *Audio MIDI Setup* with your speakers/headphones + BlackHole, use it as system output, and pick BlackHole as the output capture device in the top bar. Give Godot (or the app) microphone permission when macOS asks.
 
-Capture is silence-gated. Each source is analyzed in PCM16 RMS frames: leading
-silent chunks are discarded and are never uploaded to OpenAI, while speech and
-following audio are accumulated into one WAV. A segment is finalized after two
-seconds of trailing silence, when the detected speaker changes, or when the
-accumulated audio reaches the fifteen-minute maximum. The default
-`silence_threshold: 50` preserves the legacy signed-16-bit amplitude scale;
-values from `0` through `1` can instead be supplied as normalized RMS values.
-The trailing silence that triggers a split remains in the finalized segment,
-but silent-only segments are not sent for transcription.
+## Settings
 
-## Running
+Stored as JSON in `%APPDATA%\MeetingTranscriptions\settings.json` (Windows) or `~/Library/Application Support/MeetingTranscriptions/settings.json` (macOS). Everything is editable in the Settings window:
 
-Start immediately with the TUI:
+- General: your name, languages (comma list, the top bar lets you pick per meeting), keywords for the transcriber, auto start, name for the unknown remote speaker, Teams window match.
+- Transcription: OpenAI key, model, timeouts and retries.
+- Audio: max chunk length, silence threshold and duration, frame size.
+- Folders: where transcripts, stats and profiles go (any folder you like), and the temp audio folder.
+- Filtering: extra exact / prefix / contains / regex rules.
+- Local AI: on/off, server type and URL, model, mood and fact check toggles and instructions, install/download/test buttons.
+- Custom checks: add, edit, color and delete your own checks.
+- Logging: level and rotation. Logs go to `<output folder>/logs`.
+
+## Build a release
 
 ```sh
-./transcribe
+python -m pip install -r requirements-build.txt
+python build.py --godot <path to Godot 4.4 executable>
 ```
 
-Enable runtime logs in the current directory:
+Run it on the platform you build for. It bundles the engine with PyInstaller and exports the Godot project with `ui/export_presets.cfg` (needs Godot export templates). Result in `dist/windows/` or `dist/macos/MeetingTranscriptions.app`, with the engine sidecar inside.
+
+## Develop
 
 ```sh
-./transcribe --logging 1
+python -m unittest discover -s tests -t .            # engine tests, no audio device needed
+python -m engine --port 47321                         # run the engine alone, logs to the console
+godot --headless --path ui -s res://tests/smoke.gd    # UI smoke test against a running (demo) engine
 ```
 
-When enabled, the app writes `transcribe.log` beside the directory you launched it from and records device selection, chunk capture, and transcription progress there.
+Layout:
 
-List detected devices:
-
-```sh
-./transcribe --list-devices
-```
-
-Override devices for one run:
-
-```sh
-./transcribe --mic default --output alsa_output.pci-0000_00_1f.3.analog-stereo.monitor
-```
-
-On Windows, prefer a concrete device shown by `--list-devices` instead of `default`. DirectShow device IDs may be long `@device_...` alternative names; those are safe to paste into `--mic`, `--output`, `audio.mic_device_id`, or `audio.output_device_id`.
-
-## TUI shortcuts
-
-- `P` pause
-- `R` resume
-- `M` mute microphone
-- `U` unmute microphone
-- `S` settings
-- In settings: `M` choose microphone, `O` choose output capture device
-- Device list: `↑`/`↓` or `k`/`j`, `Enter` selects, `Esc` backs out
-- `Q` or `Ctrl+C` quits safely
-
-The TUI shows selected devices, current status/error, session timer, transcript viewport, degraded warnings, and horizontal loudness meters.
-
-After choosing a device in the picker and pressing `Enter`, the TUI returns to the settings screen and shows the updated mic/output selection summary.
-
-Runtime controls are applied between short external-recorder chunks and also cancel the active recorder context when possible. `capture_chunk_duration` controls that responsiveness for the ffmpeg backend and is capped by `max_segment_duration`; the default is `2s` so pause, mute, and device changes do not wait for a long transcription segment. Loudness meters are computed from captured WAV/PCM chunks by parsing sample RMS levels, so unsupported or malformed chunks show a warning rather than fake meter data.
-
-## Silent mode
-
-Silent mode disables the TUI and records until interrupted:
-
-```sh
-./transcribe --silent > transcript.txt
-```
-
-Contract:
-
-- final complete transcript goes to stdout only after interrupt and drain
-- status, selected devices, warnings, and errors go to stderr
-- no ANSI UI, progress, logs, or diagnostics are written to stdout
-- Markdown transcript files are still written
-
-## OS audio notes
-
-### Linux
-
-Device discovery parses `pactl info` and `pactl list short sources` when PulseAudio/PipeWire is available. System output capture expects a monitor source such as:
-
-```text
-alsa_output.<device>.monitor
-```
-
-If no monitor source exists, create/enable one in your audio stack or set `audio.output_device_id` to a valid ffmpeg/Pulse input.
-
-The numeric index column from `pactl list short sources` is preserved as a selectable alias, so `--mic`, `--output`, `AUDIO_INPUT_DEVICE_INDEX`, and `AUDIO_OUTPUT_DEVICE_INDEX` can target the exact listed row in multi-device setups.
-
-### Windows
-
-The main app is pure Go and cross-compiles. Mic capture still uses an ffmpeg external recorder with DirectShow device names from:
-
-```sh
-ffmpeg -hide_banner -list_devices true -f dshow -i dummy
-```
-
-`transcribe --list-devices` parses that output, shows all DirectShow audio capture devices as microphone candidates, and includes DirectShow `Alternative name` values as selectable IDs/aliases. A configured `default` or old synthetic placeholder is resolved to a concrete enumerated DirectShow audio device before capture; the app should not start ffmpeg with `audio=default` unless DirectShow actually listed a device with that exact name.
-
-DirectShow does not reliably label which audio capture devices are system-output loopbacks. The output-device settings therefore surface concrete DirectShow loopback/virtual devices such as `Stereo Mix`, `virtual-audio-capturer`, VB-CABLE, Voicemeeter, BlackHole, or Soundflower when present, and also supplement normal Windows render endpoints from PowerShell as `wasapi-loopback` output candidates.
-
-Windows render endpoints discovered from `Get-PnpDevice -Class AudioEndpoint` are labeled with the `wasapi-loopback` backend and routed through the bundled sidecar protocol, keeping Windows-specific recording concerns out of the main TUI/CLI. The helper is a pure-Go, no-cgo Windows executable that uses WASAPI loopback through COM, captures the endpoint's native mix format, downmixes/resamples to PCM16 16 kHz mono, and writes a normal WAV chunk for the shared RMS/OpenAI path. This is the stock Windows path for built-in speakers/headphones, equivalent in intent to Audacity's Windows WASAPI loopback recording mode.
-
-DirectShow fallback output capture remains available when a real capture-able loopback source exists: enable **Stereo Mix** in the Windows audio control panel, or install a virtual loopback device such as **VB-CABLE**, **Voicemeeter**, or `virtual-audio-capturer`. These are fallback/remediation tools if the WASAPI sidecar is missing or a specific endpoint cannot be captured, not the primary stock-Windows requirement.
-
-If system audio capture fails or records the wrong source, run `transcribe --list-devices` and choose a displayed `wasapi-loopback` render endpoint such as `Speakers (...) [Loopback]` or `Headphones (...) [Loopback]` for `audio.output_device_id` or `--output`. For helper diagnostics, `wasapi-loopback-recorder.exe list --json` lists active WASAPI render endpoints and marks the current default endpoint. If the bundled helper is missing, set `TRANSCRIBE_WINDOWS_WASAPI_HELPER` to its path or rebuild the Windows package.
-
-MS Teams speaker recognition is best-effort on Windows via PowerShell process/window-title polling. It avoids native UI Automation/cgo for cross-compilation safety, updates output speaker labels when a recognizable Teams title is found, and otherwise falls back to `Person_?` with a warning.
-
-### macOS
-
-Microphone capture uses an AVFoundation-style default. System output capture requires a virtual loopback device such as BlackHole/Soundflower or a future native ScreenCaptureKit/CoreAudio helper. Configure `audio.output_device_id` to the ffmpeg AVFoundation input for that virtual device.
-
-MS Teams speaker recognition is not available on macOS and falls back to `Person_?`.
-
-## Limitations
-
-- The external ffmpeg backend records short bounded-duration chunks, which the per-source segmenter combines into speech-oriented segments before transcription.
-- Windows WASAPI render-device capture is implemented in the bundled sidecar helper; unusual endpoint formats/devices may still need manual validation on real hardware.
-- Other system-output capture depends on OS audio setup and `ffmpeg` support.
-- Windows Teams speaker detection is best-effort title probing, not full UI Automation.
-- OpenAI transcription is the only transcription provider.
-- No summaries, assistant, vector store, agents, or local Whisper are included.
+- `engine/session.py` recording pipeline (restored flow from `transcribe.py`)
+- `engine/audio_capture.py`, `speaker_detection.py`, `transcriber.py`, `transcript_filter.py` restored from the Python version
+- `engine/profiles.py` live stats and saved profiles
+- `engine/checks.py`, `engine/llm.py` local AI checks, Ollama install
+- `engine/server.py` socket protocol, `engine/demo.py` scripted demo meeting
+- `ui/scripts/stage.gd` the speaker circle, `main.gd` app shell, `engine_client.gd` socket + engine launcher, `settings_dialog.gd`, `speaker_panel.gd`, `profiles_dialog.gd`

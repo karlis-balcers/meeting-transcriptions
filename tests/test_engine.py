@@ -156,3 +156,115 @@ class ServerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FakeStream:
+    def __init__(self, rate, chunk):
+        self.chunk = chunk
+        self.calls = 0
+
+    def read(self, n, exception_on_overflow=False):
+        import struct
+        import time as _t
+
+        _t.sleep(0.002)
+        self.calls += 1
+        # ~0.5s of loud audio, then silence, repeating.
+        loud = (self.calls % 200) < 5
+        value = 3000 if loud else 0
+        return struct.pack(f"{n}h", *([value] * n))
+
+    def is_active(self):
+        return True
+
+    def stop_stream(self):
+        pass
+
+    def close(self):
+        pass
+
+
+class FakePyAudio:
+    paInt16 = 8
+
+    def __init__(self):
+        self.devices = [
+            {"index": 0, "name": "Mic", "maxInputChannels": 1, "maxOutputChannels": 0, "defaultSampleRate": 16000},
+            {"index": 1, "name": "BlackHole", "maxInputChannels": 1, "maxOutputChannels": 2, "defaultSampleRate": 16000},
+        ]
+
+    def get_device_count(self):
+        return len(self.devices)
+
+    def get_device_info_by_index(self, i):
+        return self.devices[i]
+
+    def get_default_input_device_info(self):
+        return self.devices[0]
+
+    def get_default_output_device_info(self):
+        return self.devices[1]
+
+    def get_sample_size(self, fmt):
+        return 2
+
+    def get_format_from_width(self, w):
+        return 8
+
+    def open(self, rate, frames_per_buffer, **kwargs):
+        return FakeStream(rate, frames_per_buffer)
+
+    def terminate(self):
+        pass
+
+
+class PipelineTests(unittest.TestCase):
+    """Start/stop with fake audio and a fake transcriber, end to end through the threads."""
+
+    def test_start_record_stop_saves_transcript_stats_and_profiles(self):
+        import sys
+        import time
+        import types
+        from unittest import mock
+
+        fake_module = types.SimpleNamespace(PyAudio=FakePyAudio, paInt16=8)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        d = Path(tmp.name)
+        store = SettingsStore(d / "settings.json", env_file=d / "none.env")
+        store.update({
+            "output_dir": str(d / "out"), "temp_dir": str(d / "tmp"), "openai_api_key": "sk-test",
+            "silence_duration": 0.2, "frame_duration_ms": 20, "your_name": "Karlis",
+        })
+        events = []
+
+        class Transcriber:
+            def __init__(self, **kwargs):
+                pass
+
+            def transcribe(self, path):
+                return [Segment(0, 1.0, "We should ship the release on Friday")]
+
+        with mock.patch.dict(sys.modules, {"pyaudio": fake_module, "pyaudiowpatch": fake_module}), \
+                mock.patch("engine.transcriber.OpenAITranscribe", Transcriber), \
+                mock.patch("engine.session.sys.platform", "darwin"):
+            session = Session(store, events.append)
+            self.addCleanup(session.checks.stop)
+            result = session.start()
+            self.assertTrue(result["ok"], result)
+            deadline = time.time() + 10
+            while time.time() < deadline and len([e for e in events if e["type"] == "transcript"]) < 2:
+                time.sleep(0.05)
+            session.stop()
+
+        transcripts = [e for e in events if e["type"] == "transcript"]
+        self.assertGreaterEqual(len(transcripts), 2)
+        self.assertEqual({t["speaker"] for t in transcripts}, {"Karlis", "Remote"})
+        self.assertTrue(any(e["type"] == "level" for e in events))
+        md = Path(session.transcript_path)
+        self.assertIn("Karlis: We should ship", md.read_text(encoding="utf-8"))
+        self.assertTrue(Path(str(md)[:-3] + "-stats.json").exists())
+        profiles = session.profiles()
+        self.assertIn("Karlis", profiles)
+        self.assertEqual(profiles["Karlis"]["meetings"], 1)
+        self.assertFalse(session.recording)

@@ -14,6 +14,7 @@ import logging
 import socket
 import socketserver
 import threading
+import time
 from typing import Any, Callable, Optional
 
 from . import __version__, llm
@@ -89,7 +90,8 @@ class Engine:
         self.hub.send({"type": "llm", "state": "status", **info})
         return info
 
-    def _llm_task(self, name: str, work: Callable[[Callable[[str, float], None]], str]) -> dict[str, Any]:
+    def _llm_task(self, name: str, work: Callable[[Callable[[str, float], None]], str],
+                  refresh: bool = True) -> dict[str, Any]:
         if not self._llm_busy.acquire(blocking=False):
             return {"ok": False, "error": "Local AI setup already running"}
 
@@ -105,7 +107,8 @@ class Engine:
                 self.hub.send({"type": "llm", "state": "error", "message": str(e)})
             finally:
                 self._llm_busy.release()
-                self.llm_status()
+                if refresh:
+                    self.llm_status()
 
         threading.Thread(target=run, name=name, daemon=True).start()
         return {"ok": True}
@@ -173,6 +176,12 @@ class Engine:
             return s.rename_speaker(str(args.get("old") or ""), str(args.get("new") or ""))
         if cmd == "profiles":
             return s.profiles()
+        if cmd == "rename_profile":
+            from .profiles import ProfileBook
+
+            ProfileBook(self.store.get()["output_dir"]).rename(str(args.get("old") or ""), str(args.get("new") or ""))
+            self.hub.send({"type": "profiles", "profiles": s.profiles()})
+            return {"ok": True}
         if cmd == "delete_profile":
             s.delete_profile(str(args.get("name") or ""))
             return {"ok": True}
@@ -188,7 +197,14 @@ class Engine:
             return {"ok": started, "error": None if started else "Ollama is not installed"}
         if cmd == "llm_test":
             client = llm.LLMClient.from_settings(self.store.get())
-            return client.chat_json("Reply with JSON only.", 'Return {"ok": true}')
+
+            def test(progress: Callable[[str, float], None]) -> str:
+                progress(f"Asking {client.model}...", -1.0)
+                started = time.time()
+                reply = client.chat_json("Reply with JSON only.", 'Return {"ok": true}')
+                return f"{client.model} answered in {time.time() - started:.1f}s: {json.dumps(reply)}"
+
+            return self._llm_task("llm-test", test, refresh=False)
         if cmd == "ping":
             return {"pong": True}
         raise ValueError(f"Unknown command: {cmd}")

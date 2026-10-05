@@ -369,6 +369,7 @@ class Session:
         settings = self.store.get()
         if old == settings["your_name"]:
             self.store.update({"your_name": new})
+            self.emit({"type": "settings", "settings": self.store.public()})
         self.aliases[old] = new
         self.stats.rename(old, new)
         if not self.recording:
