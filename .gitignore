@@ -118,3 +118,8 @@ context.md
 .squad-workstream
 transcription-*.md
 
+
+# Engine / UI builds
+.venv/
+dist/
+ui/.godot/
