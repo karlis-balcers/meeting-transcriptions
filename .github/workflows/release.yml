@@ -8,6 +8,14 @@ on:
   push:
     tags: [ "v*" ]
   workflow_dispatch:
+  # Also build (without publishing) when the packaging itself changes.
+  pull_request:
+    paths:
+      - build.py
+      - packaging/**
+      - requirements*.txt
+      - ui/export_presets.cfg
+      - .github/workflows/release.yml
 
 permissions:
   contents: write
