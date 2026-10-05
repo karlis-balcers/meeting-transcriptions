@@ -85,7 +85,7 @@ jobs:
           if [ "$RUNNER_OS" = "Windows" ]; then
             python packaging/smoke_engine.py dist/windows/engine/meeting-engine.exe
           else
-            python packaging/smoke_engine.py dist/macos/MeetingTranscriptions.app/Contents/MacOS/engine/meeting-engine
+            python packaging/smoke_engine.py dist/macos/*.app/Contents/MacOS/engine/meeting-engine
           fi
 
       - name: Upload build
