@@ -70,7 +70,9 @@ func _ready() -> void:
 
 	profiles_dialog = ProfilesDialog.new()
 	profiles_dialog.delete_requested.connect(func(n): engine.send("delete_profile", {"name": n}))
-	profiles_dialog.rename_requested.connect(func(a, b): engine.send("rename_profile", {"old": a, "new": b}))
+	profiles_dialog.rename_requested.connect(func(a, b):
+		Avatars.rename(a, b)
+		engine.send("rename_profile", {"old": a, "new": b}))
 	add_child(profiles_dialog)
 
 	engine = EngineClient.new()
