@@ -318,7 +318,7 @@ func _on_llm_action(action: String) -> void:
 			var err = resp.get("error") if not resp.get("ok", false) else data.get("error")
 			settings_dialog.set_llm_status("Error: " + str(err))
 		elif action == "llm_start":
-			settings_dialog.set_llm_status("Starting Ollama, press Check in a moment."))
+			settings_dialog.set_llm_status("Starting the local AI, press Check in a moment."))
 
 
 func _select_device(kind: String, button: OptionButton, index: int) -> void:
@@ -513,10 +513,12 @@ func _on_llm(msg: Dictionary) -> void:
 				text = "Ready: %s at %s" % [msg.get("model", ""), msg.get("base_url", "")]
 			elif msg.get("running", false):
 				text = "Server is running but model %s is not downloaded. Press Download model." % msg.get("model", "")
+			elif msg.get("starting", false):
+				text = "Starting %s..." % _llm_name(msg)
 			elif msg.get("installed", false):
-				text = "Ollama is installed but not running. Press Start Ollama."
+				text = "%s is installed but not running. Press Start." % _llm_name(msg)
 			else:
-				text = "Ollama is not installed. Press Install to set it up."
+				text = "%s is not installed. Press Install to set it up." % _llm_name(msg)
 			settings_dialog.set_llm_status(text)
 			_update_ai_button()
 		"busy":
@@ -528,6 +530,15 @@ func _on_llm(msg: Dictionary) -> void:
 		"error":
 			settings_dialog.set_llm_status("Error: " + str(msg.get("message", "")))
 			_set_status("Local AI: " + str(msg.get("message", "")), "error")
+
+
+func _llm_name(info: Dictionary) -> String:
+	match str(info.get("api", "")):
+		"laya":
+			return "Laya"
+		"ollama":
+			return "Ollama"
+	return "The local AI server"
 
 
 func _set_profiles(p: Dictionary) -> void:

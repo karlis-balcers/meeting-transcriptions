@@ -1,4 +1,8 @@
-"""Live per-utterance checks on a local LLM: mood, fact check and user-defined checks.
+"""Live per-utterance checks on local AI: mood, fact check and user-defined checks.
+
+With Laya all checks of one utterance are asked in a single call as typed
+questions (a mood choice, yes/no probabilities). With Ollama or an
+OpenAI-compatible server each check is a prompt that returns JSON.
 
 Each finished utterance is queued; one worker thread runs the enabled checks
 against the local model and emits results. When the model can't keep up the
@@ -13,6 +17,7 @@ from dataclasses import dataclass, field
 from threading import Condition, Event, Thread
 from typing import Any, Callable, Optional
 
+from . import laya
 from .llm import LLMClient, LLMError
 from .profiles import MOOD_VALENCE
 
@@ -21,6 +26,10 @@ logger = logging.getLogger("checks")
 MOODS = list(MOOD_VALENCE.keys())
 FACT_VERDICTS = ("correct", "incorrect", "doubtful", "no_claim")
 MAX_PENDING = 6
+# Laya gives probabilities; how sure it has to be before a check counts as a hit.
+LAYA_HIT = 0.6
+LAYA_FACT = 0.7
+LAYA_INTENSITY = ["mild", "clear", "strong"]
 
 
 @dataclass
@@ -75,6 +84,45 @@ def custom_messages(u: Utterance, check: dict[str, Any]) -> tuple[str, str]:
     return system, _context_block(u)
 
 
+def laya_questions(u: Utterance, settings: dict[str, Any]) -> dict[str, dict]:
+    """All enabled checks for this utterance as Laya questions, keyed by check id."""
+    q: dict[str, dict] = {}
+    if settings.get("mood_enabled"):
+        q["mood"] = {"type": "choice", "instructions": "What is the mood of the speaker of the LATEST utterance?",
+                     "criteria": {m: m for m in MOODS}}
+        q["intensity"] = {"type": "score", "instructions": "How strong is the speaker's emotion in the LATEST utterance?",
+                          "criteria": LAYA_INTENSITY}
+    if settings.get("fact_check_enabled") and applies(settings.get("fact_check_applies_to", "everyone"), u.is_me):
+        q["fact"] = {"type": "noul", "instructions": (
+            "Does the LATEST utterance state a concrete fact (a number, date, name, technical or historical fact) "
+            "that is wrong?")}
+    for check in settings.get("custom_checks") or []:
+        if check.get("enabled") and check.get("prompt") and applies(check.get("applies_to", "everyone"), u.is_me):
+            q["custom:" + check["id"]] = {"type": "noul", "instructions": check["prompt"]}
+    return q
+
+
+def parse_laya_mood(answers: dict[str, Any]) -> Optional[dict[str, Any]]:
+    mood = answers.get("mood") or {}
+    intensity = answers.get("intensity") or {}
+    try:
+        level = float(intensity.get("score", 1.0)) / (len(LAYA_INTENSITY) - 1)
+    except (TypeError, ValueError):
+        level = 0.5
+    parsed = parse_mood({"mood": mood.get("choice"), "intensity": level})
+    if parsed:
+        sure = mood.get("answer_confidence", mood.get("confidence"))
+        parsed["reason"] = f"{float(sure):.0%} sure" if isinstance(sure, (int, float)) else ""
+    return parsed
+
+
+def _probability(answer: Any) -> float:
+    try:
+        return float((answer or {}).get("noul", 0.0))
+    except (TypeError, ValueError, AttributeError):
+        return 0.0
+
+
 def parse_mood(data: dict[str, Any]) -> Optional[dict[str, Any]]:
     mood = str(data.get("mood") or "").strip().lower()
     if mood not in MOOD_VALENCE:
@@ -115,13 +163,15 @@ class CheckRunner:
                  on_mood: Optional[Callable[[str, str, float, float], None]] = None,
                  on_fact: Optional[Callable[[str, str], None]] = None,
                  on_hit: Optional[Callable[[str, str], None]] = None,
-                 client_factory: Callable[[dict], LLMClient] = LLMClient.from_settings):
+                 client_factory: Callable[[dict], LLMClient] = LLMClient.from_settings,
+                 laya_predict: Callable[..., dict[str, Any]] = laya.predict):
         self._settings_getter = settings_getter
         self._emit = emit
         self._on_mood = on_mood
         self._on_fact = on_fact
         self._on_hit = on_hit
         self._client_factory = client_factory
+        self._laya_predict = laya_predict
         self._queue: deque[Utterance] = deque()
         self._cond = Condition()
         self._stop = Event()
@@ -165,22 +215,28 @@ class CheckRunner:
             except Exception as e:  # never let the worker die
                 logger.exception("Check run failed: %s", e)
 
+    def _warn(self, error: Exception) -> None:
+        if time.time() - self._last_error_at > 30:
+            self._last_error_at = time.time()
+            self._emit({"type": "status", "level": "warning", "message": f"Local AI: {error}"})
+        logger.debug("Local AI call failed: %s", error)
+
     def _ask(self, client: LLMClient, messages: tuple[str, str]) -> Optional[dict[str, Any]]:
         try:
             return client.chat_json(*messages)
         except LLMError as e:
-            if time.time() - self._last_error_at > 30:
-                self._last_error_at = time.time()
-                self._emit({"type": "status", "level": "warning", "message": f"Local AI: {e}"})
-            logger.debug("LLM call failed: %s", e)
+            self._warn(e)
             return None
 
     def run_checks(self, u: Utterance) -> None:
         settings = self._settings_getter()
         if not settings.get("llm_enabled"):
             return
-        client = self._client_factory(settings)
         base = {"type": "check", "utterance_id": u.id, "speaker": u.speaker, "at": u.at}
+        if settings.get("llm_api") == "laya":
+            self._run_laya(u, settings, base)
+            return
+        client = self._client_factory(settings)
 
         if settings.get("mood_enabled"):
             data = self._ask(client, mood_messages(u, settings.get("mood_prompt", "")))
@@ -210,3 +266,45 @@ class CheckRunner:
                     **base, "check_id": check["id"], "kind": "custom", "name": check["name"],
                     "color": check.get("color"), "result": hit,
                 })
+
+    def _run_laya(self, u: Utterance, settings: dict[str, Any], base: dict[str, Any]) -> None:
+        questions = laya_questions(u, settings)
+        if not questions:
+            return
+        try:
+            answers = self._laya_predict(settings.get("llm_base_url") or laya.DEFAULT_URL, _context_block(u),
+                                         questions, timeout=float(settings.get("llm_timeout_seconds", 30.0)))
+        except laya.LayaError as e:
+            self._warn(e)
+            return
+
+        if "mood" in questions:
+            mood = parse_laya_mood(answers)
+            if mood:
+                if self._on_mood:
+                    self._on_mood(u.speaker, mood["mood"], mood["valence"], u.at)
+                self._emit({**base, "check_id": "mood", "kind": "mood", "name": "Mood", "result": mood})
+
+        if "fact" in questions:
+            p = _probability(answers.get("fact"))
+            if p >= LAYA_FACT:
+                # Laya can only say "this looks wrong", not what is right.
+                fact = {"verdict": "doubtful", "claim": u.text[:160],
+                        "note": f"Laya thinks this is likely wrong ({p:.0%}). It has no internet, so double-check."}
+                if self._on_fact:
+                    self._on_fact(u.speaker, fact["verdict"])
+                self._emit({**base, "check_id": "fact", "kind": "fact", "name": "Fact check", "result": fact})
+
+        for check in settings.get("custom_checks") or []:
+            key = "custom:" + str(check.get("id"))
+            if key not in questions:
+                continue
+            p = _probability(answers.get(key))
+            if p < LAYA_HIT:
+                continue
+            if self._on_hit:
+                self._on_hit(u.speaker, check["name"])
+            self._emit({
+                **base, "check_id": check["id"], "kind": "custom", "name": check["name"],
+                "color": check.get("color"), "result": {"label": check["name"], "note": f"{p:.0%} sure"},
+            })

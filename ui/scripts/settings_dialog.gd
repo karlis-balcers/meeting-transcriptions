@@ -31,9 +31,9 @@ const FIELDS := [
 	["Filtering", "filter_contains", "Contains matches", "string", ""],
 	["Filtering", "filter_regex", "Regex patterns", "string", ""],
 	["Local AI", "llm_enabled", "Enable live checks on local AI", "bool", ""],
-	["Local AI", "llm_api", "Server type", "option", "ollama,openai"],
-	["Local AI", "llm_base_url", "Server URL", "string", "Ollama: http://127.0.0.1:11434. llama.cpp / LM Studio: their OpenAI-style URL."],
-	["Local AI", "llm_model", "Model", "string", "e.g. llama3.2:3b, qwen2.5:3b, gemma3:4b"],
+	["Local AI", "llm_api", "Server type", "option", "laya,ollama,openai"],
+	["Local AI", "llm_base_url", "Server URL", "string", "Laya: http://127.0.0.1:8765. Ollama: http://127.0.0.1:11434. llama.cpp / LM Studio: their OpenAI-style URL."],
+	["Local AI", "llm_model", "Model", "string", "Ollama / OpenAI-style only, e.g. llama3.2:3b, qwen2.5:3b. Laya picks its own."],
 	["Local AI", "llm_timeout_seconds", "Timeout (s)", "float", ""],
 	["Local AI", "llm_context_lines", "Context lines", "int", "Earlier lines sent with each check."],
 	["Local AI", "mood_enabled", "Mood of each speaker", "bool", ""],
@@ -202,7 +202,9 @@ func _add_llm_controls(form: VBoxContainer) -> void:
 	var v := VBoxContainer.new()
 	box.add_child(v)
 	var info := Label.new()
-	info.text = "Runs on your computer with Ollama, nothing leaves the machine. The local model has no internet, so fact checks use what the model knows."
+	info.text = ("Runs on your computer, nothing leaves the machine. Laya (default) is a small, fast decision model: " +
+		"great for mood and yes/no checks in 100+ languages, but it can only flag a claim as probably wrong. " +
+		"Ollama runs a full chat model: slower, better fact checks. Neither has internet.")
 	info.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	info.add_theme_color_override("font_color", Palette.TEXT_DIM)
 	v.add_child(info)
@@ -215,8 +217,8 @@ func _add_llm_controls(form: VBoxContainer) -> void:
 	_llm_progress.step = 0.001
 	v.add_child(_llm_progress)
 	var buttons := HBoxContainer.new()
-	for spec in [["Install Ollama + model", "llm_install"], ["Download model", "llm_pull"],
-			["Start Ollama", "llm_start"], ["Check", "llm_status"], ["Test", "llm_test"]]:
+	for spec in [["Install", "llm_install"], ["Download model", "llm_pull"],
+			["Start", "llm_start"], ["Check", "llm_status"], ["Test", "llm_test"]]:
 		var b := Button.new()
 		b.text = spec[0]
 		var action: String = spec[1]
@@ -224,7 +226,7 @@ func _add_llm_controls(form: VBoxContainer) -> void:
 		buttons.add_child(b)
 	v.add_child(buttons)
 	var note := Label.new()
-	note.text = "Save first if you changed the model or URL."
+	note.text = "Install sets up the server type picked above (Laya: about 1 GB with PyTorch). Save first if you changed it."
 	note.add_theme_font_size_override("font_size", 11)
 	note.add_theme_color_override("font_color", Palette.TEXT_DIM)
 	v.add_child(note)

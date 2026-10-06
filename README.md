@@ -2,7 +2,7 @@
 
 Near real-time transcription of both sides of a call: your microphone and whatever comes out of your speakers (the people on the other side of Teams/Zoom/Meet). Everyone who talks shows up as a node in a circle, the live transcript runs in the middle, and the app builds a profile with stats for each speaker over time.
 
-Optionally, a local LLM (Ollama) runs live checks on every line: mood of each speaker, a fact check, and any custom checks you write yourself. Nothing of that leaves your machine.
+Optionally, local AI ([Laya](https://pypi.org/project/laya/) by default, or Ollama) runs live checks on every line: mood of each speaker, a fact check, and any custom checks you write yourself. Nothing of that leaves your machine.
 
 ![speakers in a circle around the live transcript](docs/screenshot.png)
 
@@ -44,7 +44,10 @@ Why this split: the hard platform parts (WASAPI loopback on Windows, Teams UI au
 - Live stats per speaker: talk time and share, turns, words, pace (wpm), questions, interruptions, filler words, longest turn, topics. Lines between speakers show who answers whom.
 - Speaker profiles across meetings in `<output folder>/speaker-profiles.json`: meetings, total talk time, average share, pace, questions per meeting, usual mood and topics. See them under **Profiles**.
 - Local AI checks (optional): mood per line (shown as the color ring around the speaker and a mood line in the sidebar), fact check (from the model's own knowledge, no internet), and your own yes/no checks with a name, color and who they apply to (everyone, others, me). Default custom check example: "Action item".
-- **Install** button in Settings > Local AI: installs Ollama (winget or the installer on Windows, Homebrew or the app download on macOS), starts it and downloads the model (`llama3.2:3b` by default). Any OpenAI-compatible local server works too (llama.cpp server, LM Studio): set *Server type* to `openai` and the URL.
+- **Install** button in Settings > Local AI sets up the server type you picked:
+  - `laya` (default): [Laya](https://pypi.org/project/laya/) is a small local decision model. It answers all checks for a line in one fast pass, in 100+ languages (Latvian too). Install gets [uv](https://docs.astral.sh/uv/), which brings its own Python, creates a venv in the settings folder (`laya/venv`), runs `pip install "laya[serve]"` (PyTorch included, about 1 GB) and downloads the model. The engine then runs `laya-serve` on `127.0.0.1:8765` and starts it again when the app opens. It's very good at mood and yes/no checks. For fact checks it can only flag a line as "probably wrong", it can't tell you the right answer.
+  - `ollama`: installs Ollama (winget or the installer on Windows, Homebrew or the app download on macOS), starts it and downloads the model (`llama3.2:3b` by default). Slower, but better fact checks with a short explanation.
+  - `openai`: any OpenAI-compatible local server (llama.cpp server, LM Studio). Set the URL.
 - No AI summaries or assistant panels anymore, that was dropped on purpose.
 
 ## Run it from source
@@ -113,6 +116,6 @@ Layout:
 - `engine/session.py` recording pipeline (restored flow from `transcribe.py`)
 - `engine/audio_capture.py`, `speaker_detection.py`, `transcriber.py`, `transcript_filter.py` restored from the Python version
 - `engine/profiles.py` live stats and saved profiles
-- `engine/checks.py`, `engine/llm.py` local AI checks, Ollama install
+- `engine/checks.py` local AI checks, `engine/laya.py` Laya install and client, `engine/llm.py` Ollama / OpenAI-style client and Ollama install
 - `engine/server.py` socket protocol, `engine/demo.py` scripted demo meeting
 - `ui/scripts/stage.gd` the speaker circle, `main.gd` app shell, `engine_client.gd` socket + engine launcher, `settings_dialog.gd`, `speaker_panel.gd`, `profiles_dialog.gd`
