@@ -4,7 +4,8 @@ extends Window
 ## plus Local AI (Ollama) and user-defined live checks.
 
 signal save_requested(values: Dictionary)
-signal llm_action(action: String)
+## `server` carries the server type, URL and model as currently set in the form (saved or not).
+signal llm_action(action: String, server: Dictionary)
 
 # [tab, key, label, type, extra]
 const FIELDS := [
@@ -33,7 +34,7 @@ const FIELDS := [
 	["Local AI", "llm_enabled", "Enable live checks on local AI", "bool", ""],
 	["Local AI", "llm_api", "Server type", "option", "laya,ollama,openai"],
 	["Local AI", "llm_base_url", "Server URL", "string", "Laya: http://127.0.0.1:8765. Ollama: http://127.0.0.1:11434. llama.cpp / LM Studio: their OpenAI-style URL."],
-	["Local AI", "llm_model", "Model", "string", "Ollama / OpenAI-style only, e.g. llama3.2:3b, qwen2.5:3b. Laya picks its own."],
+	["Local AI", "llm_model", "Model", "string", ""],
 	["Local AI", "llm_timeout_seconds", "Timeout (s)", "float", ""],
 	["Local AI", "llm_context_lines", "Context lines", "int", "Earlier lines sent with each check."],
 	["Local AI", "mood_enabled", "Mood of each speaker", "bool", ""],
@@ -51,6 +52,24 @@ var _tabs: TabContainer
 var _checks_box: VBoxContainer
 var _llm_status: Label
 var _llm_progress: ProgressBar
+var _llm_log: TextEdit
+var _llm_info: Label
+var _llm_buttons := {}
+var _model_hint: Label
+var _model_presets: OptionButton
+const LAYA_URL := "http://127.0.0.1:8765"
+const OLLAMA_URL := "http://127.0.0.1:11434"
+const OLLAMA_MODELS := [
+	["llama3.2:3b", "Llama 3.2 3B, about 2 GB, fast, good English"],
+	["qwen2.5:3b", "Qwen 2.5 3B, about 2 GB, better with other languages"],
+	["gemma3:4b", "Gemma 3 4B, about 3 GB, slower, best fact checks of the three"],
+]
+var _llm_log_toggle: Button
+var _llm_busy_text := ""
+var _llm_busy := false
+var _llm_busy_since := 0.0
+var _llm_tick := 0.0
+const LLM_LOG_MAX_LINES := 400
 var _key_set := false
 var _dir_dialog: FileDialog
 var _dir_target: LineEdit
@@ -81,9 +100,10 @@ func _ready() -> void:
 		var tab: String = f[0]
 		if not tab_forms.has(tab):
 			tab_forms[tab] = _make_tab(tab)
-			if tab == "Local AI":
-				_add_llm_controls(tab_forms[tab])
 		_add_field(tab_forms[tab], f)
+		# The setup box sits right under server type / URL / model, which it acts on.
+		if f[1] == "llm_model":
+			_add_llm_controls(tab_forms[tab])
 	_build_checks_tab()
 
 	var bottom := HBoxContainer.new()
@@ -201,13 +221,10 @@ func _add_llm_controls(form: VBoxContainer) -> void:
 	box.add_theme_stylebox_override("panel", Palette.panel_style(Palette.PANEL_LIGHT, 8, 10))
 	var v := VBoxContainer.new()
 	box.add_child(v)
-	var info := Label.new()
-	info.text = ("Runs on your computer, nothing leaves the machine. Laya (default) is a small, fast decision model: " +
-		"great for mood and yes/no checks in 100+ languages, but it can only flag a claim as probably wrong. " +
-		"Ollama runs a full chat model: slower, better fact checks. Neither has internet.")
-	info.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	info.add_theme_color_override("font_color", Palette.TEXT_DIM)
-	v.add_child(info)
+	_llm_info = Label.new()
+	_llm_info.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_llm_info.add_theme_color_override("font_color", Palette.TEXT_DIM)
+	v.add_child(_llm_info)
 	_llm_status = Label.new()
 	_llm_status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	v.add_child(_llm_status)
@@ -216,20 +233,61 @@ func _add_llm_controls(form: VBoxContainer) -> void:
 	_llm_progress.max_value = 1.0
 	_llm_progress.step = 0.001
 	v.add_child(_llm_progress)
-	var buttons := HBoxContainer.new()
-	for spec in [["Install", "llm_install"], ["Download model", "llm_pull"],
-			["Start", "llm_start"], ["Check", "llm_status"], ["Test", "llm_test"]]:
+	var buttons := HFlowContainer.new()
+	for action in ["llm_install", "llm_pull", "llm_start", "llm_status", "llm_test"]:
 		var b := Button.new()
-		b.text = spec[0]
-		var action: String = spec[1]
-		b.pressed.connect(func(): llm_action.emit(action))
+		b.pressed.connect(func(): llm_action.emit(action, _server_values()))
 		buttons.add_child(b)
+		_llm_buttons[action] = b
 	v.add_child(buttons)
-	var note := Label.new()
-	note.text = "Install sets up the server type picked above (Laya: about 1 GB with PyTorch). Save first if you changed it."
-	note.add_theme_font_size_override("font_size", 11)
-	note.add_theme_color_override("font_color", Palette.TEXT_DIM)
-	v.add_child(note)
+	# Everything the installer prints (uv, pip, winget, the model download), like a small terminal.
+	_llm_log_toggle = Button.new()
+	_llm_log_toggle.text = "Show setup log"
+	_llm_log_toggle.toggle_mode = true
+	_llm_log_toggle.toggled.connect(func(on: bool):
+		_llm_log.visible = on
+		_llm_log_toggle.text = "Hide setup log" if on else "Show setup log")
+	v.add_child(_llm_log_toggle)
+	_llm_log = TextEdit.new()
+	_llm_log.editable = false
+	_llm_log.visible = false
+	_llm_log.custom_minimum_size = Vector2(0, 220)
+	_llm_log.wrap_mode = TextEdit.LINE_WRAPPING_BOUNDARY
+	_llm_log.add_theme_font_override("font", _monospace())
+	_llm_log.add_theme_font_size_override("font_size", 12)
+	_llm_log.add_theme_color_override("background_color", Palette.BG)
+	v.add_child(_llm_log)
+	var api: OptionButton = _widgets["llm_api"]
+	api.item_selected.connect(func(_i):
+		# Switching server type with the other one's default URL still there: use this one's default.
+		var url: LineEdit = _widgets["llm_base_url"]
+		var picked := api.get_item_text(api.selected)
+		if picked == "laya" and url.text.strip_edges() in ["", OLLAMA_URL]:
+			url.text = LAYA_URL
+		elif picked == "ollama" and url.text.strip_edges() in ["", LAYA_URL]:
+			url.text = OLLAMA_URL
+		if not _llm_busy:
+			set_llm_status("Not checked yet for %s. Press \"Check if it's running\"." % picked)
+		_refresh_llm_controls())
+	var model: LineEdit = _widgets["llm_model"]
+	model.text_changed.connect(func(_t): _refresh_llm_controls())
+	# Ollama model picker, fills the Model field.
+	var model_row: VBoxContainer = model.get_parent()
+	_model_presets = OptionButton.new()
+	_model_presets.add_item("Pick a suggested Ollama model...")
+	for preset in OLLAMA_MODELS:
+		_model_presets.add_item("%s  -  %s" % preset)
+	_model_presets.item_selected.connect(func(i):
+		if i > 0:
+			model.text = OLLAMA_MODELS[i - 1][0]
+			_model_presets.select(0)
+			_refresh_llm_controls())
+	model_row.add_child(_model_presets)
+	_model_hint = Label.new()
+	_model_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_model_hint.add_theme_font_size_override("font_size", 11)
+	_model_hint.add_theme_color_override("font_color", Palette.TEXT_DIM)
+	model_row.add_child(_model_hint)
 	form.add_child(box)
 
 
@@ -315,6 +373,7 @@ func open_with(settings: Dictionary) -> void:
 	for check in settings.get("custom_checks", []):
 		_add_check_row(check)
 	_config_path.text = "Settings file: " + str(settings.get("config_path", ""))
+	_refresh_llm_controls()
 	popup_centered()
 
 
@@ -356,9 +415,140 @@ func _on_save() -> void:
 	hide()
 
 
-func set_llm_status(text: String, progress: float = -2.0) -> void:
+func _server_values() -> Dictionary:
+	var api: OptionButton = _widgets["llm_api"]
+	return {
+		"llm_api": api.get_item_text(api.selected),
+		"llm_base_url": (_widgets["llm_base_url"] as LineEdit).text.strip_edges(),
+		"llm_model": (_widgets["llm_model"] as LineEdit).text.strip_edges(),
+	}
+
+
+## Say exactly what each button does for the server type picked right now.
+func _refresh_llm_controls() -> void:
+	if _llm_info == null:
+		return
+	var server := _server_values()
+	var model: String = server["llm_model"]
+	var model_edit: LineEdit = _widgets["llm_model"]
+	var b: Dictionary = _llm_buttons
+	match server["llm_api"]:
+		"laya":
+			_llm_info.text = ("Laya is a small local decision model (the pip package \"laya\"). It answers the mood and yes/no " +
+				"checks for each line in one fast pass, in 100+ languages, but for fact checks it can only flag a line " +
+				"as probably wrong. Nothing leaves your computer.")
+			b["llm_install"].text = "Install Laya (about 1 GB)"
+			b["llm_install"].tooltip_text = ("Downloads uv, which brings its own Python, then installs Laya and PyTorch " +
+				"into the app's settings folder (laya/venv), starts the Laya server and downloads the model. " +
+				"Nothing else on your computer is changed.")
+			b["llm_pull"].text = "Download Laya model"
+			b["llm_pull"].tooltip_text = ("Downloads Laya's English and multilingual checkpoints from Hugging Face " +
+				"(convaiinnovations/laya). Laya picks one per line by its language. Install already does this.")
+			b["llm_start"].text = "Start Laya server"
+			b["llm_start"].tooltip_text = "Starts the Laya server in the background (the app also starts it by itself when it opens)."
+			model_edit.visible = false
+			_model_hint.text = "Laya has no model to pick: it chooses its English or multilingual checkpoint per line."
+			_model_presets.visible = false
+		"ollama":
+			_llm_info.text = ("Ollama runs a full chat model on your computer. Slower than Laya, but fact checks come with " +
+				"a short explanation. Nothing leaves your computer.")
+			b["llm_install"].text = "Install Ollama"
+			b["llm_install"].tooltip_text = ("Installs the Ollama app (winget on Windows, Homebrew or the app download " +
+				"on macOS), starts it and downloads the model below.")
+			b["llm_pull"].text = "Download %s" % (model if model != "" else "model")
+			b["llm_pull"].tooltip_text = "Downloads the model named in Model from ollama.com into Ollama."
+			b["llm_start"].text = "Start Ollama server"
+			b["llm_start"].tooltip_text = "Starts Ollama in the background if it isn't running."
+			model_edit.visible = true
+			_model_hint.text = "The Ollama model to use and download. Pick one of the suggestions or type any name from ollama.com/library."
+			_model_presets.visible = true
+		_:
+			_llm_info.text = ("Your own OpenAI-compatible server (LM Studio, llama.cpp server...). You install and start it " +
+				"yourself; the app only connects to the URL and uses the model name below.")
+			model_edit.visible = true
+			_model_hint.text = "The model name your server expects."
+			_model_presets.visible = false
+	var managed: bool = server["llm_api"] != "openai"
+	b["llm_install"].visible = managed
+	b["llm_pull"].visible = managed
+	b["llm_start"].visible = managed
+	b["llm_status"].text = "Check if it's running"
+	b["llm_status"].tooltip_text = "Asks the server at the URL above whether it's up and the model is there."
+	b["llm_test"].text = "Test with a sample line"
+	b["llm_test"].tooltip_text = "Sends one sample sentence and shows the answer and how long it took."
+
+
+func _monospace() -> SystemFont:
+	var font := SystemFont.new()
+	font.font_names = PackedStringArray(["Consolas", "Menlo", "DejaVu Sans Mono", "monospace"])
+	return font
+
+
+func show_llm_log() -> void:
+	if _llm_log_toggle != null and not _llm_log_toggle.button_pressed:
+		_llm_log_toggle.button_pressed = true
+
+
+func append_llm_log(line: String) -> void:
+	if _llm_log == null:
+		return
+	if _llm_log.text != "":
+		_llm_log.text += "\n"
+	_llm_log.text += line
+	if _llm_log.get_line_count() > LLM_LOG_MAX_LINES:
+		var lines := _llm_log.text.split("\n")
+		_llm_log.text = "\n".join(lines.slice(lines.size() - LLM_LOG_MAX_LINES))
+	_scroll_log_to_end.call_deferred()
+
+
+func _scroll_log_to_end() -> void:
+	_llm_log.set_caret_line(_llm_log.get_line_count() - 1)
+	_llm_log.adjust_viewport_to_caret()
+
+
+func set_llm_log(lines: Array) -> void:
+	if _llm_log == null:
+		return
+	_llm_log.text = ""
+	for line in lines:
+		append_llm_log(str(line))
+
+
+## While a setup task runs, keep the elapsed time ticking even when the installer is quiet.
+func set_llm_busy(text: String, progress: float, elapsed: float) -> void:
+	if not _llm_busy:
+		show_llm_log()
+	_llm_busy = true
+	_llm_busy_text = text
+	_llm_busy_since = Time.get_ticks_msec() / 1000.0 - elapsed
+	set_llm_status(_busy_label(), progress, true)
+
+
+func _busy_label() -> String:
+	var seconds := maxi(0, int(Time.get_ticks_msec() / 1000.0 - _llm_busy_since))
+	return "%s  (%d:%02d)" % [_llm_busy_text, seconds / 60, seconds % 60]
+
+
+func _process(delta: float) -> void:
+	if not _llm_busy or _llm_status == null:
+		return
+	_llm_tick += delta
+	if _llm_tick >= 1.0:
+		_llm_tick = 0.0
+		_llm_status.text = _busy_label()
+
+
+## Server status from a Check; while a setup task runs its progress line wins.
+func set_llm_info(text: String) -> void:
+	if not _llm_busy:
+		set_llm_status(text)
+
+
+func set_llm_status(text: String, progress: float = -2.0, busy: bool = false) -> void:
 	if _llm_status == null:
 		return
+	if not busy:
+		_llm_busy = false
 	_llm_status.text = text
 	_llm_progress.visible = progress > -2.0
 	if progress >= 0.0:

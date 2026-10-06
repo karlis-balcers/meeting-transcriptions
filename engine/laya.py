@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -29,6 +30,7 @@ import zipfile
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from .proc import LogTail, log_fn, run_logged
 from .settings import default_config_dir
 
 logger = logging.getLogger("laya")
@@ -37,6 +39,7 @@ DEFAULT_URL = "http://127.0.0.1:8765"
 PACKAGE = "laya[serve]"
 PYTHON_VERSION = "3.12"
 UV_RELEASE = "https://github.com/astral-sh/uv/releases/latest/download/"
+MODEL_MARKER = "model-ready"
 
 Progress = Callable[[str, float], None]
 
@@ -150,8 +153,8 @@ def status(base_url: str) -> dict[str, Any]:
         info["running"] = True
         info["installed"] = True
         info["models"] = list(data.get("loaded") or [])
-        # Checkpoints load on the first question; a running server is ready to take one.
-        info["model_ready"] = True
+        # Checkpoints download on the first question; warm_up() does that and leaves a marker.
+        info["model_ready"] = bool(info["models"]) or (home() / MODEL_MARKER).exists()
         info["device"] = data.get("device")
     except LayaError as e:
         info["error"] = str(e)
@@ -212,16 +215,38 @@ def ensure_uv(on_progress: Progress) -> str:
     return str(dest)
 
 
-def _run(args: list[str], on_progress: Progress, label: str) -> None:
-    on_progress(label, -1.0)
-    kwargs: dict[str, Any] = {"capture_output": True, "text": True}
-    if sys.platform == "win32":
-        kwargs["creationflags"] = 0x08000000  # no console window
-    env = dict(os.environ, UV_PYTHON_INSTALL_DIR=str(home() / "python"))
-    result = subprocess.run(args, env=env, **kwargs)
-    if result.returncode != 0:
-        tail = (result.stderr or result.stdout or "").strip().splitlines()[-3:]
-        raise LayaError(f"{label} failed: {' '.join(tail)}")
+def _run(args: list[str], on_progress: Progress, label: str,
+         on_line: Optional[Callable[[str], None]] = None) -> None:
+    env = dict(os.environ, UV_PYTHON_INSTALL_DIR=str(home() / "python"), NO_COLOR="1")
+    code, tail = run_logged(args, on_progress, label, env=env, on_line=on_line)
+    if code != 0:
+        raise LayaError(f"{label} failed: {' '.join(tail[-3:])}")
+
+
+class _PipProgress:
+    """uv prints "Downloading torch (110.0MiB)" / "Downloaded torch" for the big wheels; count them."""
+
+    def __init__(self, on_progress: Progress, label: str):
+        self.on_progress = on_progress
+        self.label = label
+        self.started: set[str] = set()
+        self.done: set[str] = set()
+
+    def __call__(self, line: str) -> None:
+        words = line.split()
+        if len(words) < 2:
+            return
+        if words[0] == "Downloading":
+            self.started.add(words[1])
+        elif words[0] == "Downloaded":
+            self.done.add(words[1])
+        else:
+            return
+        waiting = sorted(self.started - self.done)
+        detail = f": {', '.join(waiting[:3])}" if waiting else ""
+        fraction = len(self.done) / len(self.started) if self.started else -1.0
+        self.on_progress(f"{self.label} ({len(self.done)}/{len(self.started)} big downloads{detail})",
+                         min(fraction, 0.99))
 
 
 def install(on_progress: Progress) -> str:
@@ -232,17 +257,45 @@ def install(on_progress: Progress) -> str:
     venv = home() / "venv"
     _run([uv, "venv", "--python", PYTHON_VERSION, str(venv)], on_progress, "Setting up Python for Laya")
     python = _venv_bin("python")
-    # PyTorch is the big part (a few hundred MB), uv shows no progress for it here.
-    _run([uv, "pip", "install", "--python", str(python), PACKAGE], on_progress,
-         "Installing Laya and PyTorch (large download, a few minutes)")
+    # PyTorch is the big part (a few hundred MB); the log shows each download as uv starts it.
+    label = "Installing Laya and PyTorch"
+    _run([uv, "pip", "install", "--python", str(python), PACKAGE], on_progress, label,
+         on_line=_PipProgress(on_progress, label))
     if not find_server():
         raise LayaError("Laya installed, but laya-serve is missing")
     return "Laya installed"
 
 
+_PERCENT = re.compile(r"(\d{1,3})%\|")
+
+
 def warm_up(base_url: str, on_progress: Progress) -> None:
-    """The first question downloads the checkpoints from Hugging Face; do it now, not mid-meeting."""
-    on_progress("Downloading the Laya model (first time only)", -1.0)
-    for text in ("Thanks, I'll send the report tomorrow.", "Paldies, es rīt nosūtīšu atskaiti."):
-        predict(base_url, text, {"ok": {"type": "noul", "instructions": "Does the speaker promise to do something?"}},
-                timeout=900.0)
+    """The first question downloads the checkpoints from Hugging Face; do it now, not mid-meeting.
+
+    laya-serve does the download, so its log (where Hugging Face prints the
+    progress bars) is followed and forwarded while we wait.
+    """
+    log = log_fn(on_progress)
+    label = "Downloading the Laya model (first time only)"
+    on_progress(label, -1.0)
+    last_logged = [0.0]
+
+    def on_server_line(line: str) -> None:
+        match = _PERCENT.search(line)
+        if match:
+            name = line.split(":", 1)[0][:40]
+            on_progress(f"{label}: {name}", int(match.group(1)) / 100.0)
+            # Progress bars redraw many times a second; the log gets one every couple of seconds.
+            if time.time() - last_logged[0] < 2.0 and not match.group(1) == "100":
+                return
+            last_logged[0] = time.time()
+        log(line)
+
+    question = {"ok": {"type": "noul", "instructions": "Does the speaker promise to do something?"}}
+    with LogTail(home() / "laya-serve.log", on_server_line):
+        for text in ("Thanks, I'll send the report tomorrow.", "Paldies, es rīt nosūtīšu atskaiti."):
+            log(f"Asking Laya: {text}")
+            started = time.time()
+            answers = predict(base_url, text, question, timeout=1800.0)
+            log(f"Answered in {time.time() - started:.1f}s (promise: {answers['ok'].get('noul', 0):.0%})")
+    (home() / MODEL_MARKER).write_text(time.strftime("%Y-%m-%d %H:%M:%S"), encoding="utf-8")

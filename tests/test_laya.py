@@ -56,9 +56,38 @@ class LayaTests(unittest.TestCase):
         cls.server.server_close()
 
     def test_status_and_predict(self):
-        info = laya.status(self.url)
-        self.assertTrue(info["running"])
-        self.assertTrue(info["model_ready"])
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(laya, "home", lambda: Path(d)):
+            info = laya.status(self.url)
+            self.assertTrue(info["running"])
+            self.assertFalse(info["model_ready"])  # running, but the checkpoints were never downloaded
+
+            # laya-serve prints Hugging Face progress bars into its log while it downloads.
+            (Path(d) / "laya-serve.log").write_text("old line\n")
+            progress, lines = [], []
+
+            def on_progress(message, fraction):
+                progress.append((message, fraction))
+
+            on_progress.log = lines.append
+            original = laya.predict
+
+            def slow_predict(*args, **kwargs):
+                with open(Path(d) / "laya-serve.log", "a") as f:
+                    f.write("model.safetensors:  40%|####      | 200M/500M\rmodel.safetensors: 100%|##########| 500M/500M\n")
+                import time
+                time.sleep(0.8)
+                return original(*args, **kwargs)
+
+            with mock.patch.object(laya, "predict", slow_predict):
+                laya.warm_up(self.url, on_progress)
+            self.assertTrue(laya.status(self.url)["model_ready"])
+            self.assertIn(0.4, [f for _, f in progress])
+            self.assertTrue(any("100%|" in line for line in lines))
+            self.assertFalse(any("old line" in line for line in lines))
         answers = laya.predict(self.url, "hi", {"x": {"type": "noul", "instructions": "a task?"}})
         self.assertEqual(answers["x"]["noul"], 0.9)
 
@@ -104,7 +133,45 @@ class LayaTests(unittest.TestCase):
         self.assertEqual([e["type"] for e in events], ["status"])
 
 
+class ProcTests(unittest.TestCase):
+    def test_run_logged_streams_lines_and_progress(self):
+        import sys
+
+        from engine.laya import _PipProgress
+        from engine.proc import run_logged
+
+        progress, lines = [], []
+
+        def on_progress(message, fraction):
+            progress.append((message, fraction))
+
+        on_progress.log = lines.append
+        script = ("import sys; print('Resolved 40 packages'); print('Downloading torch (110.0MiB)'); "
+                  "print('Downloading numpy (12MiB)'); sys.stdout.write('Downloaded numpy\\r'); "
+                  "print('Downloaded torch'); sys.exit(3)")
+        code, tail = run_logged([sys.executable, "-c", script], on_progress, "Installing",
+                                on_line=_PipProgress(on_progress, "Installing"))
+        self.assertEqual(code, 3)
+        self.assertIn("Downloaded numpy", lines)
+        self.assertEqual(tail[-1], "Downloaded torch")
+        self.assertEqual(progress[-1][1], 0.99)
+        self.assertIn("1/2 big downloads: torch", progress[-2][0])
+
+
 class LayaSettingsTests(unittest.TestCase):
+    def test_old_ollama_settings_move_to_laya_once(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "s.json"
+            path.write_text(json.dumps({"llm_api": "ollama", "llm_base_url": "http://127.0.0.1:11434"}))
+            store = SettingsStore(path)
+            self.assertEqual(store.get()["llm_api"], "laya")
+            self.assertEqual(store.get()["llm_base_url"], "http://127.0.0.1:8765")
+            store.update({"llm_api": "ollama"})  # picked again on purpose: stays
+            self.assertEqual(SettingsStore(path).get()["llm_api"], "ollama")
+
     def test_server_url_follows_server_type(self):
         import tempfile
         from pathlib import Path
@@ -119,6 +186,24 @@ class LayaSettingsTests(unittest.TestCase):
             store.update({"llm_api": "openai", "llm_base_url": "http://127.0.0.1:1234/v1"})
             store.update({"llm_api": "laya"})
             self.assertEqual(store.get()["llm_base_url"], "http://127.0.0.1:1234/v1")
+
+
+
+class SetupButtonsTests(unittest.TestCase):
+    def test_setup_commands_use_the_form_values(self):
+        import tempfile
+        from pathlib import Path
+
+        from engine.server import Engine, EventHub
+
+        with tempfile.TemporaryDirectory() as d:
+            store = SettingsStore(Path(d) / "s.json", env_file=Path(d) / "none.env")
+            engine = Engine(store, EventHub())
+            info = engine.handle("llm_status", {"llm_api": "ollama", "llm_base_url": "http://127.0.0.1:8765",
+                                                "llm_model": "qwen2.5:3b"})
+            self.assertEqual(info["api"], "ollama")
+            self.assertEqual(store.get()["llm_base_url"], "http://127.0.0.1:11434")
+            self.assertEqual(store.get()["llm_model"], "qwen2.5:3b")
 
 
 if __name__ == "__main__":

@@ -20,6 +20,8 @@ import zipfile
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from .proc import run_logged
+
 logger = logging.getLogger("llm")
 
 OLLAMA_WINDOWS_INSTALLER = "https://ollama.com/download/OllamaSetup.exe"
@@ -262,28 +264,25 @@ def install_ollama(on_progress: Callable[[str, float], None]) -> str:
 
     if sys.platform == "win32":
         if shutil.which("winget"):
-            on_progress("Installing Ollama with winget", -1.0)
-            result = subprocess.run(
+            code, tail = run_logged(
                 ["winget", "install", "-e", "--id", "Ollama.Ollama", "--silent",
                  "--accept-source-agreements", "--accept-package-agreements"],
-                capture_output=True, text=True, creationflags=0x08000000,
+                on_progress, "Installing Ollama with winget (Windows may ask for permission)",
             )
-            if result.returncode == 0 or find_ollama():
+            if code == 0 or find_ollama():
                 return "Ollama installed"
-            logger.warning("winget install failed (%s): %s", result.returncode, result.stdout[-400:])
+            logger.warning("winget install failed (%s): %s", code, " ".join(tail[-3:]))
         dest = Path(tempfile.gettempdir()) / "OllamaSetup.exe"
         _download(OLLAMA_WINDOWS_INSTALLER, dest, on_progress)
-        on_progress("Running the Ollama installer", -1.0)
-        subprocess.run([str(dest), "/SILENT", "/NORESTART"], check=False)
+        run_logged([str(dest), "/SILENT", "/NORESTART"], on_progress, "Running the Ollama installer")
         return "Ollama installed" if find_ollama() else "Finish the Ollama installer, then press Check"
 
     if sys.platform == "darwin":
         if shutil.which("brew"):
-            on_progress("Installing Ollama with Homebrew", -1.0)
-            result = subprocess.run(["brew", "install", "ollama"], capture_output=True, text=True)
-            if result.returncode == 0 or find_ollama():
+            code, tail = run_logged(["brew", "install", "ollama"], on_progress, "Installing Ollama with Homebrew")
+            if code == 0 or find_ollama():
                 return "Ollama installed"
-            logger.warning("brew install failed (%s): %s", result.returncode, result.stderr[-400:])
+            logger.warning("brew install failed (%s): %s", code, " ".join(tail[-3:]))
         dest = Path(tempfile.gettempdir()) / "Ollama-darwin.zip"
         _download(OLLAMA_MAC_ZIP, dest, on_progress)
         on_progress("Unpacking Ollama", -1.0)
