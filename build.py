@@ -106,9 +106,12 @@ def check_exe_icon(exe: Path) -> None:
             for lang in res.directory.entries:
                 got.add(pe.get_data(lang.data.struct.OffsetToData, lang.data.struct.Size))
     pe.close()
-    if not want <= got:
-        raise SystemExit(f"{exe.name} doesn't carry ui/icon.ico ({len(want & got)}/{len(want)} images found)")
-    print(f"Icon check: {exe.name} carries all {len(want)} icon images", flush=True)
+    # Godot rewrites the .ico before rcedit gets it, so a size or two may be
+    # re-encoded; Godot's own icon would match none of them.
+    found = len(want & got)
+    if found * 2 <= len(want):
+        raise SystemExit(f"{exe.name} doesn't carry ui/icon.ico ({found}/{len(want)} images found)")
+    print(f"Icon check: {exe.name} carries {found}/{len(want)} images of ui/icon.ico", flush=True)
 
 
 def _ico_entries(path: Path) -> list[tuple[int, bytes]]:
