@@ -188,5 +188,23 @@ class LayaSettingsTests(unittest.TestCase):
             self.assertEqual(store.get()["llm_base_url"], "http://127.0.0.1:1234/v1")
 
 
+
+class SetupButtonsTests(unittest.TestCase):
+    def test_setup_commands_use_the_form_values(self):
+        import tempfile
+        from pathlib import Path
+
+        from engine.server import Engine, EventHub
+
+        with tempfile.TemporaryDirectory() as d:
+            store = SettingsStore(Path(d) / "s.json", env_file=Path(d) / "none.env")
+            engine = Engine(store, EventHub())
+            info = engine.handle("llm_status", {"llm_api": "ollama", "llm_base_url": "http://127.0.0.1:8765",
+                                                "llm_model": "qwen2.5:3b"})
+            self.assertEqual(info["api"], "ollama")
+            self.assertEqual(store.get()["llm_base_url"], "http://127.0.0.1:11434")
+            self.assertEqual(store.get()["llm_model"], "qwen2.5:3b")
+
+
 if __name__ == "__main__":
     unittest.main()

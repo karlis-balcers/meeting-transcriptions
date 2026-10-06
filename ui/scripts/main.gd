@@ -310,9 +310,9 @@ func _open_settings(tab: String) -> void:
 	engine.send("llm_status")
 
 
-func _on_llm_action(action: String) -> void:
+func _on_llm_action(action: String, server: Dictionary) -> void:
 	settings_dialog.set_llm_status("Working...", -1.0)
-	engine.send(action, {}, func(resp):
+	engine.send(action, server, func(resp):
 		var data = resp.get("data")
 		if not resp.get("ok", false) or (data is Dictionary and data.get("ok") == false):
 			var err = resp.get("error") if not resp.get("ok", false) else data.get("error")

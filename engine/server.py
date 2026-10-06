@@ -247,6 +247,13 @@ class Engine:
         if cmd == "delete_profile":
             s.delete_profile(str(args.get("name") or ""))
             return {"ok": True}
+        if cmd.startswith("llm_"):
+            # The setup buttons act on the server type / URL / model as set in the form, saved or not.
+            server = {k: args[k] for k in ("llm_api", "llm_base_url", "llm_model") if args.get(k) is not None}
+            current = self.store.get()
+            if any(current.get(k) != v for k, v in server.items()):
+                self.store.update(server)
+                self.hub.send({"type": "settings", "settings": self.store.public()})
         if cmd == "llm_status":
             return self.llm_status()
         if cmd == "llm_log":
