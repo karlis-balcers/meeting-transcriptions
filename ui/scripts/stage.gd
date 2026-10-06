@@ -10,6 +10,10 @@ signal speaker_clicked(name: String)
 const MAX_TRANSCRIPT_PARAGRAPHS := 400
 const BADGE_SECONDS := 7.0
 const PARTICLE_SECONDS := 0.9
+const MAX_RADIUS := 56.0      # biggest node (see _radius); footprints use it so the panel doesn't jitter
+const LABEL_W := 190.0
+const LABEL_BELOW := 74.0     # name, stats and mood lines under a node
+const GAP := 12.0
 
 var speakers := {}          # name -> Dictionary
 var order: Array = []
@@ -79,6 +83,8 @@ func _ready() -> void:
 
 func _process(delta: float) -> void:
 	_time += delta
+	_compute_positions()
+	_fit_center()
 	var now := Time.get_ticks_msec() / 1000.0
 	var live_names: Array[String] = []
 	for name in speakers:
@@ -255,14 +261,62 @@ func speaker_info(name: String) -> Dictionary:
 # ------------------------------------------------------------------- layout
 
 func _layout() -> void:
-	var w := size.x
-	var h := size.y
-	var radii := _orbit_radii()
-	var rx := radii.x
-	var ry := radii.y
-	var half := Vector2(minf(w * 0.3, rx - 90.0), minf(h * 0.3, ry - 125.0))
-	half = Vector2(maxf(half.x, 140.0), maxf(half.y, 90.0))
-	_center_rect = Rect2(_orbit_center() - half, half * 2.0)
+	_compute_positions()
+	_fit_center(true)
+
+
+## The transcript card takes the space the speakers leave free: start big and
+## pull in whichever edge loses the least area until no name, stats line or
+## node sits under it.
+func _fit_center(force := false) -> void:
+	var half := Vector2(maxf(size.x * 0.36, 140.0), maxf(size.y * 0.34, 90.0))
+	var c := _orbit_center()
+	var left := c.x - half.x
+	var right := c.x + half.x
+	var top := c.y - half.y
+	var bottom := c.y + half.y
+	var min_w := minf(280.0, size.x * 0.5)
+	var min_h := minf(180.0, size.y * 0.4)
+	for name in _positions:
+		var f := _footprint(_positions[name])
+		if f.position.x >= right or f.end.x <= left or f.position.y >= bottom or f.end.y <= top:
+			continue
+		# Candidate edges that would clear this footprint, with the area each keeps.
+		var options := [
+			[f.end.y + GAP, bottom, left, right, "top"],
+			[top, f.position.y - GAP, left, right, "bottom"],
+			[top, bottom, f.end.x + GAP, right, "left"],
+			[top, bottom, left, f.position.x - GAP, "right"],
+		]
+		var best = null
+		var best_area := -1.0
+		for o in options:
+			var ow: float = o[3] - o[2]
+			var oh: float = o[1] - o[0]
+			if ow < min_w or oh < min_h:
+				continue
+			if ow * oh > best_area:
+				best_area = ow * oh
+				best = o
+		if best != null:
+			top = best[0]
+			bottom = best[1]
+			left = best[2]
+			right = best[3]
+	var rect := Rect2(left, top, right - left, bottom - top)
+	if not force and rect.position.distance_to(_center_rect.position) < 0.5 \
+			and rect.size.distance_to(_center_rect.size) < 0.5:
+		return
+	_center_rect = rect
+	_place_center_controls()
+
+
+func _footprint(pos: Vector2) -> Rect2:
+	var w := maxf(LABEL_W, MAX_RADIUS * 2.0 + 20.0)
+	return Rect2(pos.x - w / 2.0, pos.y - MAX_RADIUS - GAP, w, MAX_RADIUS * 2.0 + GAP + LABEL_BELOW)
+
+
+func _place_center_controls() -> void:
 	_header.position = _center_rect.position + Vector2(16, 10)
 	_header.size = Vector2(_center_rect.size.x - 32, 20)
 	_transcript.position = _center_rect.position + Vector2(16, 34)
@@ -274,11 +328,11 @@ func _layout() -> void:
 
 
 func _orbit_center() -> Vector2:
-	return Vector2(size.x * 0.5, size.y * 0.5 - 16.0)
+	return Vector2(size.x * 0.5, size.y * 0.5 - 34.0)
 
 
 func _orbit_radii() -> Vector2:
-	return Vector2(maxf(size.x * 0.5 - 100.0, 120.0), maxf(size.y * 0.5 - 100.0, 100.0))
+	return Vector2(maxf(size.x * 0.5 - 110.0, 120.0), maxf(size.y * 0.5 - 100.0, 100.0))
 
 
 func _update_hint() -> void:
@@ -432,21 +486,36 @@ func _draw_speaker(s: Dictionary, pos: Vector2, font: Font, now: float) -> void:
 	var fs := int(clampf(r * 0.62, 16.0, 30.0))
 	draw_string(font, pos + Vector2(-r, fs * 0.36), ini, HORIZONTAL_ALIGNMENT_CENTER, r * 2.0, fs, Palette.TEXT)
 
-	# Name and a short stats line under the node.
-	var label_w := 180.0
+	# Name, a short stats line and the mood under the node, on a dark plate so
+	# the answer lines behind don't wash them out.
+	var label_w := LABEL_W
 	var name_text: String = s.name + ("  (you)" if s.is_me else "")
-	draw_string(font, pos + Vector2(-label_w / 2.0, r + 24.0), name_text, HORIZONTAL_ALIGNMENT_CENTER,
-		label_w, 15, Palette.TEXT)
 	var st: Dictionary = s.stats
+	var line := ""
 	if not st.is_empty():
-		var line := "%s talk  %d wpm" % [Palette.percent(float(st.get("talk_share", 0.0))), int(st.get("wpm", 0))]
+		line = "%s talk  %d wpm" % [Palette.percent(float(st.get("talk_share", 0.0))), int(st.get("wpm", 0))]
 		if int(st.get("questions", 0)) > 0:
 			line += "  %d?" % int(st.questions)
-		draw_string(font, pos + Vector2(-label_w / 2.0, r + 42.0), line, HORIZONTAL_ALIGNMENT_CENTER,
-			label_w, 12, Palette.TEXT_DIM)
+	var rows := 1 + (1 if line != "" else 0) + (1 if s.mood != null else 0)
+	var text_w := font.get_string_size(name_text, HORIZONTAL_ALIGNMENT_LEFT, -1, 16).x
+	if line != "":
+		text_w = maxf(text_w, font.get_string_size(line, HORIZONTAL_ALIGNMENT_LEFT, -1, 14).x)
+	var plate_w := minf(text_w + 20.0, label_w)
+	var plate := Rect2(pos + Vector2(-plate_w / 2.0, r + 8.0), Vector2(plate_w, 8.0 + rows * 20.0))
+	var plate_box := Palette.panel_style(Color(Palette.BG, 0.85), 8, 0)
+	plate_box.set_border_width_all(0)
+	draw_style_box(plate_box, plate)
+	var y := r + 26.0
+	draw_string(font, pos + Vector2(-label_w / 2.0, y), name_text, HORIZONTAL_ALIGNMENT_CENTER,
+		label_w, 16, Palette.TEXT)
+	if line != "":
+		y += 20.0
+		draw_string(font, pos + Vector2(-label_w / 2.0, y), line, HORIZONTAL_ALIGNMENT_CENTER,
+			label_w, 14, Palette.TEXT.darkened(0.12))
 	if s.mood != null:
-		draw_string(font, pos + Vector2(-label_w / 2.0, r + 58.0), str(s.mood), HORIZONTAL_ALIGNMENT_CENTER,
-			label_w, 12, mood_col)
+		y += 20.0
+		draw_string(font, pos + Vector2(-label_w / 2.0, y), str(s.mood), HORIZONTAL_ALIGNMENT_CENTER,
+			label_w, 14, mood_col.lightened(0.2))
 
 	# Small counters for check hits and wrong facts.
 	var badge_pos := pos + Vector2(r * 0.72, -r * 0.72)
