@@ -48,6 +48,8 @@ Why this split: the hard platform parts (WASAPI loopback on Windows, Teams UI au
   - `laya` (default): [Laya](https://pypi.org/project/laya/) is a small local decision model. It answers all checks for a line in one fast pass, in 100+ languages (Latvian too). Install gets [uv](https://docs.astral.sh/uv/), which brings its own Python, creates a venv in the settings folder (`laya/venv`), runs `pip install "laya[serve]"` (PyTorch included, about 1 GB) and downloads the model. The engine then runs `laya-serve` on `127.0.0.1:8765` and starts it again when the app opens. It's very good at mood and yes/no checks. For fact checks it can only flag a line as "probably wrong", it can't tell you the right answer.
   - `ollama`: installs Ollama (winget or the installer on Windows, Homebrew or the app download on macOS), starts it and downloads the model (`llama3.2:3b` by default). Slower, but better fact checks with a short explanation.
   - `openai`: any OpenAI-compatible local server (llama.cpp server, LM Studio). Set the URL.
+
+  While it installs, the status line shows the step, progress and elapsed time, and **Show setup log** shows everything the installer prints (uv, pip, winget, the model download), like a small terminal. The same log is saved as `local-ai-setup.log` in the settings folder.
 - No AI summaries or assistant panels anymore, that was dropped on purpose.
 
 ## Run it from source

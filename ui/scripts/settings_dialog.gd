@@ -51,6 +51,13 @@ var _tabs: TabContainer
 var _checks_box: VBoxContainer
 var _llm_status: Label
 var _llm_progress: ProgressBar
+var _llm_log: TextEdit
+var _llm_log_toggle: Button
+var _llm_busy_text := ""
+var _llm_busy := false
+var _llm_busy_since := 0.0
+var _llm_tick := 0.0
+const LLM_LOG_MAX_LINES := 400
 var _key_set := false
 var _dir_dialog: FileDialog
 var _dir_target: LineEdit
@@ -230,6 +237,23 @@ func _add_llm_controls(form: VBoxContainer) -> void:
 	note.add_theme_font_size_override("font_size", 11)
 	note.add_theme_color_override("font_color", Palette.TEXT_DIM)
 	v.add_child(note)
+	# Everything the installer prints (uv, pip, winget, the model download), like a small terminal.
+	_llm_log_toggle = Button.new()
+	_llm_log_toggle.text = "Show setup log"
+	_llm_log_toggle.toggle_mode = true
+	_llm_log_toggle.toggled.connect(func(on: bool):
+		_llm_log.visible = on
+		_llm_log_toggle.text = "Hide setup log" if on else "Show setup log")
+	v.add_child(_llm_log_toggle)
+	_llm_log = TextEdit.new()
+	_llm_log.editable = false
+	_llm_log.visible = false
+	_llm_log.custom_minimum_size = Vector2(0, 220)
+	_llm_log.wrap_mode = TextEdit.LINE_WRAPPING_BOUNDARY
+	_llm_log.add_theme_font_override("font", _monospace())
+	_llm_log.add_theme_font_size_override("font_size", 12)
+	_llm_log.add_theme_color_override("background_color", Palette.BG)
+	v.add_child(_llm_log)
 	form.add_child(box)
 
 
@@ -356,9 +380,77 @@ func _on_save() -> void:
 	hide()
 
 
-func set_llm_status(text: String, progress: float = -2.0) -> void:
+func _monospace() -> SystemFont:
+	var font := SystemFont.new()
+	font.font_names = PackedStringArray(["Consolas", "Menlo", "DejaVu Sans Mono", "monospace"])
+	return font
+
+
+func show_llm_log() -> void:
+	if _llm_log_toggle != null and not _llm_log_toggle.button_pressed:
+		_llm_log_toggle.button_pressed = true
+
+
+func append_llm_log(line: String) -> void:
+	if _llm_log == null:
+		return
+	if _llm_log.text != "":
+		_llm_log.text += "\n"
+	_llm_log.text += line
+	if _llm_log.get_line_count() > LLM_LOG_MAX_LINES:
+		var lines := _llm_log.text.split("\n")
+		_llm_log.text = "\n".join(lines.slice(lines.size() - LLM_LOG_MAX_LINES))
+	_scroll_log_to_end.call_deferred()
+
+
+func _scroll_log_to_end() -> void:
+	_llm_log.set_caret_line(_llm_log.get_line_count() - 1)
+	_llm_log.adjust_viewport_to_caret()
+
+
+func set_llm_log(lines: Array) -> void:
+	if _llm_log == null:
+		return
+	_llm_log.text = ""
+	for line in lines:
+		append_llm_log(str(line))
+
+
+## While a setup task runs, keep the elapsed time ticking even when the installer is quiet.
+func set_llm_busy(text: String, progress: float, elapsed: float) -> void:
+	if not _llm_busy:
+		show_llm_log()
+	_llm_busy = true
+	_llm_busy_text = text
+	_llm_busy_since = Time.get_ticks_msec() / 1000.0 - elapsed
+	set_llm_status(_busy_label(), progress, true)
+
+
+func _busy_label() -> String:
+	var seconds := maxi(0, int(Time.get_ticks_msec() / 1000.0 - _llm_busy_since))
+	return "%s  (%d:%02d)" % [_llm_busy_text, seconds / 60, seconds % 60]
+
+
+func _process(delta: float) -> void:
+	if not _llm_busy or _llm_status == null:
+		return
+	_llm_tick += delta
+	if _llm_tick >= 1.0:
+		_llm_tick = 0.0
+		_llm_status.text = _busy_label()
+
+
+## Server status from a Check; while a setup task runs its progress line wins.
+func set_llm_info(text: String) -> void:
+	if not _llm_busy:
+		set_llm_status(text)
+
+
+func set_llm_status(text: String, progress: float = -2.0, busy: bool = false) -> void:
 	if _llm_status == null:
 		return
+	if not busy:
+		_llm_busy = false
 	_llm_status.text = text
 	_llm_progress.visible = progress > -2.0
 	if progress >= 0.0:

@@ -38,6 +38,7 @@ DEFAULT_FACT_PROMPT = (
 APPLIES_TO = ("everyone", "others", "me")
 LLM_APIS = ("laya", "ollama", "openai")
 LAYA_URL = "http://127.0.0.1:8765"
+SETTINGS_VERSION = 2
 OLLAMA_URL = "http://127.0.0.1:11434"
 
 
@@ -97,6 +98,7 @@ def default_settings() -> dict[str, Any]:
         "llm_enabled": False,
         # "laya" (local decision model), "ollama", or "openai" (OpenAI-compatible, e.g. llama.cpp / LM Studio)
         "llm_api": "laya",
+        "settings_version": SETTINGS_VERSION,
         "llm_base_url": LAYA_URL,
         "llm_model": "llama3.2:3b",
         "llm_timeout_seconds": 30.0,
@@ -302,6 +304,20 @@ def normalize(values: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def migrate(data: dict[str, Any]) -> bool:
+    """Bring a settings file from an older version up to date, in place. True if anything changed."""
+    version = int(data.get("settings_version") or 1)
+    if version >= SETTINGS_VERSION:
+        return False
+    if version < 2 and data.get("llm_api") == "ollama" and data.get("llm_base_url", OLLAMA_URL) == OLLAMA_URL:
+        # v2.0.0-2.0.3 defaulted to Ollama; Laya is what the local AI was meant to be.
+        data["llm_api"] = "laya"
+        data["llm_base_url"] = LAYA_URL
+        logger.info("Settings: local AI switched from Ollama to Laya (pick Ollama again in Settings if you want it)")
+    data["settings_version"] = SETTINGS_VERSION
+    return True
+
+
 class SettingsStore:
     """Thread-safe settings file wrapper."""
 
@@ -315,7 +331,11 @@ class SettingsStore:
             try:
                 data = json.loads(self.path.read_text(encoding="utf-8"))
                 if isinstance(data, dict):
-                    return normalize(data)
+                    migrated = migrate(data)
+                    result = normalize(data)
+                    if migrated:
+                        self._write(result)
+                    return result
             except (OSError, ValueError) as e:
                 logger.warning("Could not read settings %s (%s); using defaults.", self.path, e)
             return normalize({})

@@ -15,11 +15,12 @@ import socket
 import socketserver
 import threading
 import time
+from collections import deque
 from typing import Any, Callable, Optional
 
 from . import __version__, laya, llm
 from .session import Session
-from .settings import SettingsStore
+from .settings import SettingsStore, default_config_dir
 
 logger = logging.getLogger("server")
 
@@ -61,6 +62,9 @@ class Engine:
         self.session = session_factory(store, hub.send)
         self._llm_busy = threading.Lock()
         self._laya_autostarted = False
+        # Install/download output, kept so a UI that (re)connects mid-task can show it.
+        self._llm_log: deque[str] = deque(maxlen=500)
+        self._llm_current: Optional[dict[str, Any]] = None
 
     def hello(self) -> dict[str, Any]:
         return {
@@ -105,17 +109,46 @@ class Engine:
         if not self._llm_busy.acquire(blocking=False):
             return {"ok": False, "error": "Local AI setup already running"}
 
+        started = time.time()
+        log_path = default_config_dir() / "local-ai-setup.log"
+
+        def log(line: str) -> None:
+            line = line.rstrip()[:500]
+            self._llm_log.append(line)
+            self.hub.send({"type": "llm", "state": "log", "line": line})
+            try:
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+            except OSError:
+                pass
+
         def progress(message: str, fraction: float) -> None:
-            self.hub.send({"type": "llm", "state": "busy", "message": message, "progress": fraction})
+            if self._llm_current is None or self._llm_current.get("message") != message:
+                log(f"== {message}")
+            self._llm_current = {"message": message, "progress": fraction, "started": started}
+            self.hub.send({"type": "llm", "state": "busy", "message": message, "progress": fraction,
+                           "elapsed": round(time.time() - started)})
+
+        progress.log = log  # type: ignore[attr-defined]  # proc.log_fn picks this up
 
         def run():
+            self._llm_log.clear()
+            try:
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                log_path.write_text("", encoding="utf-8")
+            except OSError:
+                pass
+            log(f"{name} started {time.strftime('%Y-%m-%d %H:%M:%S')}")
             try:
                 message = work(progress)
+                log(f"Done: {message}")
                 self.hub.send({"type": "llm", "state": "done", "message": message})
             except Exception as e:
                 logger.warning("%s failed: %s", name, e)
+                log(f"Failed: {e}")
                 self.hub.send({"type": "llm", "state": "error", "message": str(e)})
             finally:
+                self._llm_current = None
                 self._llm_busy.release()
                 if refresh:
                     self.llm_status()
@@ -216,6 +249,12 @@ class Engine:
             return {"ok": True}
         if cmd == "llm_status":
             return self.llm_status()
+        if cmd == "llm_log":
+            current = self._llm_current
+            return {"lines": list(self._llm_log), "busy": current is not None,
+                    "message": current.get("message") if current else None,
+                    "progress": current.get("progress") if current else None,
+                    "elapsed": round(time.time() - current["started"]) if current else None}
         if cmd == "llm_install":
             return self._llm_task("llm-install", self._install_and_pull)
         settings = self.store.get()

@@ -427,6 +427,13 @@ func _on_event(msg: Dictionary) -> void:
 			stage.apply_stats(stats)
 			_load_devices()
 			engine.send("llm_status")
+			# A setup task may still be running from before the window was reopened.
+			engine.send("llm_log", {}, func(resp):
+				var data: Dictionary = resp.get("data", {})
+				settings_dialog.set_llm_log(data.get("lines", []))
+				if data.get("busy", false):
+					settings_dialog.set_llm_busy(str(data.get("message", "")), float(data.get("progress", -1.0)),
+						float(data.get("elapsed", 0))))
 			engine.send("profiles", {}, func(resp):
 				if resp.get("ok", false):
 					_set_profiles(resp.get("data", {})))
@@ -519,16 +526,20 @@ func _on_llm(msg: Dictionary) -> void:
 				text = "%s is installed but not running. Press Start." % _llm_name(msg)
 			else:
 				text = "%s is not installed. Press Install to set it up." % _llm_name(msg)
-			settings_dialog.set_llm_status(text)
+			settings_dialog.set_llm_info(text)
 			_update_ai_button()
 		"busy":
-			settings_dialog.set_llm_status(str(msg.get("message", "")), float(msg.get("progress", -1.0)))
+			settings_dialog.set_llm_busy(str(msg.get("message", "")), float(msg.get("progress", -1.0)),
+				float(msg.get("elapsed", 0)))
 			_ai_btn.text = "Local AI: setting up..."
+		"log":
+			settings_dialog.append_llm_log(str(msg.get("line", "")))
 		"done":
 			settings_dialog.set_llm_status(str(msg.get("message", "")))
 			_set_status(str(msg.get("message", "")), "info")
 		"error":
-			settings_dialog.set_llm_status("Error: " + str(msg.get("message", "")))
+			settings_dialog.set_llm_status("Error: " + str(msg.get("message", "")) + "  (details in the setup log below)")
+			settings_dialog.show_llm_log()
 			_set_status("Local AI: " + str(msg.get("message", "")), "error")
 
 
