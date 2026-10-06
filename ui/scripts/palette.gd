@@ -34,6 +34,39 @@ const FACT_COLORS := {
 }
 
 
+## One common emoji per mood (the moods are what Laya or the LLM picks from).
+const MOOD_EMOJI := {
+	"happy": "😄",
+	"excited": "🤩",
+	"positive": "🙂",
+	"calm": "😌",
+	"neutral": "😐",
+	"confused": "😕",
+	"anxious": "😟",
+	"sad": "😢",
+	"frustrated": "😤",
+	"angry": "😠",
+}
+
+static var _emoji_font: Font
+
+
+static func mood_emoji(mood) -> String:
+	if mood == null:
+		return ""
+	return MOOD_EMOJI.get(str(mood), "")
+
+
+## The system's color emoji font, falling back to the default UI font.
+static func emoji_font() -> Font:
+	if _emoji_font == null:
+		var f := SystemFont.new()
+		f.font_names = PackedStringArray(["Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji", "Twemoji"])
+		f.fallbacks = [ThemeDB.fallback_font]
+		_emoji_font = f
+	return _emoji_font
+
+
 static func speaker_color(name: String, is_me: bool = false) -> Color:
 	if is_me:
 		return Color("4cc9f0")

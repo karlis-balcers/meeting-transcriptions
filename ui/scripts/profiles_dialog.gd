@@ -10,6 +10,8 @@ const COLUMNS := ["Name", "Meetings", "Talk (min)", "Avg share", "Pace (wpm)", "
 var _tree: Tree
 var _rename: LineEdit
 var _profiles := {}
+var _picker: FileDialog
+var _picture_for := ""
 
 
 func _ready() -> void:
@@ -52,6 +54,19 @@ func _ready() -> void:
 			rename_requested.emit(name, new_name)
 			_rename.text = "")
 	row.add_child(rename_btn)
+	var picture_btn := Button.new()
+	picture_btn.text = "Set picture..."
+	picture_btn.tooltip_text = "Pick a photo for the selected person. It shows inside their bubble."
+	picture_btn.pressed.connect(_pick_picture)
+	row.add_child(picture_btn)
+	var no_picture_btn := Button.new()
+	no_picture_btn.text = "Remove picture"
+	no_picture_btn.pressed.connect(func():
+		var name := _selected_name()
+		if name != "":
+			Avatars.remove(name)
+			set_profiles(_profiles))
+	row.add_child(no_picture_btn)
 	var delete_btn := Button.new()
 	delete_btn.text = "Delete selected"
 	delete_btn.pressed.connect(func():
@@ -64,6 +79,36 @@ func _ready() -> void:
 	close.pressed.connect(hide)
 	row.add_child(close)
 	root.add_child(row)
+
+	_picker = FileDialog.new()
+	_picker.file_mode = FileDialog.FILE_MODE_OPEN_FILE
+	_picker.access = FileDialog.ACCESS_FILESYSTEM
+	_picker.use_native_dialog = true
+	_picker.filters = PackedStringArray(["*.png, *.jpg, *.jpeg, *.webp ; Pictures"])
+	_picker.title = "Pick a profile picture"
+	_picker.file_selected.connect(_on_picture_selected)
+	add_child(_picker)
+
+
+func _pick_picture() -> void:
+	_picture_for = _selected_name()
+	if _picture_for == "":
+		return
+	_picker.popup_centered_ratio(0.6)
+
+
+func _on_picture_selected(path: String) -> void:
+	if _picture_for == "":
+		return
+	var err := Avatars.set_from_file(_picture_for, path)
+	if err != "":
+		var dlg := AcceptDialog.new()
+		dlg.title = "Profile picture"
+		dlg.dialog_text = err
+		add_child(dlg)
+		dlg.confirmed.connect(dlg.queue_free)
+		dlg.popup_centered()
+	set_profiles(_profiles)
 
 
 func _selected_name() -> String:
@@ -85,13 +130,17 @@ func set_profiles(profiles: Dictionary) -> void:
 		item.set_metadata(0, name)
 		item.set_text(0, name + ("  (you)" if p.get("is_me", false) else ""))
 		item.set_custom_color(0, Palette.speaker_color(name, p.get("is_me", false)))
+		var avatar := Avatars.texture(name)
+		if avatar != null:
+			item.set_icon(0, avatar)
+			item.set_icon_max_width(0, 28)
 		item.set_text(1, str(int(p.get("meetings", 0))))
 		item.set_text(2, "%.1f" % float(p.get("talk_minutes", 0.0)))
 		item.set_text(3, Palette.percent(float(p.get("avg_talk_share", 0.0))))
 		item.set_text(4, str(int(p.get("wpm", 0))))
 		item.set_text(5, str(p.get("questions_per_meeting", 0)))
 		var mood = p.get("top_mood")
-		item.set_text(6, str(mood) if mood != null else "-")
+		item.set_text(6, "%s %s" % [Palette.mood_emoji(mood), mood] if mood != null else "-")
 		if mood != null:
 			item.set_custom_color(6, Palette.mood_color(mood))
 		item.set_text(7, ", ".join(p.get("top_topics", [])))

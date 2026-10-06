@@ -238,6 +238,7 @@ func add_check(msg: Dictionary) -> void:
 func rename(old: String, new_name: String) -> void:
 	if not speakers.has(old) or old == new_name:
 		return
+	Avatars.rename(old, new_name)
 	var s: Dictionary = speakers[old]
 	speakers.erase(old)
 	order.erase(old)
@@ -482,9 +483,26 @@ func _draw_speaker(s: Dictionary, pos: Vector2, font: Font, now: float) -> void:
 	if share > 0.0:
 		draw_arc(pos, r - 1.5, -PI / 2.0, -PI / 2.0 + TAU * share, 48, base.lightened(0.25), 3.0, true)
 
-	var ini := Palette.initials(s.name)
-	var fs := int(clampf(r * 0.62, 16.0, 30.0))
-	draw_string(font, pos + Vector2(-r, fs * 0.36), ini, HORIZONTAL_ALIGNMENT_CENTER, r * 2.0, fs, Palette.TEXT)
+	var avatar := Avatars.texture(s.name)
+	if avatar != null:
+		var ar := r - 3.0
+		draw_texture_rect(avatar, Rect2(pos - Vector2(ar, ar), Vector2(ar, ar) * 2.0), false)
+	else:
+		var ini := Palette.initials(s.name)
+		var fs := int(clampf(r * 0.62, 16.0, 30.0))
+		draw_string(font, pos + Vector2(-r, fs * 0.36), ini, HORIZONTAL_ALIGNMENT_CENTER, r * 2.0, fs, Palette.TEXT)
+
+	# Mood emoji on the lower right of the bubble.
+	var emoji := Palette.mood_emoji(s.mood)
+	if emoji != "":
+		var ep := pos + Vector2(r * 0.74, r * 0.74)
+		var efont := Palette.emoji_font()
+		var es := 22
+		draw_circle(ep, 17.0, Palette.BG)
+		draw_arc(ep, 17.0, 0, TAU, 32, mood_col, 1.5, true)
+		var ew := efont.get_string_size(emoji, HORIZONTAL_ALIGNMENT_LEFT, -1, es).x
+		var baseline := ep.y + (efont.get_ascent(es) - efont.get_descent(es)) / 2.0
+		draw_string(efont, Vector2(ep.x - ew / 2.0, baseline), emoji, HORIZONTAL_ALIGNMENT_LEFT, -1, es)
 
 	# Name, a short stats line and the mood under the node, on a dark plate so
 	# the answer lines behind don't wash them out.
