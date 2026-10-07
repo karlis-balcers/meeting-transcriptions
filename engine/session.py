@@ -22,6 +22,7 @@ from threading import Event, Lock, Thread
 from typing import Any, Callable, Optional
 
 from . import audio_capture
+from .answers import AnswerRunner
 from .checks import CheckRunner, Utterance
 from .profiles import MeetingStats, ProfileBook, summarize_profile
 from .settings import SettingsStore, parse_language_candidates
@@ -50,6 +51,7 @@ class Session:
         self.store = store
         self.emit = emit
         self._lock = Lock()
+        self._devices_lock = Lock()
         self.recording = False
         self.language: Optional[str] = None
         self.transcript_path: Optional[str] = None
@@ -84,6 +86,8 @@ class Session:
             on_hit=lambda speaker, name: self.stats.add_check_hit(speaker, name),
         )
         self.checks.start()
+        self.answers = AnswerRunner(settings_getter=self.store.get, emit=self.emit)
+        self.answers.start()
 
     # ------------------------------------------------------------------ devices
 
@@ -93,11 +97,13 @@ class Session:
             pyaudio = _load_pyaudio()
         except ImportError as e:
             return {"inputs": [], "outputs": [], "error": f"Audio library missing: {e}"}
-        p = pyaudio.PyAudio()
-        try:
-            catalog = audio_capture.enumerate_recording_devices(p, platform_name=sys.platform)
-        finally:
-            p.terminate()
+        # PortAudio setup isn't thread-safe and device scans can now run next to a Start.
+        with self._devices_lock:
+            p = pyaudio.PyAudio()
+            try:
+                catalog = audio_capture.enumerate_recording_devices(p, platform_name=sys.platform)
+            finally:
+                p.terminate()
         selected_in = audio_capture.pick_preferred_device(
             catalog["inputs"], settings.get("input_device_index"), settings.get("input_device_name"),
             catalog.get("default_input"),
@@ -137,7 +143,9 @@ class Session:
                 return {"ok": True}
             settings = self.store.get()
             api_key = self.store.api_key()
-            if not api_key:
+            base_url = settings["transcribe_base_url"]
+            # OpenAI itself needs a key; a local speech-to-text server usually doesn't.
+            if not api_key and not base_url:
                 return {"ok": False, "error": "Set your OpenAI API key in Settings first."}
 
             candidates = parse_language_candidates(settings["languages"])
@@ -160,6 +168,7 @@ class Session:
 
                 self._transcriber = OpenAITranscribe(
                     api_key=api_key,
+                    base_url=base_url or None,
                     model=settings["transcript_model"],
                     language=self.language,
                     keywords=settings["keywords"] or None,
@@ -169,7 +178,7 @@ class Session:
                     status_callback=lambda m, lvl: self.emit({"type": "status", "message": m, "level": lvl}),
                 )
             except Exception as e:
-                return {"ok": False, "error": f"Could not start OpenAI client: {e}"}
+                return {"ok": False, "error": f"Could not start the transcription client: {e}"}
 
             self._filter = TranscriptFilter.from_settings(settings)
             output_dir = Path(settings["output_dir"])
@@ -205,7 +214,8 @@ class Session:
                 self._flush_mic = None
                 self._flush_out = None
 
-            self._pa = pyaudio.PyAudio()
+            with self._devices_lock:
+                self._pa = pyaudio.PyAudio()
             sample_size = self._pa.get_sample_size(pyaudio.paInt16)
             q_in: Queue = Queue()
             q_out: Queue = Queue()
@@ -304,6 +314,7 @@ class Session:
     def shutdown(self) -> None:
         self.stop()
         self.checks.stop()
+        self.answers.stop()
 
     def set_mute(self, muted: bool) -> None:
         if muted:
@@ -455,7 +466,9 @@ class Session:
         })
         snap = self.stats.snapshot()
         self.emit({"type": "stats", "stats": snap})
-        self.checks.submit(Utterance(id=utterance_id, speaker=speaker, text=text, at=at, is_me=is_me, context=context))
+        utterance = Utterance(id=utterance_id, speaker=speaker, text=text, at=at, is_me=is_me, context=context)
+        self.checks.submit(utterance)
+        self.answers.submit(utterance)
 
     # --------------------------------------------------------------- profiles
 

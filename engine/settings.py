@@ -37,9 +37,16 @@ DEFAULT_FACT_PROMPT = (
 
 APPLIES_TO = ("everyone", "others", "me")
 LLM_APIS = ("laya", "ollama", "openai")
+# The answer AI writes text, so Laya (a decision model) is not an option there.
+ANSWER_APIS = ("ollama", "openai")
 LAYA_URL = "http://127.0.0.1:8765"
 SETTINGS_VERSION = 2
 OLLAMA_URL = "http://127.0.0.1:11434"
+
+DEFAULT_ANSWER_PROMPT = (
+    "Someone in the meeting asked a question. Draft a short, direct answer I could say out loud, "
+    "in the language of the question. If you don't know, say what you would need to find out."
+)
 
 
 def default_config_dir() -> Path:
@@ -66,8 +73,11 @@ def default_settings() -> dict[str, Any]:
         "auto_start": False,
         "teams_window_name": "Meeting compact view*",
         "remote_speaker_name": "Remote",
-        # OpenAI transcription
+        # Transcription AI: OpenAI, or any OpenAI-compatible speech-to-text server.
+        # "keywords" (under General) is its knowledge: hard words and names it should expect.
         "openai_api_key": "",
+        "transcribe_base_url": "",  # empty = OpenAI
+        "transcribe_api_key_env": "OPENAI_API_KEY",
         "transcript_model": "gpt-4o-mini-transcribe",
         "transcribe_timeout_seconds": 60.0,
         "transcribe_max_retries": 3,
@@ -101,6 +111,8 @@ def default_settings() -> dict[str, Any]:
         "settings_version": SETTINGS_VERSION,
         "llm_base_url": LAYA_URL,
         "llm_model": "llama3.2:3b",
+        "llm_api_key_env": "",
+        "llm_context": "",
         "llm_timeout_seconds": 30.0,
         "llm_context_lines": 6,
         "mood_enabled": True,
@@ -118,6 +130,16 @@ def default_settings() -> dict[str, Any]:
                 "color": "#f5a524",
             },
         ],
+        # Answer AI: a chat model that drafts answers to questions people ask in the meeting.
+        "answer_enabled": False,
+        "answer_api": "ollama",
+        "answer_base_url": OLLAMA_URL,
+        "answer_model": "llama3.2:3b",
+        "answer_api_key_env": "",
+        "answer_context": "",
+        "answer_prompt": DEFAULT_ANSWER_PROMPT,
+        "answer_applies_to": "others",
+        "answer_timeout_seconds": 60.0,
     }
 
 
@@ -163,6 +185,7 @@ _NUMERIC_LIMITS = {
     "transcribe_retry_base_seconds": (0.0, 60.0),
     "llm_timeout_seconds": (1.0, 600.0),
     "llm_context_lines": (0, 50),
+    "answer_timeout_seconds": (1.0, 600.0),
     "log_file_max_mb": (0.1, 1024.0),
     "log_file_backup_count": (0, 100),
 }
@@ -288,14 +311,23 @@ def normalize(values: dict[str, Any]) -> dict[str, Any]:
     for key in ("fact_check_applies_to",):
         if result[key] not in APPLIES_TO:
             result[key] = "everyone"
+    if result["answer_applies_to"] not in APPLIES_TO:
+        result["answer_applies_to"] = "others"
     if result["llm_api"] not in LLM_APIS:
         result["llm_api"] = "laya"
+    if result["answer_api"] not in ANSWER_APIS:
+        result["answer_api"] = "ollama"
     # Switching server type with the other one's default URL still in place: use this one's default.
     url = result["llm_base_url"].strip().rstrip("/")
     if result["llm_api"] == "laya" and url in ("", OLLAMA_URL):
         result["llm_base_url"] = LAYA_URL
     elif result["llm_api"] == "ollama" and url in ("", LAYA_URL):
         result["llm_base_url"] = OLLAMA_URL
+    if result["answer_api"] == "ollama" and result["answer_base_url"].strip() == "":
+        result["answer_base_url"] = OLLAMA_URL
+    result["transcribe_base_url"] = result["transcribe_base_url"].strip().rstrip("/")
+    for key in ("transcribe_api_key_env", "llm_api_key_env", "answer_api_key_env"):
+        result[key] = result[key].strip()
     result["languages"] = ",".join(parse_language_candidates(result["languages"]))
     for key in ("output_dir", "temp_dir"):
         result[key] = os.path.expanduser(str(result[key]).strip()) or defaults[key]
@@ -316,6 +348,23 @@ def migrate(data: dict[str, Any]) -> bool:
         logger.info("Settings: local AI switched from Ollama to Laya (pick Ollama again in Settings if you want it)")
     data["settings_version"] = SETTINGS_VERSION
     return True
+
+
+def env_key(name: Any) -> str:
+    """The API key in environment variable `name`; empty when no name is set (local servers need none)."""
+    name = str(name or "").strip()
+    return os.getenv(name, "") if name else ""
+
+
+def role_settings(settings: dict[str, Any], role: str) -> dict[str, Any]:
+    """Settings as the shared LLM code reads them (llm_* keys), for the "llm" (live checks) or "answer" role."""
+    if role != "answer":
+        return settings
+    view = dict(settings)
+    for key in ("api", "base_url", "model", "api_key_env", "context", "timeout_seconds"):
+        view["llm_" + key] = settings["answer_" + key]
+    view["llm_enabled"] = settings["answer_enabled"]
+    return view
 
 
 class SettingsStore:
@@ -371,13 +420,15 @@ class SettingsStore:
             return copy.deepcopy(self._values)
 
     def api_key(self) -> str:
+        """Key for the transcription AI: the one pasted in Settings, else its environment variable."""
         with self._lock:
-            return self._values.get("openai_api_key") or os.getenv("OPENAI_API_KEY", "")
+            return self._values.get("openai_api_key") or env_key(self._values.get("transcribe_api_key_env"))
 
     def public(self) -> dict[str, Any]:
         """Settings as sent to the UI: the API key is replaced by a flag."""
         values = self.get()
-        values["openai_api_key_set"] = bool(values.pop("openai_api_key", "") or os.getenv("OPENAI_API_KEY"))
+        values["openai_api_key_set"] = bool(values.pop("openai_api_key", "") or
+                                            env_key(values.get("transcribe_api_key_env")))
         values["config_path"] = str(self.path)
         values["supported_languages"] = list(SUPPORTED_LANGUAGES)
         return values

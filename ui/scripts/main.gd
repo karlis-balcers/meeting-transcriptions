@@ -66,6 +66,15 @@ func _ready() -> void:
 	settings_dialog = SettingsDialog.new()
 	settings_dialog.save_requested.connect(func(values): engine.send("save_settings", {"settings": values}))
 	settings_dialog.llm_action.connect(_on_llm_action)
+	settings_dialog.transcribe_check.connect(func(values):
+		engine.send("transcribe_check", values, func(resp):
+			var data = resp.get("data")
+			if not resp.get("ok", false):
+				settings_dialog.set_transcribe_status("Error: " + str(resp.get("error")))
+			elif data is Dictionary and data.get("ok") == false:
+				settings_dialog.set_transcribe_status("Error: " + str(data.get("error")))
+			else:
+				settings_dialog.set_transcribe_status(str(data.get("message", "OK")))))
 	add_child(settings_dialog)
 
 	profiles_dialog = ProfilesDialog.new()
@@ -149,8 +158,8 @@ func _build_top_bar() -> Control:
 	row.add_child(spacer)
 
 	_ai_btn = Button.new()
-	_ai_btn.tooltip_text = "Local AI for mood, fact checks and your own checks"
-	_ai_btn.pressed.connect(func(): _open_settings("Local AI"))
+	_ai_btn.tooltip_text = "Checks AI for mood, fact checks and your own checks"
+	_ai_btn.pressed.connect(func(): _open_settings("Checks AI"))
 	row.add_child(_ai_btn)
 	var profiles_btn := Button.new()
 	profiles_btn.text = "Profiles"
@@ -231,20 +240,20 @@ func _update_controls() -> void:
 
 
 func _update_ai_button() -> void:
-	var text := "Local AI: off"
+	var text := "Checks AI: off"
 	var color := Palette.TEXT_DIM
 	if bool(settings.get("llm_enabled", false)):
 		if _llm_info.get("model_ready", false):
-			text = "Local AI: on"
+			text = "Checks AI: on"
 			color = Palette.GOOD
 		elif _llm_info.get("running", false):
-			text = "Local AI: no model"
+			text = "Checks AI: no model"
 			color = Palette.WARN
 		elif _llm_info.get("installed", false):
-			text = "Local AI: not running"
+			text = "Checks AI: not running"
 			color = Palette.WARN
 		else:
-			text = "Local AI: install"
+			text = "Checks AI: install"
 			color = Palette.WARN
 	_ai_btn.text = text
 	_ai_btn.add_theme_color_override("font_color", color)
@@ -309,18 +318,25 @@ func _open_settings(tab: String) -> void:
 		for i in tabs.get_tab_count():
 			if tabs.get_tab_title(i) == tab:
 				tabs.current_tab = i
+	_send_llm_status()
+
+
+func _send_llm_status() -> void:
 	engine.send("llm_status")
+	if bool(settings.get("answer_enabled", false)) or settings_dialog.visible:
+		engine.send("llm_status", {"role": "answer"})
 
 
 func _on_llm_action(action: String, server: Dictionary) -> void:
-	settings_dialog.set_llm_status("Working...", -1.0)
+	var role := str(server.get("role", "llm"))
+	settings_dialog.set_llm_status("Working...", -1.0, false, role)
 	engine.send(action, server, func(resp):
 		var data = resp.get("data")
 		if not resp.get("ok", false) or (data is Dictionary and data.get("ok") == false):
 			var err = resp.get("error") if not resp.get("ok", false) else data.get("error")
-			settings_dialog.set_llm_status("Error: " + str(err))
+			settings_dialog.set_llm_status("Error: " + str(err), -2.0, false, role)
 		elif action == "llm_start":
-			settings_dialog.set_llm_status("Starting the local AI, press Check in a moment."))
+			settings_dialog.set_llm_status("Starting the server, press Check in a moment.", -2.0, false, role))
 
 
 func _select_device(kind: String, button: OptionButton, index: int) -> void:
@@ -428,18 +444,19 @@ func _on_event(msg: Dictionary) -> void:
 			stats = msg.get("stats", {})
 			stage.apply_stats(stats)
 			_load_devices()
-			engine.send("llm_status")
+			_send_llm_status()
 			# A setup task may still be running from before the window was reopened.
 			engine.send("llm_log", {}, func(resp):
 				var data: Dictionary = resp.get("data", {})
-				settings_dialog.set_llm_log(data.get("lines", []))
+				var role := str(data.get("role", "llm")) if data.get("role") != null else "llm"
+				settings_dialog.set_llm_log(data.get("lines", []), role)
 				if data.get("busy", false):
 					settings_dialog.set_llm_busy(str(data.get("message", "")), float(data.get("progress", -1.0)),
-						float(data.get("elapsed", 0))))
+						float(data.get("elapsed", 0)), role))
 			engine.send("profiles", {}, func(resp):
 				if resp.get("ok", false):
 					_set_profiles(resp.get("data", {})))
-			if not settings.get("openai_api_key_set", false):
+			if not settings.get("openai_api_key_set", false) and str(settings.get("transcribe_base_url", "")) == "":
 				_set_status("Add your OpenAI API key in Settings to start.", "warning")
 			if bool(settings.get("auto_start", false)) and not recording and not _auto_started:
 				_auto_started = true
@@ -450,7 +467,7 @@ func _on_event(msg: Dictionary) -> void:
 			_set_status(str(msg.get("message", "")), str(msg.get("level", "info")))
 		"settings":
 			_apply_settings(msg.get("settings", {}))
-			engine.send("llm_status")
+			_send_llm_status()
 		"transcript":
 			stage.add_transcript(msg)
 		"level":
@@ -504,6 +521,11 @@ func _on_check(msg: Dictionary) -> void:
 			if str(result.get("note", "")) != "":
 				text += "\n[color=#8b91a7]%s[/color]" % str(result.note).replace("[", "[lb]")
 			_add_feed_entry(msg.get("speaker"), text, color)
+		"answer":
+			var color := Color(str(msg.get("color", "#4cc9f0")))
+			var text := "[color=#%s]Q: %s[/color]\n%s" % [color.to_html(false), str(result.get("label", "")).replace("[", "[lb]"),
+				str(result.get("note", "")).replace("[", "[lb]")]
+			_add_feed_entry(msg.get("speaker"), text, color)
 		_:
 			var c = msg.get("color")
 			var color := Color(str(c)) if c != null and str(c) != "" else Palette.ACCENT
@@ -514,9 +536,12 @@ func _on_check(msg: Dictionary) -> void:
 
 
 func _on_llm(msg: Dictionary) -> void:
+	var role := str(msg.get("role", "llm"))
+	var label := "Answer AI" if role == "answer" else "Checks AI"
 	match str(msg.get("state", "")):
 		"status":
-			_llm_info = msg
+			if role == "llm":
+				_llm_info = msg
 			var text := ""
 			if msg.get("model_ready", false):
 				text = "Ready: %s at %s" % [msg.get("model", ""), msg.get("base_url", "")]
@@ -524,25 +549,29 @@ func _on_llm(msg: Dictionary) -> void:
 				text = "Server is running but model %s is not downloaded. Press Download model." % msg.get("model", "")
 			elif msg.get("starting", false):
 				text = "Starting %s..." % _llm_name(msg)
+			elif str(msg.get("api", "")) == "openai":
+				text = "Can't reach %s: %s" % [msg.get("base_url", ""), msg.get("error", "")]
 			elif msg.get("installed", false):
 				text = "%s is installed but not running. Press Start." % _llm_name(msg)
 			else:
 				text = "%s is not installed. Press Install to set it up." % _llm_name(msg)
-			settings_dialog.set_llm_info(text)
+			settings_dialog.set_llm_info(text, role)
 			_update_ai_button()
 		"busy":
 			settings_dialog.set_llm_busy(str(msg.get("message", "")), float(msg.get("progress", -1.0)),
-				float(msg.get("elapsed", 0)))
-			_ai_btn.text = "Local AI: setting up..."
+				float(msg.get("elapsed", 0)), role)
+			if role == "llm":
+				_ai_btn.text = "Checks AI: setting up..."
 		"log":
-			settings_dialog.append_llm_log(str(msg.get("line", "")))
+			settings_dialog.append_llm_log(str(msg.get("line", "")), role)
 		"done":
-			settings_dialog.set_llm_status(str(msg.get("message", "")))
+			settings_dialog.set_llm_status(str(msg.get("message", "")), -2.0, false, role)
 			_set_status(str(msg.get("message", "")), "info")
 		"error":
-			settings_dialog.set_llm_status("Error: " + str(msg.get("message", "")) + "  (details in the setup log below)")
-			settings_dialog.show_llm_log()
-			_set_status("Local AI: " + str(msg.get("message", "")), "error")
+			settings_dialog.set_llm_status("Error: " + str(msg.get("message", "")) + "  (details in the setup log below)",
+				-2.0, false, role)
+			settings_dialog.show_llm_log(role)
+			_set_status(label + ": " + str(msg.get("message", "")), "error")
 
 
 func _llm_name(info: Dictionary) -> String:

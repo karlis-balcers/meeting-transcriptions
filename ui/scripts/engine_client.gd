@@ -13,7 +13,12 @@ signal engine_failed(text: String)
 
 const DEFAULT_PORT := 47321
 const CONNECT_RETRY_SECONDS := 1.0
-const SPAWN_AFTER_FAILED_TRIES := 2
+## While the app opens, and while an engine we started boots, poll fast: every
+## slow retry here was time the window sat on "Starting engine".
+const FAST_RETRY_SECONDS := 0.2
+## The engine is only ever already running when started by hand, and a refused
+## connect on localhost answers at once, so one miss is enough to start ours.
+const SPAWN_AFTER_FAILED_TRIES := 1
 const MAX_SPAWNS := 3
 ## The first start of a packaged engine unpacks and loads a lot (antivirus scans
 ## it too), so give it a while before calling it stuck.
@@ -134,7 +139,8 @@ func _read_crash_log() -> String:
 
 
 func _try_connect() -> void:
-	_retry_in = CONNECT_RETRY_SECONDS
+	var booting := not _was_connected or (_spawned_pid >= 0 and _spawned_at > 0.0)
+	_retry_in = FAST_RETRY_SECONDS if booting else CONNECT_RETRY_SECONDS
 	_tcp = StreamPeerTCP.new()
 	_tcp.connect_to_host("127.0.0.1", port)
 

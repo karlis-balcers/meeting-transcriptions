@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from .proc import run_logged
+from .settings import env_key
 
 logger = logging.getLogger("llm")
 
@@ -33,9 +34,16 @@ class LLMError(Exception):
     pass
 
 
-def _request(url: str, payload: Optional[dict] = None, timeout: float = 10.0) -> Any:
+def _headers(api_key: str = "") -> dict[str, str]:
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
+
+
+def _request(url: str, payload: Optional[dict] = None, timeout: float = 10.0, api_key: str = "") -> Any:
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    req = urllib.request.Request(url, data=data, headers=_headers(api_key))
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             body = resp.read().decode("utf-8")
@@ -101,19 +109,22 @@ def extract_json(text: str) -> dict[str, Any]:
 
 
 class LLMClient:
-    def __init__(self, api: str, base_url: str, model: str, timeout: float = 30.0):
+    def __init__(self, api: str, base_url: str, model: str, timeout: float = 30.0, api_key: str = ""):
         self.api = api
         self.base_url = (base_url or "").rstrip("/")
         self.model = model
         self.timeout = timeout
+        self.api_key = api_key
 
     @classmethod
     def from_settings(cls, settings: dict) -> "LLMClient":
+        """Client for the llm_* keys; pass `role_settings(settings, "answer")` for the answer AI."""
         return cls(
             api=settings.get("llm_api", "ollama"),
             base_url=settings.get("llm_base_url", "http://127.0.0.1:11434"),
             model=settings.get("llm_model", "llama3.2:3b"),
             timeout=float(settings.get("llm_timeout_seconds", 30.0)),
+            api_key=env_key(settings.get("llm_api_key_env")),
         )
 
     def _openai_base(self) -> str:
@@ -121,9 +132,9 @@ class LLMClient:
 
     def list_models(self) -> list[str]:
         if self.api == "ollama":
-            data = _request(f"{self.base_url}/api/tags", timeout=3.0)
+            data = _request(f"{self.base_url}/api/tags", timeout=3.0, api_key=self.api_key)
             return [m.get("name", "") for m in data.get("models", []) if m.get("name")]
-        data = _request(f"{self._openai_base()}/models", timeout=3.0)
+        data = _request(f"{self._openai_base()}/models", timeout=3.0, api_key=self.api_key)
         return [m.get("id", "") for m in data.get("data", []) if m.get("id")]
 
     def has_model(self, models: list[str]) -> bool:
@@ -132,34 +143,28 @@ class LLMClient:
         want = self.model if ":" in self.model else self.model + ":latest"
         return want in models or self.model in models
 
-    def chat_json(self, system: str, user: str) -> dict[str, Any]:
+    def _chat(self, system: str, user: str, json_reply: bool, temperature: float) -> str:
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
         if self.api == "ollama":
-            data = _request(
-                f"{self.base_url}/api/chat",
-                {
-                    "model": self.model,
-                    "stream": False,
-                    "format": "json",
-                    "options": {"temperature": 0.1},
-                    "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-                },
-                timeout=self.timeout,
-            )
-            content = (data.get("message") or {}).get("content", "")
-        else:
-            data = _request(
-                f"{self._openai_base()}/chat/completions",
-                {
-                    "model": self.model,
-                    "temperature": 0.1,
-                    "response_format": {"type": "json_object"},
-                    "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-                },
-                timeout=self.timeout,
-            )
-            choices = data.get("choices") or [{}]
-            content = (choices[0].get("message") or {}).get("content", "")
-        return extract_json(content)
+            payload: dict[str, Any] = {"model": self.model, "stream": False,
+                                       "options": {"temperature": temperature}, "messages": messages}
+            if json_reply:
+                payload["format"] = "json"
+            data = _request(f"{self.base_url}/api/chat", payload, timeout=self.timeout, api_key=self.api_key)
+            return (data.get("message") or {}).get("content", "")
+        payload = {"model": self.model, "temperature": temperature, "messages": messages}
+        if json_reply:
+            payload["response_format"] = {"type": "json_object"}
+        data = _request(f"{self._openai_base()}/chat/completions", payload, timeout=self.timeout,
+                        api_key=self.api_key)
+        choices = data.get("choices") or [{}]
+        return (choices[0].get("message") or {}).get("content", "")
+
+    def chat_json(self, system: str, user: str) -> dict[str, Any]:
+        return extract_json(self._chat(system, user, json_reply=True, temperature=0.1))
+
+    def chat_text(self, system: str, user: str) -> str:
+        return self._chat(system, user, json_reply=False, temperature=0.3).strip()
 
     def pull(self, on_progress: Callable[[str, float], None]) -> None:
         """Download the configured model through Ollama, streaming progress."""
@@ -168,7 +173,7 @@ class LLMClient:
         req = urllib.request.Request(
             f"{self.base_url}/api/pull",
             data=json.dumps({"model": self.model, "stream": True}).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers=_headers(self.api_key),
         )
         try:
             with urllib.request.urlopen(req, timeout=3600) as resp:
@@ -312,7 +317,7 @@ def status(settings: dict) -> dict[str, Any]:
 
         base_url = settings.get("llm_base_url") or laya.DEFAULT_URL
         return {"enabled": bool(settings.get("llm_enabled")), "api": "laya", "base_url": base_url,
-                "model": "Laya", **laya.status(base_url)}
+                "model": "Laya", **laya.status(base_url, env_key(settings.get("llm_api_key_env")))}
     client = LLMClient.from_settings(settings)
     info: dict[str, Any] = {
         "enabled": bool(settings.get("llm_enabled")),

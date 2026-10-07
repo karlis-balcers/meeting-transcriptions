@@ -153,7 +153,7 @@ func show_speaker(name: String, live: Dictionary, stats: Dictionary, profile: Di
 	if mood == null:
 		mood = live.get("mood")
 	if mood == null:
-		_mood_label.text = "No mood yet (turn on Local AI in Settings)."
+		_mood_label.text = "No mood yet (turn on the Checks AI in Settings)."
 		_mood_label.add_theme_color_override("font_color", Palette.TEXT_DIM)
 	else:
 		var counts: Dictionary = stats.get("mood_counts", {})

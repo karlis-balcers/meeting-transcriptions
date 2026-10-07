@@ -69,10 +69,12 @@ def find_server() -> Optional[str]:
 
 # ------------------------------------------------------------------ HTTP client
 
-def _request(url: str, payload: Optional[dict] = None, timeout: float = 10.0) -> Any:
+def _request(url: str, payload: Optional[dict] = None, timeout: float = 10.0, api_key: str = "") -> Any:
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"},
-                                 method="POST" if payload is not None else "GET")
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST" if payload is not None else "GET")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
@@ -85,14 +87,17 @@ def _request(url: str, payload: Optional[dict] = None, timeout: float = 10.0) ->
         raise LayaError("Laya returned something that isn't JSON") from e
 
 
-def health(base_url: str) -> dict[str, Any]:
-    return _request(f"{base_url.rstrip('/')}/health", timeout=3.0)
+def health(base_url: str, api_key: str = "") -> dict[str, Any]:
+    return _request(f"{base_url.rstrip('/')}/health", timeout=3.0, api_key=api_key)
 
 
-def predict(base_url: str, state: str, questions: dict[str, dict], timeout: float = 30.0) -> dict[str, Any]:
-    """Ask all questions about `state` in one call; returns the `answers` dict."""
+def predict(base_url: str, state: str, questions: dict[str, dict], timeout: float = 30.0,
+            api_key: str = "") -> dict[str, Any]:
+    """Ask all questions about `state` in one call; returns the `answers` dict.
+
+    `api_key` is only needed for a Laya server behind an auth proxy; the local one has none."""
     data = _request(f"{base_url.rstrip('/')}/v1/systemone", {"state": state, "questions": questions},
-                    timeout=timeout)
+                    timeout=timeout, api_key=api_key)
     answers = data.get("answers") if isinstance(data, dict) else None
     if not isinstance(answers, dict):
         raise LayaError("Laya reply had no answers")
@@ -145,11 +150,11 @@ def wait_until_up(base_url: str, seconds: float = 90.0) -> bool:
     return False
 
 
-def status(base_url: str) -> dict[str, Any]:
+def status(base_url: str, api_key: str = "") -> dict[str, Any]:
     info: dict[str, Any] = {"installed": bool(find_server()), "running": False, "model_ready": False,
                             "models": []}
     try:
-        data = health(base_url)
+        data = health(base_url, api_key)
         info["running"] = True
         info["installed"] = True
         info["models"] = list(data.get("loaded") or [])
