@@ -48,6 +48,11 @@ class LayaError(Exception):
     pass
 
 
+class LayaTimeout(LayaError):
+    """The server took too long. It is still working on that request (laya-serve answers one
+    at a time and doesn't stop when we hang up), so the next request waits behind it."""
+
+
 def home() -> Path:
     return default_config_dir() / "laya"
 
@@ -82,6 +87,8 @@ def _request(url: str, payload: Optional[dict] = None, timeout: float = 10.0, ap
         detail = e.read().decode("utf-8", "replace")[:300]
         raise LayaError(f"Laya returned HTTP {e.code}: {detail}") from e
     except (urllib.error.URLError, OSError, TimeoutError) as e:
+        if isinstance(getattr(e, "reason", e), TimeoutError):
+            raise LayaTimeout(f"Laya did not answer within {timeout:.0f}s") from e
         raise LayaError(f"Laya is not reachable at {url} ({getattr(e, 'reason', e)})") from e
     except json.JSONDecodeError as e:
         raise LayaError("Laya returned something that isn't JSON") from e
@@ -114,7 +121,37 @@ def _popen_detached(args: list[str], env: dict[str, str], log_path: Path) -> Non
         kwargs["creationflags"] = 0x00000008 | 0x00000200 | 0x08000000  # DETACHED | NEW_GROUP | NO_WINDOW
     else:
         kwargs["start_new_session"] = True
-    subprocess.Popen(args, **kwargs)
+    proc = subprocess.Popen(args, **kwargs)
+    try:
+        _pid_file().write_text(str(proc.pid), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _pid_file() -> Path:
+    return home() / "laya-serve.pid"
+
+
+def stop_server() -> None:
+    """Stop the laya-serve we started, so its PyTorch files can be replaced."""
+    try:
+        pid = int(_pid_file().read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        pid = 0
+    if sys.platform == "win32":
+        # /T: the uv launcher runs Python as a child. Started before the pid file existed: by name.
+        target = ["/PID", str(pid)] if pid else ["/IM", "laya-serve.exe"]
+        subprocess.run(["taskkill", "/F", "/T", *target], capture_output=True, creationflags=0x08000000)
+    elif pid:
+        import signal
+        try:
+            os.killpg(pid, signal.SIGTERM)  # started in its own session, so pid is the group
+        except OSError:
+            pass
+    try:
+        _pid_file().unlink()
+    except OSError:
+        pass
 
 
 def start_server(base_url: str = DEFAULT_URL) -> bool:
@@ -161,6 +198,8 @@ def status(base_url: str, api_key: str = "") -> dict[str, Any]:
         # Checkpoints download on the first question; warm_up() does that and leaves a marker.
         info["model_ready"] = bool(info["models"]) or (home() / MODEL_MARKER).exists()
         info["device"] = data.get("device")
+        if info["device"] == "cpu" and nvidia_gpu():
+            info["hint"] = "Laya runs on the CPU, but there is an NVIDIA GPU. Press Install to switch Laya to it."
     except LayaError as e:
         info["error"] = str(e)
     return info
@@ -264,11 +303,53 @@ def install(on_progress: Progress) -> str:
     python = _venv_bin("python")
     # PyTorch is the big part (a few hundred MB); the log shows each download as uv starts it.
     label = "Installing Laya and PyTorch"
-    _run([uv, "pip", "install", "--python", str(python), PACKAGE], on_progress, label,
-         on_line=_PipProgress(on_progress, label))
+    _pip_install(uv, python, [PACKAGE], on_progress, label)
     if not find_server():
         raise LayaError("Laya installed, but laya-serve is missing")
     return "Laya installed"
+
+
+def _pip_install(uv: str, python: Path, args: list[str], on_progress: Progress, label: str) -> None:
+    # Plain PyPI torch on Windows is CPU-only; `--torch-backend auto` makes uv pick the CUDA
+    # build that matches the NVIDIA driver (and the CPU one where there is no GPU).
+    base = [uv, "pip", "install", "--python", str(python)]
+    try:
+        _run(base + ["--torch-backend", "auto"] + args, on_progress, label, on_line=_PipProgress(on_progress, label))
+    except LayaError:
+        log_fn(on_progress)("Retrying without --torch-backend (older uv)")
+        _run(base + args, on_progress, label, on_line=_PipProgress(on_progress, label))
+
+
+def nvidia_gpu() -> bool:
+    return shutil.which("nvidia-smi") is not None
+
+
+def torch_cuda_build(on_progress: Progress) -> Optional[bool]:
+    """Whether our venv has a CUDA build of PyTorch; None when there is no venv to ask."""
+    python = _venv_bin("python")
+    if not python.exists():
+        return None
+    found: list[str] = []
+    code, _ = run_logged([str(python), "-c", "import torch; print('cuda=' + str(torch.version.cuda))"],
+                         on_progress, "Checking which PyTorch Laya has",
+                         on_line=lambda line: found.append(line) if line.startswith("cuda=") else None)
+    if code != 0 or not found:
+        return None
+    return found[-1] != "cuda=None"
+
+
+def ensure_gpu(on_progress: Progress) -> bool:
+    """Swap a CPU-only PyTorch for the CUDA one when there is an NVIDIA GPU. True if it did."""
+    if not nvidia_gpu() or torch_cuda_build(on_progress) is not False:
+        return False
+    uv = ensure_uv(on_progress)
+    # Windows locks the loaded torch DLLs, so the running server has to go first.
+    on_progress("Stopping Laya to replace PyTorch", -1.0)
+    stop_server()
+    time.sleep(2.0)
+    _pip_install(uv, _venv_bin("python"), ["--reinstall-package", "torch", "torch"], on_progress,
+                 "Installing the GPU build of PyTorch (about 2.5 GB)")
+    return True
 
 
 _PERCENT = re.compile(r"(\d{1,3})%\|")

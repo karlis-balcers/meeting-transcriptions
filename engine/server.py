@@ -20,7 +20,7 @@ import time
 from collections import deque
 from typing import Any, Callable, Optional
 
-from . import __version__, laya, llm
+from . import __version__, laya, llm, speedtest
 from .session import Session
 from .settings import SettingsStore, default_config_dir, env_key, role_settings
 
@@ -172,6 +172,7 @@ class Engine:
 
     def _install_laya(self, progress: Callable[[str, float], None]) -> str:
         laya.install(progress)
+        on_gpu = laya.ensure_gpu(progress)
         base_url = self.store.get().get("llm_base_url") or laya.DEFAULT_URL
         try:
             laya.health(base_url)
@@ -182,7 +183,7 @@ class Engine:
                 raise laya.LayaError(f"Laya installed but did not start, see {laya.home() / 'laya-serve.log'}")
         laya.warm_up(base_url, progress)
         self._enable("llm")
-        return "Local AI ready (Laya)"
+        return "Local AI ready (Laya, now on the GPU)" if on_gpu else "Local AI ready (Laya)"
 
     def _install_and_pull(self, progress: Callable[[str, float], None], role: str = "llm") -> str:
         settings = self._role_settings(role)
@@ -302,23 +303,13 @@ class Engine:
         settings = self._role_settings(role)
         on_laya = settings.get("llm_api") == "laya"
         laya_url = settings.get("llm_base_url") or laya.DEFAULT_URL
-        laya_key = env_key(settings.get("llm_api_key_env"))
         if cmd == "llm_pull" and on_laya:
             return self._llm_task("llm-pull", lambda progress: (laya.warm_up(laya_url, progress), "Laya model ready")[1])
         if cmd == "llm_start" and on_laya:
             started = laya.start_server(laya_url)
             return {"ok": started, "error": None if started else "Laya is not installed, press Install"}
         if cmd == "llm_test" and on_laya:
-            def test_laya(progress: Callable[[str, float], None]) -> str:
-                progress("Asking Laya...", -1.0)
-                started = time.time()
-                answers = laya.predict(laya_url, "Sure, I'll send you the slides tomorrow morning.",
-                                       {"promise": {"type": "noul", "instructions": "Does the speaker promise to do something?"}},
-                                       timeout=300.0, api_key=laya_key)
-                return (f"Laya answered in {time.time() - started:.1f}s: "
-                        f"promise = {answers['promise'].get('noul', 0):.0%} yes")
-
-            return self._llm_task("llm-test", test_laya, refresh=False)
+            return self._llm_task("llm-test", lambda progress: speedtest.laya_speed(settings, progress), refresh=False)
         client = llm.LLMClient.from_settings(settings)
         if cmd == "llm_pull":
             return self._llm_task("llm-pull", lambda progress: (client.pull(progress), f"Model {client.model} ready")[1],
@@ -327,16 +318,8 @@ class Engine:
             started = llm.start_ollama_server()
             return {"ok": started, "error": None if started else "Ollama is not installed"}
         if cmd == "llm_test":
-            def test(progress: Callable[[str, float], None]) -> str:
-                progress(f"Asking {client.model}...", -1.0)
-                started = time.time()
-                if role == "answer":
-                    reply = client.chat_text("Answer in one short sentence.", "What is the capital of Latvia?")
-                    return f"{client.model} answered in {time.time() - started:.1f}s: {reply[:200]}"
-                reply = client.chat_json("Reply with JSON only.", 'Return {"ok": true}')
-                return f"{client.model} answered in {time.time() - started:.1f}s: {json.dumps(reply)}"
-
-            return self._llm_task("llm-test", test, refresh=False, role=role)
+            return self._llm_task("llm-test", lambda progress: speedtest.llm_speed(settings, role, progress),
+                                  refresh=False, role=role)
         if cmd == "ping":
             return {"pong": True}
         raise ValueError(f"Unknown command: {cmd}")

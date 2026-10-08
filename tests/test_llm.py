@@ -74,6 +74,15 @@ class LLMClientTests(unittest.TestCase):
         self.assertEqual(client.list_models(), ["local-model"])
         self.assertEqual(client.chat_json("sys", "user"), {"hit": True})
 
+    def test_speed_test_reports_short_and_full_context(self):
+        from engine import speedtest
+
+        settings = {"llm_api": "ollama", "llm_base_url": self.url, "llm_model": "llama3.2:3b",
+                    "llm_timeout_seconds": 30, "mood_enabled": True, "fact_check_enabled": True, "custom_checks": []}
+        message = speedtest.llm_speed(settings, "llm", lambda *a: None)
+        self.assertIn("llama3.2:3b: short line", message)
+        self.assertIn("with 2 checks on", message)
+
     def test_unreachable_server(self):
         client = llm.LLMClient("ollama", "http://127.0.0.1:9", "x", timeout=1)
         with self.assertRaises(llm.LLMError):

@@ -31,6 +31,10 @@ MAX_PENDING = 6
 LAYA_HIT = 0.6
 LAYA_FACT = 0.7
 LAYA_INTENSITY = ["mild", "clear", "strong"]
+# Laya keeps the start of the text and drops whatever doesn't fit its window (512 or 1024
+# tokens, minus the question), and every question re-reads the whole text, so a longer text
+# costs time on every check. Send about what fits, newest first.
+LAYA_STATE_CHARS = 1500
 
 
 @dataclass
@@ -41,6 +45,38 @@ class Utterance:
     at: float
     is_me: bool
     context: list[str] = field(default_factory=list)
+
+
+# For the speed test: a full context window, like late in a real meeting.
+SAMPLE_CONTEXT = {
+    "en": [
+        "Anna: So the main thing for today is the migration plan, we said last week that the database part would be done by the end of the month.",
+        "Me: Right, and I think the database part is mostly fine, the risky bit is the card processing service because it still talks to the old cluster.",
+        "Peter: We had two incidents there in September, both around the nightly batch, so I would really like to see a rollback plan before we touch it.",
+        "Anna: Fair point. Can we split it into two steps, first the read traffic and then the writes, and keep the old cluster warm for a week?",
+        "Me: That works for me, but we need someone from the network team, the firewall rules alone took three weeks last time.",
+        "Peter: I can ask Laura, she did the rules for the payments gateway, and I think she still has the change templates from that project.",
+    ],
+    "lv": [
+        "Anna: Tātad šodien galvenais ir migrācijas plāns, pagājušajā nedēļā sarunājām, ka datubāzes daļa būs gatava līdz mēneša beigām.",
+        "Es: Jā, un man liekas, ka datubāzes daļa ir kārtībā, riskantākā ir karšu apstrādes serviss, jo tas joprojām runā ar veco klasteri.",
+        "Pēteris: Septembrī tur bija divi incidenti, abi ap nakts batch apstrādi, tāpēc es gribētu redzēt atjaunošanas plānu pirms to aiztiekam.",
+        "Anna: Labi. Vai varam to sadalīt divos soļos, vispirms lasīšanas plūsmu un tad rakstīšanu, un vienu nedēļu paturēt veco klasteri?",
+        "Es: Man der, bet mums vajag kādu no tīkla komandas, pagājušajā reizē tikai ugunsmūra noteikumi aizņēma trīs nedēļas.",
+        "Pēteris: Es varu pajautāt Laurai, viņa taisīja noteikumus maksājumu vārtejai, un viņai laikam vēl ir izmaiņu veidnes no tā projekta.",
+    ],
+}
+SAMPLE_LATEST = {
+    "en": "Okay, then I will write the rollback plan by Friday and send it to everyone, and Peter, can you check with Laura?",
+    "lv": "Labi, tad es līdz piektdienai uzrakstīšu atjaunošanas plānu un nosūtīšu visiem, un Pēteri, vai tu vari parunāt ar Lauru?",
+}
+
+
+def sample_utterance(lang: str = "en", full: bool = True) -> Utterance:
+    """A test line: short and alone, or with a full window of earlier lines."""
+    if not full:
+        return Utterance("test", "Anna", "Sure, I'll send you the slides tomorrow morning.", 0.0, False)
+    return Utterance("test", "Me", SAMPLE_LATEST[lang], 0.0, True, list(SAMPLE_CONTEXT[lang]))
 
 
 def applies(applies_to: str, is_me: bool) -> bool:
@@ -58,6 +94,26 @@ def _context_block(u: Utterance, background: str = "") -> str:
     block = f"Earlier conversation:\n{lines}\n\nLATEST utterance by {u.speaker}:\n{u.text}"
     background = (background or "").strip()
     return f"Background:\n{background}\n\n{block}" if background else block
+
+
+def laya_state(u: Utterance, background: str = "", max_chars: int = LAYA_STATE_CHARS) -> str:
+    """The text Laya reads. The LATEST line comes first so it is never the part cut off;
+    earlier lines are dropped oldest first and the background gets what room is left."""
+    text = f"LATEST utterance by {u.speaker}:\n{u.text}"
+    earlier: list[str] = []
+    room = max_chars - len(text) - len("\n\nEarlier conversation:")
+    for line in reversed(u.context):
+        room -= len(line) + 1
+        if room < 0:
+            break
+        earlier.insert(0, line)
+    if earlier:
+        text += "\n\nEarlier conversation:\n" + "\n".join(earlier)
+    background = (background or "").strip()
+    room = max_chars - len(text) - len("\n\nBackground:\n")
+    if background and room > 40:
+        text += "\n\nBackground:\n" + background[:room]
+    return text
 
 
 def mood_messages(u: Utterance, instruction: str, background: str = "") -> tuple[str, str]:
@@ -220,6 +276,14 @@ class CheckRunner:
             except Exception as e:  # never let the worker die
                 logger.exception("Check run failed: %s", e)
 
+    def _drop_backlog(self) -> int:
+        """Keep only the newest waiting utterance; returns how many were dropped."""
+        with self._cond:
+            dropped = max(0, len(self._queue) - 1)
+            while len(self._queue) > 1:
+                self._queue.popleft()
+        return dropped
+
     def _warn(self, error: Exception) -> None:
         if time.time() - self._last_error_at > 30:
             self._last_error_at = time.time()
@@ -279,9 +343,16 @@ class CheckRunner:
             return
         try:
             answers = self._laya_predict(settings.get("llm_base_url") or laya.DEFAULT_URL,
-                                         _context_block(u, settings.get("llm_context", "")), questions,
+                                         laya_state(u, settings.get("llm_context", "")), questions,
                                          timeout=float(settings.get("llm_timeout_seconds", 30.0)),
                                          api_key=env_key(settings.get("llm_api_key_env")))
+        except laya.LayaTimeout as e:
+            # Laya is still busy with that line and answers one at a time, so lines that
+            # queued up meanwhile would only time out behind it. Skip to the newest.
+            skipped = self._drop_backlog()
+            self._warn(laya.LayaError(f"{e}, skipped {skipped} lines to catch up. "
+                                      "Test in the Checks AI settings shows how fast it is."))
+            return
         except laya.LayaError as e:
             self._warn(e)
             return

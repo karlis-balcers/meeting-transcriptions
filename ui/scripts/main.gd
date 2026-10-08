@@ -545,6 +545,10 @@ func _on_llm(msg: Dictionary) -> void:
 			var text := ""
 			if msg.get("model_ready", false):
 				text = "Ready: %s at %s" % [msg.get("model", ""), msg.get("base_url", "")]
+				if str(msg.get("device", "")) != "":
+					text += " (on %s)" % msg.device
+				if str(msg.get("hint", "")) != "":
+					text += "\n" + str(msg.hint)
 			elif msg.get("running", false):
 				text = "Server is running but model %s is not downloaded. Press Download model." % msg.get("model", "")
 			elif msg.get("starting", false):
