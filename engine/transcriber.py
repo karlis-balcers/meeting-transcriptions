@@ -1,4 +1,7 @@
-"""OpenAI audio transcription, restored from the Python version (openai_transcribe.py)."""
+"""OpenAI audio transcription, restored from the Python version (openai_transcribe.py).
+
+With a base URL it talks to any OpenAI-compatible speech-to-text server instead
+(a local faster-whisper / Speaches server, LocalAI, Groq...)."""
 from __future__ import annotations
 
 import logging
@@ -40,6 +43,7 @@ class OpenAITranscribe:
         self,
         api_key: str,
         model: str = "gpt-4o-mini-transcribe",
+        base_url: Optional[str] = None,
         language: str = "en",
         keywords: Optional[str] = None,
         timeout_seconds: float = 60.0,
@@ -52,7 +56,9 @@ class OpenAITranscribe:
         self.timeout_seconds = float(timeout_seconds)
         self.max_retries = int(max_retries)
         self.retry_base_seconds = float(retry_base_seconds)
-        self.client = OpenAI(api_key=api_key or None, timeout=self.timeout_seconds, max_retries=0)
+        # The SDK refuses to start without a key; local servers ignore it, so give them a placeholder.
+        self.client = OpenAI(api_key=api_key or ("not-needed" if base_url else None), base_url=base_url or None,
+                             timeout=self.timeout_seconds, max_retries=0)
         self.model = model
         self.language = language
         self.keywords = keywords
@@ -103,7 +109,7 @@ class OpenAITranscribe:
                 status_code = e.status_code
                 if status_code in (401, 403):
                     logger.error("Transcription hard failure %s (auth/permission): %s", status_code, e)
-                    self._emit_status("Transcription failed: check the OpenAI API key.", "error")
+                    self._emit_status("Transcription failed: check the transcription API key.", "error")
                     return []
                 transient = status_code in (408, 409, 429) or (status_code is not None and status_code >= 500)
                 if transient and attempt < max_attempts:

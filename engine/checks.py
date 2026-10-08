@@ -20,6 +20,7 @@ from typing import Any, Callable, Optional
 from . import laya
 from .llm import LLMClient, LLMError
 from .profiles import MOOD_VALENCE
+from .settings import env_key
 
 logger = logging.getLogger("checks")
 
@@ -50,38 +51,42 @@ def applies(applies_to: str, is_me: bool) -> bool:
     return True
 
 
-def _context_block(u: Utterance) -> str:
+def _context_block(u: Utterance, background: str = "") -> str:
+    """The text every check looks at. `background` is the user's extra context for this AI
+    (who is in the meeting, project names...), put first so the model reads the lines with it."""
     lines = "\n".join(u.context) if u.context else "(no earlier lines)"
-    return f"Earlier conversation:\n{lines}\n\nLATEST utterance by {u.speaker}:\n{u.text}"
+    block = f"Earlier conversation:\n{lines}\n\nLATEST utterance by {u.speaker}:\n{u.text}"
+    background = (background or "").strip()
+    return f"Background:\n{background}\n\n{block}" if background else block
 
 
-def mood_messages(u: Utterance, instruction: str) -> tuple[str, str]:
+def mood_messages(u: Utterance, instruction: str, background: str = "") -> tuple[str, str]:
     system = (
         "You analyse the emotional tone of people in a live meeting transcript. "
         f"{instruction} Reply with JSON only: "
         '{"mood": one of ' + ", ".join(f'"{m}"' for m in MOODS) + ', '
         '"intensity": number 0..1, "reason": "max 8 words"}'
     )
-    return system, _context_block(u)
+    return system, _context_block(u, background)
 
 
-def fact_messages(u: Utterance, instruction: str) -> tuple[str, str]:
+def fact_messages(u: Utterance, instruction: str, background: str = "") -> tuple[str, str]:
     system = (
         "You fact-check statements made in a live meeting, using only your own knowledge (no internet). "
         f"{instruction} Reply with JSON only: "
         '{"verdict": "correct" | "incorrect" | "doubtful" | "no_claim", '
         '"claim": "the claim, max 15 words", "note": "one short sentence with the correct info if wrong"}'
     )
-    return system, _context_block(u)
+    return system, _context_block(u, background)
 
 
-def custom_messages(u: Utterance, check: dict[str, Any]) -> tuple[str, str]:
+def custom_messages(u: Utterance, check: dict[str, Any], background: str = "") -> tuple[str, str]:
     system = (
         "You monitor a live meeting transcript and apply one check to the LATEST utterance.\n"
         f"Check '{check['name']}': {check['prompt']}\n"
         'Reply with JSON only: {"hit": true|false, "label": "max 5 words", "note": "one short sentence"}'
     )
-    return system, _context_block(u)
+    return system, _context_block(u, background)
 
 
 def laya_questions(u: Utterance, settings: dict[str, Any]) -> dict[str, dict]:
@@ -237,9 +242,10 @@ class CheckRunner:
             self._run_laya(u, settings, base)
             return
         client = self._client_factory(settings)
+        background = settings.get("llm_context", "")
 
         if settings.get("mood_enabled"):
-            data = self._ask(client, mood_messages(u, settings.get("mood_prompt", "")))
+            data = self._ask(client, mood_messages(u, settings.get("mood_prompt", ""), background))
             mood = parse_mood(data) if data else None
             if mood:
                 if self._on_mood:
@@ -247,7 +253,7 @@ class CheckRunner:
                 self._emit({**base, "check_id": "mood", "kind": "mood", "name": "Mood", "result": mood})
 
         if settings.get("fact_check_enabled") and applies(settings.get("fact_check_applies_to", "everyone"), u.is_me):
-            data = self._ask(client, fact_messages(u, settings.get("fact_check_prompt", "")))
+            data = self._ask(client, fact_messages(u, settings.get("fact_check_prompt", ""), background))
             fact = parse_fact(data) if data else None
             if fact:
                 if self._on_fact:
@@ -257,7 +263,7 @@ class CheckRunner:
         for check in settings.get("custom_checks") or []:
             if not check.get("enabled") or not applies(check.get("applies_to", "everyone"), u.is_me):
                 continue
-            data = self._ask(client, custom_messages(u, check))
+            data = self._ask(client, custom_messages(u, check, background))
             hit = parse_custom(data) if data else None
             if hit:
                 if self._on_hit:
@@ -272,8 +278,10 @@ class CheckRunner:
         if not questions:
             return
         try:
-            answers = self._laya_predict(settings.get("llm_base_url") or laya.DEFAULT_URL, _context_block(u),
-                                         questions, timeout=float(settings.get("llm_timeout_seconds", 30.0)))
+            answers = self._laya_predict(settings.get("llm_base_url") or laya.DEFAULT_URL,
+                                         _context_block(u, settings.get("llm_context", "")), questions,
+                                         timeout=float(settings.get("llm_timeout_seconds", 30.0)),
+                                         api_key=env_key(settings.get("llm_api_key_env")))
         except laya.LayaError as e:
             self._warn(e)
             return

@@ -225,6 +225,10 @@ func add_check(msg: Dictionary) -> void:
 				s.facts_wrong += 1
 			text = "%s: %s" % [verdict.capitalize(), str(result.get("claim", ""))]
 			color = Palette.FACT_COLORS.get(verdict, Palette.WARN)
+		"answer":
+			# Shown in the insights feed; on the stage just a small marker, it isn't a check hit.
+			text = "Answer ready"
+			color = Color(str(msg.get("color", "#4cc9f0")))
 		_:
 			s.hits += 1
 			text = "%s: %s" % [str(msg.get("name", "")), str(result.get("label", ""))]

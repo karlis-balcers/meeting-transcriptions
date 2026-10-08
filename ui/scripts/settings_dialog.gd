@@ -1,25 +1,34 @@
 class_name SettingsDialog
 extends Window
 ## Settings, same options as the Python version (minus the OpenAI assistant),
-## plus Local AI (Ollama) and user-defined live checks.
+## plus the three AI roles, each with its own server, key and knowledge:
+## transcription (speech to text), checks (Laya / Ollama, live mood and yes/no
+## checks) and answers (a chat model that drafts answers to questions).
 
 signal save_requested(values: Dictionary)
-## `server` carries the server type, URL and model as currently set in the form (saved or not).
+## `server` carries the role ("llm" = checks, "answer") and its server type, URL,
+## model and key variable as currently set in the form (saved or not), as llm_* keys.
 signal llm_action(action: String, server: Dictionary)
+## Test the transcription server with the values in the form.
+signal transcribe_check(values: Dictionary)
+
+const KEY_ENV_HINT := "Name of an environment variable that holds the key, e.g. OPENAI_API_KEY. Leave empty for local servers."
 
 # [tab, key, label, type, extra]
 const FIELDS := [
 	["General", "your_name", "Your name", "string", ""],
 	["General", "languages", "Language(s)", "string", "One code or a comma list, e.g. en,lv. The first is the default."],
-	["General", "keywords", "Keywords", "string", "Hard words for the transcriber, comma separated."],
 	["General", "auto_start", "Start transcribing when the app opens", "bool", ""],
 	["General", "remote_speaker_name", "Name for unknown remote speaker", "string", "Used when Teams can't tell who talks (always on Mac)."],
 	["General", "teams_window_name", "Teams window match (Windows)", "string", ""],
-	["Transcription", "openai_api_key", "OpenAI API key", "secret", ""],
-	["Transcription", "transcript_model", "Transcription model", "string", "gpt-4o-mini-transcribe or gpt-4o-transcribe"],
-	["Transcription", "transcribe_timeout_seconds", "Timeout (s)", "float", ""],
-	["Transcription", "transcribe_max_retries", "Max retries", "int", ""],
-	["Transcription", "transcribe_retry_base_seconds", "Retry base (s)", "float", ""],
+	["Transcription AI", "transcribe_base_url", "Server URL", "string", "Empty = OpenAI. Or any OpenAI-compatible speech-to-text server, with /v1, e.g. a local Speaches / faster-whisper server: http://127.0.0.1:8000/v1"],
+	["Transcription AI", "transcribe_api_key_env", "API key environment variable", "string", KEY_ENV_HINT],
+	["Transcription AI", "openai_api_key", "API key (optional, instead of the variable)", "secret", "Saved in the settings file. The variable above is used when this is empty."],
+	["Transcription AI", "transcript_model", "Model", "string", "OpenAI: gpt-4o-mini-transcribe or gpt-4o-transcribe. Local servers: their model name, e.g. Systran/faster-whisper-large-v3"],
+	["Transcription AI", "keywords", "Keywords (what it should know)", "multiline", "Names, product words and jargon it should expect, comma separated. They go into every request as a hint."],
+	["Transcription AI", "transcribe_timeout_seconds", "Timeout (s)", "float", ""],
+	["Transcription AI", "transcribe_max_retries", "Max retries", "int", ""],
+	["Transcription AI", "transcribe_retry_base_seconds", "Retry base (s)", "float", ""],
 	["Audio", "record_seconds", "Max chunk length (s)", "int", ""],
 	["Audio", "silence_threshold", "Silence threshold", "float", "RMS level under which audio counts as silence."],
 	["Audio", "silence_duration", "Silence duration (s)", "float", "How long a pause splits a chunk."],
@@ -31,44 +40,50 @@ const FIELDS := [
 	["Filtering", "filter_prefixes", "Prefix matches", "string", ""],
 	["Filtering", "filter_contains", "Contains matches", "string", ""],
 	["Filtering", "filter_regex", "Regex patterns", "string", ""],
-	["Local AI", "llm_enabled", "Enable live checks on local AI", "bool", ""],
-	["Local AI", "llm_api", "Server type", "option", "laya,ollama,openai"],
-	["Local AI", "llm_base_url", "Server URL", "string", "Laya: http://127.0.0.1:8765. Ollama: http://127.0.0.1:11434. llama.cpp / LM Studio: their OpenAI-style URL."],
-	["Local AI", "llm_model", "Model", "string", ""],
-	["Local AI", "llm_timeout_seconds", "Timeout (s)", "float", ""],
-	["Local AI", "llm_context_lines", "Context lines", "int", "Earlier lines sent with each check."],
-	["Local AI", "mood_enabled", "Mood of each speaker", "bool", ""],
-	["Local AI", "mood_prompt", "Mood instruction", "multiline", ""],
-	["Local AI", "fact_check_enabled", "Fact check", "bool", ""],
-	["Local AI", "fact_check_applies_to", "Fact check who", "option", "everyone,others,me"],
-	["Local AI", "fact_check_prompt", "Fact check instruction", "multiline", ""],
+	["Checks AI", "llm_enabled", "Enable live checks (mood, facts, your checks)", "bool", ""],
+	["Checks AI", "llm_api", "Server type", "option", "laya,ollama,openai"],
+	["Checks AI", "llm_base_url", "Server URL", "string", "Laya: http://127.0.0.1:8765. Ollama: http://127.0.0.1:11434. llama.cpp / LM Studio / cloud: their OpenAI-style URL."],
+	["Checks AI", "llm_model", "Model", "string", ""],
+	["Checks AI", "llm_api_key_env", "API key environment variable", "string", KEY_ENV_HINT],
+	["Checks AI", "llm_context", "Extra context (what it should know)", "multiline", "Sent with every check: who is in your meetings, what the project is, words that mean something special to you."],
+	["Checks AI", "llm_timeout_seconds", "Timeout (s)", "float", ""],
+	["Checks AI", "llm_context_lines", "Context lines", "int", "Earlier lines sent with each check."],
+	["Checks AI", "mood_enabled", "Mood of each speaker", "bool", ""],
+	["Checks AI", "mood_prompt", "Mood instruction", "multiline", ""],
+	["Checks AI", "fact_check_enabled", "Fact check", "bool", ""],
+	["Checks AI", "fact_check_applies_to", "Fact check who", "option", "everyone,others,me"],
+	["Checks AI", "fact_check_prompt", "Fact check instruction", "multiline", ""],
+	["Answer AI", "answer_enabled", "Draft answers to questions people ask", "bool", ""],
+	["Answer AI", "answer_api", "Server type", "option", "ollama,openai"],
+	["Answer AI", "answer_base_url", "Server URL", "string", "Ollama: http://127.0.0.1:11434. LM Studio / llama.cpp: their OpenAI-style URL. OpenAI: https://api.openai.com/v1"],
+	["Answer AI", "answer_model", "Model", "string", ""],
+	["Answer AI", "answer_api_key_env", "API key environment variable", "string", KEY_ENV_HINT],
+	["Answer AI", "answer_context", "Extra context (what it should know)", "multiline", "Facts it can answer from: your role, the project, numbers, links. The more here, the better the answers."],
+	["Answer AI", "answer_prompt", "Answer instruction", "multiline", ""],
+	["Answer AI", "answer_applies_to", "Answer questions from", "option", "others,everyone,me"],
+	["Answer AI", "answer_timeout_seconds", "Timeout (s)", "float", ""],
 	["Logging", "log_level", "Log level", "option", "DEBUG,INFO,WARNING,ERROR"],
 	["Logging", "log_file_max_mb", "Log file max MB", "float", ""],
 	["Logging", "log_file_backup_count", "Log backups", "int", ""],
 ]
 
+## Prefix of each AI role's settings keys.
+const ROLES := {"llm": "llm_", "answer": "answer_"}
+
 var _widgets := {}
 var _tabs: TabContainer
 var _checks_box: VBoxContainer
-var _llm_status: Label
-var _llm_progress: ProgressBar
-var _llm_log: TextEdit
-var _llm_info: Label
-var _llm_buttons := {}
-var _model_hint: Label
-var _model_presets: OptionButton
+## Per role ("llm", "answer"): the setup box widgets and its busy state.
+var _setup := {}
+var _transcribe_status: Label
 const LAYA_URL := "http://127.0.0.1:8765"
 const OLLAMA_URL := "http://127.0.0.1:11434"
 const OLLAMA_MODELS := [
 	["llama3.2:3b", "Llama 3.2 3B, about 2 GB, fast, good English"],
 	["qwen2.5:3b", "Qwen 2.5 3B, about 2 GB, better with other languages"],
 	["gemma3:4b", "Gemma 3 4B, about 3 GB, slower, best fact checks of the three"],
+	["qwen2.5:7b", "Qwen 2.5 7B, about 5 GB, slower, better answers"],
 ]
-var _llm_log_toggle: Button
-var _llm_busy_text := ""
-var _llm_busy := false
-var _llm_busy_since := 0.0
-var _llm_tick := 0.0
 const LLM_LOG_MAX_LINES := 400
 var _key_set := false
 var _dir_dialog: FileDialog
@@ -103,7 +118,11 @@ func _ready() -> void:
 		_add_field(tab_forms[tab], f)
 		# The setup box sits right under server type / URL / model, which it acts on.
 		if f[1] == "llm_model":
-			_add_llm_controls(tab_forms[tab])
+			_add_llm_controls(tab_forms[tab], "llm")
+		elif f[1] == "answer_model":
+			_add_llm_controls(tab_forms[tab], "answer")
+		elif f[1] == "transcript_model":
+			_add_transcribe_check(tab_forms[tab])
 	_build_checks_tab()
 
 	var bottom := HBoxContainer.new()
@@ -216,78 +235,114 @@ func _add_field(form: VBoxContainer, f: Array) -> void:
 	form.add_child(row)
 
 
-func _add_llm_controls(form: VBoxContainer) -> void:
+func _add_transcribe_check(form: VBoxContainer) -> void:
+	var row := HBoxContainer.new()
+	var b := Button.new()
+	b.text = "Check connection"
+	b.tooltip_text = "Asks the server for its model list with the URL and key above. Costs nothing."
+	b.pressed.connect(func():
+		set_transcribe_status("Checking...")
+		transcribe_check.emit({
+			"transcribe_base_url": (_widgets["transcribe_base_url"] as LineEdit).text.strip_edges(),
+			"transcribe_api_key_env": (_widgets["transcribe_api_key_env"] as LineEdit).text.strip_edges(),
+			"transcript_model": (_widgets["transcript_model"] as LineEdit).text.strip_edges(),
+		}))
+	row.add_child(b)
+	_transcribe_status = Label.new()
+	_transcribe_status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_transcribe_status.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_transcribe_status.add_theme_color_override("font_color", Palette.TEXT_DIM)
+	row.add_child(_transcribe_status)
+	form.add_child(row)
+
+
+func set_transcribe_status(text: String) -> void:
+	if _transcribe_status != null:
+		_transcribe_status.text = text
+
+
+func _add_llm_controls(form: VBoxContainer, role: String) -> void:
+	var prefix: String = ROLES[role]
+	var ui := {"busy": false, "busy_text": "", "busy_since": 0.0, "buttons": {}}
+	_setup[role] = ui
 	var box := PanelContainer.new()
 	box.add_theme_stylebox_override("panel", Palette.panel_style(Palette.PANEL_LIGHT, 8, 10))
 	var v := VBoxContainer.new()
 	box.add_child(v)
-	_llm_info = Label.new()
-	_llm_info.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	_llm_info.add_theme_color_override("font_color", Palette.TEXT_DIM)
-	v.add_child(_llm_info)
-	_llm_status = Label.new()
-	_llm_status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	v.add_child(_llm_status)
-	_llm_progress = ProgressBar.new()
-	_llm_progress.visible = false
-	_llm_progress.max_value = 1.0
-	_llm_progress.step = 0.001
-	v.add_child(_llm_progress)
+	var info := Label.new()
+	info.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	info.add_theme_color_override("font_color", Palette.TEXT_DIM)
+	v.add_child(info)
+	ui["info"] = info
+	var status := Label.new()
+	status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	v.add_child(status)
+	ui["status"] = status
+	var progress := ProgressBar.new()
+	progress.visible = false
+	progress.max_value = 1.0
+	progress.step = 0.001
+	v.add_child(progress)
+	ui["progress"] = progress
 	var buttons := HFlowContainer.new()
 	for action in ["llm_install", "llm_pull", "llm_start", "llm_status", "llm_test"]:
 		var b := Button.new()
-		b.pressed.connect(func(): llm_action.emit(action, _server_values()))
+		b.pressed.connect(func(): llm_action.emit(action, _server_values(role)))
 		buttons.add_child(b)
-		_llm_buttons[action] = b
+		ui["buttons"][action] = b
 	v.add_child(buttons)
 	# Everything the installer prints (uv, pip, winget, the model download), like a small terminal.
-	_llm_log_toggle = Button.new()
-	_llm_log_toggle.text = "Show setup log"
-	_llm_log_toggle.toggle_mode = true
-	_llm_log_toggle.toggled.connect(func(on: bool):
-		_llm_log.visible = on
-		_llm_log_toggle.text = "Hide setup log" if on else "Show setup log")
-	v.add_child(_llm_log_toggle)
-	_llm_log = TextEdit.new()
-	_llm_log.editable = false
-	_llm_log.visible = false
-	_llm_log.custom_minimum_size = Vector2(0, 220)
-	_llm_log.wrap_mode = TextEdit.LINE_WRAPPING_BOUNDARY
-	_llm_log.add_theme_font_override("font", _monospace())
-	_llm_log.add_theme_font_size_override("font_size", 12)
-	_llm_log.add_theme_color_override("background_color", Palette.BG)
-	v.add_child(_llm_log)
-	var api: OptionButton = _widgets["llm_api"]
+	var log_view := TextEdit.new()
+	var toggle := Button.new()
+	toggle.text = "Show setup log"
+	toggle.toggle_mode = true
+	toggle.toggled.connect(func(on: bool):
+		log_view.visible = on
+		toggle.text = "Hide setup log" if on else "Show setup log")
+	v.add_child(toggle)
+	ui["log_toggle"] = toggle
+	log_view.editable = false
+	log_view.visible = false
+	log_view.custom_minimum_size = Vector2(0, 220)
+	log_view.wrap_mode = TextEdit.LINE_WRAPPING_BOUNDARY
+	log_view.add_theme_font_override("font", _monospace())
+	log_view.add_theme_font_size_override("font_size", 12)
+	log_view.add_theme_color_override("background_color", Palette.BG)
+	v.add_child(log_view)
+	ui["log"] = log_view
+	var api: OptionButton = _widgets[prefix + "api"]
 	api.item_selected.connect(func(_i):
 		# Switching server type with the other one's default URL still there: use this one's default.
-		var url: LineEdit = _widgets["llm_base_url"]
+		var url: LineEdit = _widgets[prefix + "base_url"]
 		var picked := api.get_item_text(api.selected)
 		if picked == "laya" and url.text.strip_edges() in ["", OLLAMA_URL]:
 			url.text = LAYA_URL
 		elif picked == "ollama" and url.text.strip_edges() in ["", LAYA_URL]:
 			url.text = OLLAMA_URL
-		if not _llm_busy:
-			set_llm_status("Not checked yet for %s. Press \"Check if it's running\"." % picked)
-		_refresh_llm_controls())
-	var model: LineEdit = _widgets["llm_model"]
-	model.text_changed.connect(func(_t): _refresh_llm_controls())
+		if not ui["busy"]:
+			set_llm_status("Not checked yet for %s. Press \"Check if it's running\"." % picked, -2.0, false, role)
+		_refresh_llm_controls(role))
+	var model: LineEdit = _widgets[prefix + "model"]
+	model.text_changed.connect(func(_t): _refresh_llm_controls(role))
 	# Ollama model picker, fills the Model field.
 	var model_row: VBoxContainer = model.get_parent()
-	_model_presets = OptionButton.new()
-	_model_presets.add_item("Pick a suggested Ollama model...")
+	var presets := OptionButton.new()
+	presets.add_item("Pick a suggested Ollama model...")
 	for preset in OLLAMA_MODELS:
-		_model_presets.add_item("%s  -  %s" % preset)
-	_model_presets.item_selected.connect(func(i):
+		presets.add_item("%s  -  %s" % preset)
+	presets.item_selected.connect(func(i):
 		if i > 0:
 			model.text = OLLAMA_MODELS[i - 1][0]
-			_model_presets.select(0)
-			_refresh_llm_controls())
-	model_row.add_child(_model_presets)
-	_model_hint = Label.new()
-	_model_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	_model_hint.add_theme_font_size_override("font_size", 11)
-	_model_hint.add_theme_color_override("font_color", Palette.TEXT_DIM)
-	model_row.add_child(_model_hint)
+			presets.select(0)
+			_refresh_llm_controls(role))
+	model_row.add_child(presets)
+	ui["presets"] = presets
+	var hint := Label.new()
+	hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	hint.add_theme_font_size_override("font_size", 11)
+	hint.add_theme_color_override("font_color", Palette.TEXT_DIM)
+	model_row.add_child(hint)
+	ui["model_hint"] = hint
 	form.add_child(box)
 
 
@@ -373,7 +428,9 @@ func open_with(settings: Dictionary) -> void:
 	for check in settings.get("custom_checks", []):
 		_add_check_row(check)
 	_config_path.text = "Settings file: " + str(settings.get("config_path", ""))
-	_refresh_llm_controls()
+	for role in _setup:
+		_refresh_llm_controls(role)
+	set_transcribe_status("")
 	popup_centered()
 
 
@@ -415,26 +472,33 @@ func _on_save() -> void:
 	hide()
 
 
-func _server_values() -> Dictionary:
-	var api: OptionButton = _widgets["llm_api"]
+func _server_values(role: String) -> Dictionary:
+	var prefix: String = ROLES[role]
+	var api: OptionButton = _widgets[prefix + "api"]
 	return {
+		"role": role,
 		"llm_api": api.get_item_text(api.selected),
-		"llm_base_url": (_widgets["llm_base_url"] as LineEdit).text.strip_edges(),
-		"llm_model": (_widgets["llm_model"] as LineEdit).text.strip_edges(),
+		"llm_base_url": (_widgets[prefix + "base_url"] as LineEdit).text.strip_edges(),
+		"llm_model": (_widgets[prefix + "model"] as LineEdit).text.strip_edges(),
+		"llm_api_key_env": (_widgets[prefix + "api_key_env"] as LineEdit).text.strip_edges(),
 	}
 
 
 ## Say exactly what each button does for the server type picked right now.
-func _refresh_llm_controls() -> void:
-	if _llm_info == null:
+func _refresh_llm_controls(role: String) -> void:
+	if not _setup.has(role):
 		return
-	var server := _server_values()
+	var ui: Dictionary = _setup[role]
+	var server := _server_values(role)
 	var model: String = server["llm_model"]
-	var model_edit: LineEdit = _widgets["llm_model"]
-	var b: Dictionary = _llm_buttons
+	var model_edit: LineEdit = _widgets[ROLES[role] + "model"]
+	var info: Label = ui["info"]
+	var hint: Label = ui["model_hint"]
+	var presets: OptionButton = ui["presets"]
+	var b: Dictionary = ui["buttons"]
 	match server["llm_api"]:
 		"laya":
-			_llm_info.text = ("Laya is a small local decision model (the pip package \"laya\"). It answers the mood and yes/no " +
+			info.text = ("Laya is a small local decision model (the pip package \"laya\"). It answers the mood and yes/no " +
 				"checks for each line in one fast pass, in 100+ languages, but for fact checks it can only flag a line " +
 				"as probably wrong. Nothing leaves your computer.")
 			b["llm_install"].text = "Install Laya (about 1 GB)"
@@ -447,11 +511,15 @@ func _refresh_llm_controls() -> void:
 			b["llm_start"].text = "Start Laya server"
 			b["llm_start"].tooltip_text = "Starts the Laya server in the background (the app also starts it by itself when it opens)."
 			model_edit.visible = false
-			_model_hint.text = "Laya has no model to pick: it chooses its English or multilingual checkpoint per line."
-			_model_presets.visible = false
+			hint.text = "Laya has no model to pick: it chooses its English or multilingual checkpoint per line."
+			presets.visible = false
 		"ollama":
-			_llm_info.text = ("Ollama runs a full chat model on your computer. Slower than Laya, but fact checks come with " +
-				"a short explanation. Nothing leaves your computer.")
+			if role == "answer":
+				info.text = ("Ollama runs a chat model on your computer that writes the answers. A bigger model answers " +
+					"better but slower. Nothing leaves your computer.")
+			else:
+				info.text = ("Ollama runs a full chat model on your computer. Slower than Laya, but fact checks come with " +
+					"a short explanation. Nothing leaves your computer.")
 			b["llm_install"].text = "Install Ollama"
 			b["llm_install"].tooltip_text = ("Installs the Ollama app (winget on Windows, Homebrew or the app download " +
 				"on macOS), starts it and downloads the model below.")
@@ -460,22 +528,23 @@ func _refresh_llm_controls() -> void:
 			b["llm_start"].text = "Start Ollama server"
 			b["llm_start"].tooltip_text = "Starts Ollama in the background if it isn't running."
 			model_edit.visible = true
-			_model_hint.text = "The Ollama model to use and download. Pick one of the suggestions or type any name from ollama.com/library."
-			_model_presets.visible = true
+			hint.text = "The Ollama model to use and download. Pick one of the suggestions or type any name from ollama.com/library."
+			presets.visible = true
 		_:
-			_llm_info.text = ("Your own OpenAI-compatible server (LM Studio, llama.cpp server...). You install and start it " +
-				"yourself; the app only connects to the URL and uses the model name below.")
+			info.text = ("Any OpenAI-compatible server: local (LM Studio, llama.cpp server) or in the cloud (OpenAI, Groq...). " +
+				"You run or sign up for it yourself; the app connects to the URL with the model below, and the key " +
+				"from the environment variable if one is set. Cloud servers see the transcript lines.")
 			model_edit.visible = true
-			_model_hint.text = "The model name your server expects."
-			_model_presets.visible = false
+			hint.text = "The model name your server expects."
+			presets.visible = false
 	var managed: bool = server["llm_api"] != "openai"
 	b["llm_install"].visible = managed
 	b["llm_pull"].visible = managed
 	b["llm_start"].visible = managed
 	b["llm_status"].text = "Check if it's running"
 	b["llm_status"].tooltip_text = "Asks the server at the URL above whether it's up and the model is there."
-	b["llm_test"].text = "Test with a sample line"
-	b["llm_test"].tooltip_text = "Sends one sample sentence and shows the answer and how long it took."
+	b["llm_test"].text = "Test with a sample question" if role == "answer" else "Test with a sample line"
+	b["llm_test"].tooltip_text = "Sends one sample and shows the answer and how long it took."
 
 
 func _monospace() -> SystemFont:
@@ -484,75 +553,94 @@ func _monospace() -> SystemFont:
 	return font
 
 
-func show_llm_log() -> void:
-	if _llm_log_toggle != null and not _llm_log_toggle.button_pressed:
-		_llm_log_toggle.button_pressed = true
+func _ui(role: String) -> Dictionary:
+	return _setup.get(role, _setup.get("llm", {}))
 
 
-func append_llm_log(line: String) -> void:
-	if _llm_log == null:
+func show_llm_log(role: String = "llm") -> void:
+	var ui := _ui(role)
+	if not ui.is_empty() and not ui["log_toggle"].button_pressed:
+		ui["log_toggle"].button_pressed = true
+
+
+func append_llm_log(line: String, role: String = "llm") -> void:
+	var ui := _ui(role)
+	if ui.is_empty():
 		return
-	if _llm_log.text != "":
-		_llm_log.text += "\n"
-	_llm_log.text += line
-	if _llm_log.get_line_count() > LLM_LOG_MAX_LINES:
-		var lines := _llm_log.text.split("\n")
-		_llm_log.text = "\n".join(lines.slice(lines.size() - LLM_LOG_MAX_LINES))
-	_scroll_log_to_end.call_deferred()
+	var log_view: TextEdit = ui["log"]
+	if log_view.text != "":
+		log_view.text += "\n"
+	log_view.text += line
+	if log_view.get_line_count() > LLM_LOG_MAX_LINES:
+		var lines := log_view.text.split("\n")
+		log_view.text = "\n".join(lines.slice(lines.size() - LLM_LOG_MAX_LINES))
+	_scroll_log_to_end.call_deferred(log_view)
 
 
-func _scroll_log_to_end() -> void:
-	_llm_log.set_caret_line(_llm_log.get_line_count() - 1)
-	_llm_log.adjust_viewport_to_caret()
+func _scroll_log_to_end(log_view: TextEdit) -> void:
+	log_view.set_caret_line(log_view.get_line_count() - 1)
+	log_view.adjust_viewport_to_caret()
 
 
-func set_llm_log(lines: Array) -> void:
-	if _llm_log == null:
+func set_llm_log(lines: Array, role: String = "llm") -> void:
+	var ui := _ui(role)
+	if ui.is_empty():
 		return
-	_llm_log.text = ""
+	ui["log"].text = ""
 	for line in lines:
-		append_llm_log(str(line))
+		append_llm_log(str(line), role)
 
 
 ## While a setup task runs, keep the elapsed time ticking even when the installer is quiet.
-func set_llm_busy(text: String, progress: float, elapsed: float) -> void:
-	if not _llm_busy:
-		show_llm_log()
-	_llm_busy = true
-	_llm_busy_text = text
-	_llm_busy_since = Time.get_ticks_msec() / 1000.0 - elapsed
-	set_llm_status(_busy_label(), progress, true)
+func set_llm_busy(text: String, progress: float, elapsed: float, role: String = "llm") -> void:
+	var ui := _ui(role)
+	if ui.is_empty():
+		return
+	if not ui["busy"]:
+		show_llm_log(role)
+	ui["busy"] = true
+	ui["busy_text"] = text
+	ui["busy_since"] = Time.get_ticks_msec() / 1000.0 - elapsed
+	set_llm_status(_busy_label(ui), progress, true, role)
 
 
-func _busy_label() -> String:
-	var seconds := maxi(0, int(Time.get_ticks_msec() / 1000.0 - _llm_busy_since))
-	return "%s  (%d:%02d)" % [_llm_busy_text, seconds / 60, seconds % 60]
+func _busy_label(ui: Dictionary) -> String:
+	var seconds := maxi(0, int(Time.get_ticks_msec() / 1000.0 - float(ui["busy_since"])))
+	return "%s  (%d:%02d)" % [ui["busy_text"], seconds / 60, seconds % 60]
+
+
+var _llm_tick := 0.0
 
 
 func _process(delta: float) -> void:
-	if not _llm_busy or _llm_status == null:
-		return
 	_llm_tick += delta
-	if _llm_tick >= 1.0:
-		_llm_tick = 0.0
-		_llm_status.text = _busy_label()
+	if _llm_tick < 1.0:
+		return
+	_llm_tick = 0.0
+	for role in _setup:
+		var ui: Dictionary = _setup[role]
+		if ui["busy"]:
+			ui["status"].text = _busy_label(ui)
 
 
 ## Server status from a Check; while a setup task runs its progress line wins.
-func set_llm_info(text: String) -> void:
-	if not _llm_busy:
-		set_llm_status(text)
+func set_llm_info(text: String, role: String = "llm") -> void:
+	var ui := _ui(role)
+	if not ui.is_empty() and not ui["busy"]:
+		set_llm_status(text, -2.0, false, role)
 
 
-func set_llm_status(text: String, progress: float = -2.0, busy: bool = false) -> void:
-	if _llm_status == null:
+func set_llm_status(text: String, progress: float = -2.0, busy: bool = false, role: String = "llm") -> void:
+	var ui := _ui(role)
+	if ui.is_empty():
 		return
 	if not busy:
-		_llm_busy = false
-	_llm_status.text = text
-	_llm_progress.visible = progress > -2.0
+		ui["busy"] = false
+	ui["status"].text = text
+	var bar: ProgressBar = ui["progress"]
+	bar.visible = progress > -2.0
 	if progress >= 0.0:
-		_llm_progress.value = progress
-		_llm_progress.indeterminate = false
+		bar.value = progress
+		bar.indeterminate = false
 	elif progress > -2.0:
-		_llm_progress.indeterminate = true
+		bar.indeterminate = true

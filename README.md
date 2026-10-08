@@ -51,7 +51,7 @@ Why this split: the hard platform parts (WASAPI loopback on Windows, Teams UI au
   - `openai`: any OpenAI-compatible local server (llama.cpp server, LM Studio). Set the URL.
 
   While it installs, the status line shows the step, progress and elapsed time, and **Show setup log** shows everything the installer prints (uv, pip, winget, the model download), like a small terminal. The same log is saved as `local-ai-setup.log` in the settings folder.
-- No AI summaries or assistant panels anymore, that was dropped on purpose.
+- Answer AI (optional, off by default): when someone else asks a question, a chat model drafts a short answer for you in the insights feed, using the extra context you gave it (your role, the project, numbers). Ollama on your machine, or any OpenAI-compatible server. No summaries or assistant panels beyond that.
 
 ## Run it from source
 
@@ -79,12 +79,15 @@ macOS has no loopback capture out of the box, same as with the Python version. I
 
 Stored as JSON in `%APPDATA%\MeetingTranscriptions\settings.json` (Windows) or `~/Library/Application Support/MeetingTranscriptions/settings.json` (macOS). Everything is editable in the Settings window:
 
-- General: your name, languages (comma list, the top bar lets you pick per meeting), keywords for the transcriber, auto start, name for the unknown remote speaker, Teams window match.
-- Transcription: OpenAI key, model, timeouts and retries.
+- General: your name, languages (comma list, the top bar lets you pick per meeting), auto start, name for the unknown remote speaker, Teams window match.
+- Three AI roles, each with its own server URL, API key environment variable (leave empty for local servers), model and knowledge:
+  - Transcription AI: OpenAI by default, or any OpenAI-compatible speech-to-text server (a local Speaches / faster-whisper server, Groq...). Knowledge = keywords, the hard words it should expect. The key can be pasted or read from the variable (`OPENAI_API_KEY` by default). **Check connection** asks the server for its model list.
+  - Checks AI: Laya (default), Ollama or OpenAI-compatible, for mood, fact and custom checks. Knowledge = extra context sent with every check. Install / download / start / check / test buttons.
+  - Answer AI: Ollama or OpenAI-compatible, drafts answers to questions. Knowledge = extra context it answers from, plus the answer instruction and whose questions to answer. Same setup buttons for Ollama.
 - Audio: max chunk length, silence threshold and duration, frame size.
 - Folders: where transcripts, stats and profiles go (any folder you like), and the temp audio folder.
 - Filtering: extra exact / prefix / contains / regex rules.
-- Local AI: on/off, server type and URL, model, mood and fact check toggles and instructions, install/download/test buttons.
+- Transcription timeouts and retries, mood and fact check toggles and instructions sit with their AI.
 - Custom checks: add, edit, color and delete your own checks.
 - Logging: level and rotation. Logs go to `<output folder>/logs`.
 
