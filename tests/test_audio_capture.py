@@ -1,9 +1,18 @@
+import logging
+import queue
+import tempfile
+import threading
 import unittest
+import wave
+
+import numpy as np
 
 from engine.audio_capture import (
     build_recording_device_catalog,
     normalize_device_name,
     pick_preferred_device,
+    store_audio_stream,
+    to_mono_pcm16,
 )
 
 
@@ -67,6 +76,37 @@ class AudioCaptureDeviceSelectionTests(unittest.TestCase):
         )
 
         self.assertEqual(selected["index"], 21)
+
+
+class StoreAudioStreamTests(unittest.TestCase):
+    def _run(self, chunks, channels=2, rate=16000):
+        q = queue.Queue()
+        for frames in chunks:
+            q.put((frames, None, 1.0))
+        stop = threading.Event()
+        stop.set()
+        seen = []
+
+        def callback(path, from_mic, letter):
+            with wave.open(path, "rb") as wf:
+                seen.append((wf.getnchannels(), wf.getnframes()))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store_audio_stream(q, "out", {"maxInputChannels": channels, "defaultSampleRate": rate}, tmp, stop,
+                               lambda: 2, callback, logging.getLogger("test"))
+        return seen
+
+    def test_short_and_empty_chunks_are_not_sent(self):
+        tiny = [np.zeros(2 * 1600, dtype="<i2").tobytes()]  # 0.1s stereo at 16 kHz
+        self.assertEqual(self._run([[], tiny]), [])
+
+    def test_chunks_are_written_as_mono(self):
+        one_second = [np.zeros(2 * 16000, dtype="<i2").tobytes()]
+        self.assertEqual(self._run([one_second]), [(1, 16000)])
+
+    def test_to_mono_averages_channels(self):
+        stereo = np.array([100, 300, -50, -150], dtype="<i2").tobytes()
+        self.assertEqual(np.frombuffer(to_mono_pcm16(stereo, 2), dtype="<i2").tolist(), [200, -100])
 
 
 if __name__ == "__main__":
