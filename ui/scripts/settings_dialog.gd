@@ -544,7 +544,8 @@ func _refresh_llm_controls(role: String) -> void:
 	b["llm_status"].text = "Check if it's running"
 	b["llm_status"].tooltip_text = "Asks the server at the URL above whether it's up and the model is there."
 	b["llm_test"].text = "Test with a sample question" if role == "answer" else "Test with a sample line"
-	b["llm_test"].tooltip_text = "Sends one sample and shows the answer and how long it took."
+	b["llm_test"].tooltip_text = ("Sends a short sample and one with a full window of earlier lines, like late in a " +
+		"meeting, and shows how long each took next to the timeout.")
 
 
 func _monospace() -> SystemFont:

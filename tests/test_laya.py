@@ -1,10 +1,11 @@
 import json
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from engine import laya
-from engine.checks import CheckRunner, Utterance
+from engine import laya, speedtest
+from engine.checks import CheckRunner, Utterance, laya_state, sample_utterance
 from engine.settings import SettingsStore
 
 
@@ -21,7 +22,10 @@ class FakeLaya(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except BrokenPipeError:  # the client gave up waiting (timeout test)
+            pass
 
     def do_GET(self):
         if self.path == "/health":
@@ -32,6 +36,8 @@ class FakeLaya(BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         FakeLaya.requests.append(body)
+        if "SLOW" in str(body.get("state")):
+            time.sleep(1.0)
         answers = {}
         for qid, q in body["questions"].items():
             if q["type"] == "choice":
@@ -122,6 +128,51 @@ class LayaTests(unittest.TestCase):
         self.assertEqual(events[0]["result"]["intensity"], 1.0)
         self.assertEqual(moods[0][:2], ("Anna", "frustrated"))
         self.assertEqual(hits, [("Anna", "Action item")])
+
+    def test_state_puts_the_latest_line_first_and_fits_the_window(self):
+        u = Utterance("u", "Anna", "the newest line", 0, False, [f"line {i}: " + "x" * 300 for i in range(6)])
+        state = laya_state(u, "We are the payments team.", max_chars=1000)
+        self.assertTrue(state.startswith("LATEST utterance by Anna:\nthe newest line"))
+        self.assertLessEqual(len(state), 1000)
+        self.assertIn("line 5", state)  # the newest earlier lines stay...
+        self.assertNotIn("line 0", state)  # ...the oldest go
+        self.assertLess(state.index("line 4"), state.index("line 5"))  # still in the order they were said
+        short = laya_state(Utterance("u", "A", "hi", 0, False, ["B: hello"]), "We are the payments team.")
+        self.assertTrue(short.endswith("Background:\nWe are the payments team."))
+
+    def test_slow_answer_is_a_timeout(self):
+        with self.assertRaises(laya.LayaTimeout):
+            laya.predict(self.url, "SLOW", {"x": {"type": "noul", "instructions": "a task?"}}, timeout=0.3)
+
+    def test_timeout_skips_the_backlog(self):
+        settings = {"llm_enabled": True, "llm_api": "laya", "mood_enabled": True, "custom_checks": []}
+
+        def timing_out(*args, **kwargs):
+            raise laya.LayaTimeout("Laya did not answer within 30s")
+
+        events = []
+        runner = CheckRunner(lambda: settings, events.append, laya_predict=timing_out)
+        for i in range(5):
+            runner.submit(Utterance(f"u{i}", "A", "x", 0, False))
+        runner.run_checks(Utterance("now", "A", "x", 0, False))
+        self.assertEqual([u.id for u in runner._queue], ["u4"])
+        self.assertIn("skipped 4 lines", events[0]["message"])
+
+    def test_speed_test_sends_short_and_full_context(self):
+        from unittest import mock
+
+        settings = {"llm_base_url": self.url, "llm_timeout_seconds": 30, "llm_context": "Payments team",
+                    "mood_enabled": True, "custom_checks": [
+                        {"id": "act", "name": "Action item", "prompt": "Is there a task?", "enabled": True}]}
+        FakeLaya.requests.clear()
+        with mock.patch.object(laya, "nvidia_gpu", lambda: True):
+            message = speedtest.laya_speed(settings, lambda *a: None)
+        self.assertEqual(len(FakeLaya.requests), 3)
+        self.assertEqual(set(FakeLaya.requests[1]["questions"]), {"mood", "intensity", "custom:act"})
+        self.assertIn(sample_utterance("en").context[-1], FakeLaya.requests[1]["state"])
+        self.assertIn("Pēteris", FakeLaya.requests[2]["state"])
+        self.assertIn("Laya on cpu: short line", message)
+        self.assertIn("press Install to move it to the NVIDIA GPU", message)
 
     def test_unreachable_server_is_one_status(self):
         settings = {"llm_enabled": True, "llm_api": "laya", "llm_base_url": "http://127.0.0.1:9",
