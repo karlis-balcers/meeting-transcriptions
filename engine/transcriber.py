@@ -5,6 +5,7 @@ With a base URL it talks to any OpenAI-compatible speech-to-text server instead
 from __future__ import annotations
 
 import logging
+import random
 import time
 from dataclasses import dataclass
 from typing import Callable, Optional
@@ -73,7 +74,9 @@ class OpenAITranscribe:
                 logger.debug("Transcribe status callback failed: %s", e)
 
     def _backoff(self, attempt: int) -> float:
-        return self.retry_base_seconds * (2 ** max(0, attempt - 1))
+        # Jitter keeps the mic and speaker threads from retrying in lockstep.
+        base = self.retry_base_seconds * (2 ** max(0, attempt - 1))
+        return base * random.uniform(0.75, 1.25)
 
     def transcribe(self, audio_file_path: str) -> list[Segment]:
         from openai import APIConnectionError, APIStatusError, APITimeoutError, RateLimitError
@@ -115,8 +118,8 @@ class OpenAITranscribe:
                 if transient and attempt < max_attempts:
                     delay = self._backoff(attempt)
                     logger.warning(
-                        "Transcription transient API status %s on attempt %s/%s. Retrying in %.2fs.",
-                        status_code, attempt, max_attempts, delay,
+                        "Transcription transient API status %s on attempt %s/%s (request id %s): %s. Retrying in %.2fs.",
+                        status_code, attempt, max_attempts, getattr(e, "request_id", None), e, delay,
                     )
                     self._emit_status(f"Transcription service busy ({status_code}), retrying...", "warning")
                     time.sleep(delay)

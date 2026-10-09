@@ -173,6 +173,24 @@ def wav_duration_seconds(path: str) -> float:
 		return 0.0
 
 
+# Chunks shorter than this are not worth a request: they are usually a click or a
+# leftover sliver from a speaker split, and the transcription API rejects or
+# errors on near-empty audio.
+MIN_CHUNK_SECONDS = 0.3
+
+
+def to_mono_pcm16(data: bytes, channels: int) -> bytes:
+	"""Average interleaved 16-bit PCM down to one channel.
+
+	Loopback devices often report 2-8 channels; speech needs one, and a mono file
+	is a fraction of the upload size."""
+	if channels <= 1 or not data:
+		return data
+	samples = np.frombuffer(data, dtype="<i2")
+	samples = samples[: len(samples) - len(samples) % channels].reshape(-1, channels)
+	return samples.astype(np.int32).mean(axis=1).round().astype("<i2").tobytes()
+
+
 def store_audio_stream(
 	queue,
 	filename_suffix,
@@ -196,13 +214,25 @@ def store_audio_stream(
 			logger.debug("[%s] Queue read skipped: %s", filename_suffix, e)
 			continue
 
+		channels = int(device_info["maxInputChannels"])
+		sample_width = sample_size_getter()
+		rate = int(device_info["defaultSampleRate"])
+		audio = b"".join(frames)
+		seconds = len(audio) / float(max(1, channels * sample_width * rate))
+		if seconds < MIN_CHUNK_SECONDS:
+			logger.debug("[%s] Skipping %.2fs chunk (too short to transcribe).", filename_suffix, seconds)
+			continue
+		if sample_width == 2:
+			audio = to_mono_pcm16(audio, channels)
+			channels = 1
+
 		filename = os.path.join(temp_dir, f"{start_time:.2f}-{filename_suffix}.wav")
 		try:
 			with wave.open(filename, "wb") as wf:
-				wf.setnchannels(device_info["maxInputChannels"])
-				wf.setsampwidth(sample_size_getter())
-				wf.setframerate(int(device_info["defaultSampleRate"]))
-				wf.writeframes(b"".join(frames))
+				wf.setnchannels(channels)
+				wf.setsampwidth(sample_width)
+				wf.setframerate(rate)
+				wf.writeframes(audio)
 			logger.debug("[%s] Wrote audio to %s.", filename_suffix, filename)
 		except Exception as e:
 			logger.error("[%s] Error writing WAV file: %s", filename_suffix, e)
