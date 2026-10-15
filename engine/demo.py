@@ -30,6 +30,9 @@ SCRIPT = [
 
 
 class DemoSession(Session):
+    # Plays scripted lines, so Start needs no transcription server (no Parakeet install in demo mode).
+    uses_transcriber = False
+
     def __init__(self, store, emit):
         super().__init__(store, emit)
         self._demo_stop = Event()

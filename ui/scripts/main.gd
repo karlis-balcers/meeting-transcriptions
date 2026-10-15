@@ -66,15 +66,6 @@ func _ready() -> void:
 	settings_dialog = SettingsDialog.new()
 	settings_dialog.save_requested.connect(func(values): engine.send("save_settings", {"settings": values}))
 	settings_dialog.llm_action.connect(_on_llm_action)
-	settings_dialog.transcribe_check.connect(func(values):
-		engine.send("transcribe_check", values, func(resp):
-			var data = resp.get("data")
-			if not resp.get("ok", false):
-				settings_dialog.set_transcribe_status("Error: " + str(resp.get("error")))
-			elif data is Dictionary and data.get("ok") == false:
-				settings_dialog.set_transcribe_status("Error: " + str(data.get("error")))
-			else:
-				settings_dialog.set_transcribe_status(str(data.get("message", "OK")))))
 	add_child(settings_dialog)
 
 	profiles_dialog = ProfilesDialog.new()
@@ -323,6 +314,8 @@ func _open_settings(tab: String) -> void:
 
 func _send_llm_status() -> void:
 	engine.send("llm_status")
+	# Also starts the local Parakeet server when it's installed, so Start is quick.
+	engine.send("llm_status", {"role": "transcribe"})
 	if bool(settings.get("answer_enabled", false)) or settings_dialog.visible:
 		engine.send("llm_status", {"role": "answer"})
 
@@ -456,7 +449,8 @@ func _on_event(msg: Dictionary) -> void:
 			engine.send("profiles", {}, func(resp):
 				if resp.get("ok", false):
 					_set_profiles(resp.get("data", {})))
-			if not settings.get("openai_api_key_set", false) and str(settings.get("transcribe_base_url", "")) == "":
+			if (str(settings.get("transcribe_api", "")) == "openai" and not settings.get("openai_api_key_set", false)
+					and str(settings.get("transcribe_base_url", "")) == ""):
 				_set_status("Add your OpenAI API key in Settings to start.", "warning")
 			if bool(settings.get("auto_start", false)) and not recording and not _auto_started:
 				_auto_started = true
@@ -537,18 +531,23 @@ func _on_check(msg: Dictionary) -> void:
 
 func _on_llm(msg: Dictionary) -> void:
 	var role := str(msg.get("role", "llm"))
-	var label := "Answer AI" if role == "answer" else "Checks AI"
+	var label: String = {"answer": "Answer AI", "transcribe": "Transcription"}.get(role, "Checks AI")
 	match str(msg.get("state", "")):
 		"status":
 			if role == "llm":
 				_llm_info = msg
 			var text := ""
-			if msg.get("model_ready", false):
+			if role == "transcribe" and str(msg.get("api", "")) == "openai":
+				text = str(msg.get("hint", "")) if msg.get("running", false) else "Error: " + str(msg.get("error", ""))
+			elif msg.get("model_ready", false):
 				text = "Ready: %s at %s" % [msg.get("model", ""), msg.get("base_url", "")]
 				if str(msg.get("device", "")) != "":
 					text += " (on %s)" % msg.device
 				if str(msg.get("hint", "")) != "":
 					text += "\n" + str(msg.hint)
+			elif role == "transcribe" and msg.get("running", false):
+				var err := str(msg.get("error", "")) if msg.get("error") != null else ""
+				text = "Parakeet is running but the model isn't loaded: " + err if err != "" else "Parakeet is loading the model..."
 			elif msg.get("running", false):
 				text = "Server is running but model %s is not downloaded. Press Download model." % msg.get("model", "")
 			elif msg.get("starting", false):
@@ -566,6 +565,8 @@ func _on_llm(msg: Dictionary) -> void:
 				float(msg.get("elapsed", 0)), role)
 			if role == "llm":
 				_ai_btn.text = "Checks AI: setting up..."
+			elif role == "transcribe":
+				_set_status(str(msg.get("message", "")), "info")
 		"log":
 			settings_dialog.append_llm_log(str(msg.get("line", "")), role)
 		"done":
@@ -584,6 +585,8 @@ func _llm_name(info: Dictionary) -> String:
 			return "Laya"
 		"ollama":
 			return "Ollama"
+		"parakeet":
+			return "Parakeet"
 	return "The local AI server"
 
 

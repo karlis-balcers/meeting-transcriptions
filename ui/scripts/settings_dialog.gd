@@ -2,15 +2,14 @@ class_name SettingsDialog
 extends Window
 ## Settings, same options as the Python version (minus the OpenAI assistant),
 ## plus the three AI roles, each with its own server, key and knowledge:
-## transcription (speech to text), checks (Laya / Ollama, live mood and yes/no
-## checks) and answers (a chat model that drafts answers to questions).
+## transcription (speech to text: local Parakeet or OpenAI), checks (Laya /
+## Ollama, live mood and yes/no checks) and answers (a chat model that drafts
+## answers to questions).
 
 signal save_requested(values: Dictionary)
-## `server` carries the role ("llm" = checks, "answer") and its server type, URL,
+## `server` carries the role ("llm" = checks, "answer", "transcribe") and its server type, URL,
 ## model and key variable as currently set in the form (saved or not), as llm_* keys.
 signal llm_action(action: String, server: Dictionary)
-## Test the transcription server with the values in the form.
-signal transcribe_check(values: Dictionary)
 
 const KEY_ENV_HINT := "Name of an environment variable that holds the key, e.g. OPENAI_API_KEY. Leave empty for local servers."
 
@@ -21,10 +20,12 @@ const FIELDS := [
 	["General", "auto_start", "Start transcribing when the app opens", "bool", ""],
 	["General", "remote_speaker_name", "Name for unknown remote speaker", "string", "Used when Teams can't tell who talks (always on Mac)."],
 	["General", "teams_window_name", "Teams window match (Windows)", "string", ""],
-	["Transcription AI", "transcribe_base_url", "Server URL", "string", "Empty = OpenAI. Or any OpenAI-compatible speech-to-text server, with /v1, e.g. a local Speaches / faster-whisper server: http://127.0.0.1:8000/v1"],
+	["Transcription AI", "transcribe_api", "Server type", "option", "parakeet,openai"],
+	["Transcription AI", "transcribe_base_url", "Server URL", "string", "Parakeet: http://127.0.0.1:8766/v1. For openai: empty = OpenAI, or any OpenAI-compatible speech-to-text server with /v1, e.g. a local Speaches / faster-whisper server: http://127.0.0.1:8000/v1"],
+	["Transcription AI", "transcribe_device", "Run on", "option", "auto,cuda,mps,cpu"],
 	["Transcription AI", "transcribe_api_key_env", "API key environment variable", "string", KEY_ENV_HINT],
 	["Transcription AI", "openai_api_key", "API key (optional, instead of the variable)", "secret", "Saved in the settings file. The variable above is used when this is empty."],
-	["Transcription AI", "transcript_model", "Model", "string", "OpenAI: gpt-4o-mini-transcribe or gpt-4o-transcribe. Local servers: their model name, e.g. Systran/faster-whisper-large-v3"],
+	["Transcription AI", "transcribe_model", "Model", "string", ""],
 	["Transcription AI", "keywords", "Keywords (what it should know)", "multiline", "Names, product words and jargon it should expect, comma separated. They go into every request as a hint."],
 	["Transcription AI", "transcribe_timeout_seconds", "Timeout (s)", "float", ""],
 	["Transcription AI", "transcribe_max_retries", "Max retries", "int", ""],
@@ -68,15 +69,17 @@ const FIELDS := [
 ]
 
 ## Prefix of each AI role's settings keys.
-const ROLES := {"llm": "llm_", "answer": "answer_"}
+const ROLES := {"llm": "llm_", "answer": "answer_", "transcribe": "transcribe_"}
 
 var _widgets := {}
 var _tabs: TabContainer
 var _checks_box: VBoxContainer
-## Per role ("llm", "answer"): the setup box widgets and its busy state.
+## Per role ("llm", "answer", "transcribe"): the setup box widgets and its busy state.
 var _setup := {}
-var _transcribe_status: Label
 const LAYA_URL := "http://127.0.0.1:8765"
+const PARAKEET_URL := "http://127.0.0.1:8766/v1"
+const PARAKEET_MODEL := "moondream/parakeet-redux"
+const OPENAI_TRANSCRIBE_MODEL := "gpt-4o-mini-transcribe"
 const OLLAMA_URL := "http://127.0.0.1:11434"
 const OLLAMA_MODELS := [
 	["llama3.2:3b", "Llama 3.2 3B, about 2 GB, fast, good English"],
@@ -121,8 +124,8 @@ func _ready() -> void:
 			_add_llm_controls(tab_forms[tab], "llm")
 		elif f[1] == "answer_model":
 			_add_llm_controls(tab_forms[tab], "answer")
-		elif f[1] == "transcript_model":
-			_add_transcribe_check(tab_forms[tab])
+		elif f[1] == "transcribe_model":
+			_add_llm_controls(tab_forms[tab], "transcribe")
 	_build_checks_tab()
 
 	var bottom := HBoxContainer.new()
@@ -235,32 +238,6 @@ func _add_field(form: VBoxContainer, f: Array) -> void:
 	form.add_child(row)
 
 
-func _add_transcribe_check(form: VBoxContainer) -> void:
-	var row := HBoxContainer.new()
-	var b := Button.new()
-	b.text = "Check connection"
-	b.tooltip_text = "Asks the server for its model list with the URL and key above. Costs nothing."
-	b.pressed.connect(func():
-		set_transcribe_status("Checking...")
-		transcribe_check.emit({
-			"transcribe_base_url": (_widgets["transcribe_base_url"] as LineEdit).text.strip_edges(),
-			"transcribe_api_key_env": (_widgets["transcribe_api_key_env"] as LineEdit).text.strip_edges(),
-			"transcript_model": (_widgets["transcript_model"] as LineEdit).text.strip_edges(),
-		}))
-	row.add_child(b)
-	_transcribe_status = Label.new()
-	_transcribe_status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	_transcribe_status.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	_transcribe_status.add_theme_color_override("font_color", Palette.TEXT_DIM)
-	row.add_child(_transcribe_status)
-	form.add_child(row)
-
-
-func set_transcribe_status(text: String) -> void:
-	if _transcribe_status != null:
-		_transcribe_status.text = text
-
-
 func _add_llm_controls(form: VBoxContainer, role: String) -> void:
 	var prefix: String = ROLES[role]
 	var ui := {"busy": false, "busy_text": "", "busy_since": 0.0, "buttons": {}}
@@ -319,6 +296,19 @@ func _add_llm_controls(form: VBoxContainer, role: String) -> void:
 			url.text = LAYA_URL
 		elif picked == "ollama" and url.text.strip_edges() in ["", LAYA_URL]:
 			url.text = OLLAMA_URL
+		elif role == "transcribe":
+			var model_edit: LineEdit = _widgets[prefix + "model"]
+			var m := model_edit.text.strip_edges()
+			if picked == "parakeet":
+				if url.text.strip_edges() == "":
+					url.text = PARAKEET_URL
+				if m == "" or m.begins_with("gpt-") or m.begins_with("whisper"):
+					model_edit.text = PARAKEET_MODEL
+			else:
+				if url.text.strip_edges() == PARAKEET_URL:
+					url.text = ""
+				if m == "" or m.begins_with("moondream/"):
+					model_edit.text = OPENAI_TRANSCRIBE_MODEL
 		if not ui["busy"]:
 			set_llm_status("Not checked yet for %s. Press \"Check if it's running\"." % picked, -2.0, false, role)
 		_refresh_llm_controls(role))
@@ -430,7 +420,6 @@ func open_with(settings: Dictionary) -> void:
 	_config_path.text = "Settings file: " + str(settings.get("config_path", ""))
 	for role in _setup:
 		_refresh_llm_controls(role)
-	set_transcribe_status("")
 	popup_centered()
 
 
@@ -475,13 +464,17 @@ func _on_save() -> void:
 func _server_values(role: String) -> Dictionary:
 	var prefix: String = ROLES[role]
 	var api: OptionButton = _widgets[prefix + "api"]
-	return {
+	var values := {
 		"role": role,
 		"llm_api": api.get_item_text(api.selected),
 		"llm_base_url": (_widgets[prefix + "base_url"] as LineEdit).text.strip_edges(),
 		"llm_model": (_widgets[prefix + "model"] as LineEdit).text.strip_edges(),
 		"llm_api_key_env": (_widgets[prefix + "api_key_env"] as LineEdit).text.strip_edges(),
 	}
+	if role == "transcribe":
+		var device: OptionButton = _widgets["transcribe_device"]
+		values["llm_device"] = device.get_item_text(device.selected)
+	return values
 
 
 ## Say exactly what each button does for the server type picked right now.
@@ -496,6 +489,9 @@ func _refresh_llm_controls(role: String) -> void:
 	var hint: Label = ui["model_hint"]
 	var presets: OptionButton = ui["presets"]
 	var b: Dictionary = ui["buttons"]
+	if role == "transcribe":
+		_refresh_transcribe_controls(ui, server)
+		return
 	match server["llm_api"]:
 		"laya":
 			info.text = ("Laya is a small local decision model (the pip package \"laya\"). It answers the mood and yes/no " +
@@ -546,6 +542,42 @@ func _refresh_llm_controls(role: String) -> void:
 	b["llm_test"].text = "Test with a sample question" if role == "answer" else "Test with a sample line"
 	b["llm_test"].tooltip_text = ("Sends a short sample and one with a full window of earlier lines, like late in a " +
 		"meeting, and shows how long each took next to the timeout.")
+
+
+## The transcription setup box: Parakeet is installed and run by the app, OpenAI only gets a connection check.
+func _refresh_transcribe_controls(ui: Dictionary, server: Dictionary) -> void:
+	var b: Dictionary = ui["buttons"]
+	var local: bool = server["llm_api"] == "parakeet"
+	var info: Label = ui["info"]
+	var hint: Label = ui["model_hint"]
+	ui["presets"].visible = false
+	if local:
+		info.text = ("Parakeet Redux runs on your computer: no API key, no subscription, nothing leaves your computer. " +
+			"It recognizes 25 European languages by itself (Latvian, English, Russian, German...) and ignores the " +
+			"keywords. With \"auto\" it uses an NVIDIA GPU (CUDA) or Apple GPU (MPS) when that works, otherwise the CPU.")
+		b["llm_install"].text = "Install Parakeet (about 1 GB)"
+		b["llm_install"].tooltip_text = ("Downloads uv, which brings its own Python, then installs the moondream package " +
+			"and PyTorch (the GPU build when there is an NVIDIA GPU) into the app's settings folder (parakeet/venv), " +
+			"starts the local server and downloads the model (about 180 MB). Pressing Start does this too the first time.")
+		b["llm_start"].text = "Start Parakeet"
+		b["llm_start"].tooltip_text = ("Starts the local Parakeet server and loads the model (the app also starts it when " +
+			"it opens). Restarts it if Run on or Model changed.")
+		b["llm_status"].text = "Check if it's running"
+		b["llm_status"].tooltip_text = "Asks the local server whether it's up, the model is loaded and which device it runs on."
+		hint.text = "moondream/parakeet-redux (default, about 180 MB) or moondream/parakeet-ultra."
+	else:
+		info.text = ("OpenAI (leave the URL empty, needs an API key and costs per minute) or any OpenAI-compatible " +
+			"speech-to-text server you run yourself. The audio is sent to that server.")
+		b["llm_status"].text = "Check connection"
+		b["llm_status"].tooltip_text = "Asks the server for its model list with the URL and key above. Costs nothing."
+		hint.text = "OpenAI: gpt-4o-mini-transcribe or gpt-4o-transcribe. Local servers: their model name, e.g. Systran/faster-whisper-large-v3"
+	b["llm_install"].visible = local
+	b["llm_start"].visible = local
+	b["llm_pull"].visible = false
+	b["llm_test"].visible = false
+	_widgets["transcribe_device"].get_parent().visible = local
+	for key in ["transcribe_api_key_env", "openai_api_key", "keywords"]:
+		_widgets[key].get_parent().visible = not local
 
 
 func _monospace() -> SystemFont:

@@ -83,6 +83,7 @@ class SessionTests(unittest.TestCase):
 
     def test_start_without_key_fails_cleanly(self):
         os.environ.pop("OPENAI_API_KEY", None)
+        self.store.update({"transcribe_api": "openai", "transcribe_base_url": ""})
         result = self.session.start()
         self.assertFalse(result["ok"])
         self.assertIn("API key", result["error"])
