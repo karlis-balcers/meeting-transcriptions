@@ -172,7 +172,8 @@ class DeviceTests(unittest.TestCase):
             return Speech(device)
 
         fake_torch = types.SimpleNamespace(
-            __version__="2.8.0", cuda=types.SimpleNamespace(is_available=lambda: True),
+            __version__="2.8.0", version=types.SimpleNamespace(cuda="12.8"),
+            cuda=types.SimpleNamespace(is_available=lambda: True, get_device_name=lambda i: "RTX 3000"),
             backends=types.SimpleNamespace(mps=types.SimpleNamespace(is_available=lambda: False)))
         fake_md = types.SimpleNamespace(photon=photon)
         with mock.patch.dict(sys.modules, {"torch": fake_torch, "moondream": fake_md}):
@@ -190,14 +191,73 @@ class DeviceTests(unittest.TestCase):
             raise RuntimeError(f"broken on {device}")
 
         fake_torch = types.SimpleNamespace(
-            __version__="2.8.0", cuda=types.SimpleNamespace(is_available=lambda: False), backends=types.SimpleNamespace())
+            __version__="2.8.0", version=types.SimpleNamespace(cuda=None),
+            cuda=types.SimpleNamespace(is_available=lambda: False), backends=types.SimpleNamespace())
         with mock.patch.dict(sys.modules, {"torch": fake_torch, "moondream": types.SimpleNamespace(photon=photon)}):
             model = parakeet_server.Model(PARAKEET_MODEL, "auto")
             model.load()
         self.assertIsNone(model.device)
         self.assertIn("broken on cpu", model.error)
+        self.assertIn(parakeet_server.FULL_MODEL, model.error)  # the last resort was tried too
         with self.assertRaises(RuntimeError):
             model.transcribe("x.wav")
+
+
+    def test_cpu_without_int8_kernel_falls_back_to_full_model(self):
+        def photon(name, device):
+            if name == PARAKEET_MODEL:
+                raise NotImplementedError("ternary weights need an int8 matrix-multiply kernel on the CPU")
+            return types.SimpleNamespace(transcribe=lambda audio, timestamps: {"text": "ok"})
+
+        fake_torch = types.SimpleNamespace(
+            __version__="2.8.0", version=types.SimpleNamespace(cuda=None),
+            cuda=types.SimpleNamespace(is_available=lambda: False), backends=types.SimpleNamespace())
+        with mock.patch.dict(sys.modules, {"torch": fake_torch, "moondream": types.SimpleNamespace(photon=photon)}):
+            model = parakeet_server.Model(PARAKEET_MODEL, "auto")
+            model.load()
+        self.assertEqual(model.device, "cpu")
+        self.assertEqual(model.loaded_model, parakeet_server.FULL_MODEL)
+        health = model.health()
+        self.assertEqual(health["model"], PARAKEET_MODEL)  # what was asked for, so the engine doesn't restart it
+        self.assertEqual(health["loaded_model"], parakeet_server.FULL_MODEL)
+
+    def test_scalar_cpu_kernel_is_replaced_by_one_the_cpu_has(self):
+        have = {"avx2", "scalar"}.__contains__
+        self.assertEqual(parakeet_server.pick_cpu_gemm("scalar", have), "avx2")
+        self.assertEqual(parakeet_server.pick_cpu_gemm(None, have), "avx2")
+        self.assertIsNone(parakeet_server.pick_cpu_gemm("avx512vnni", have))
+        self.assertIsNone(parakeet_server.pick_cpu_gemm("scalar", lambda name: False))
+
+
+class GpuTorchTests(unittest.TestCase):
+    def test_cuda_backend_for_driver(self):
+        self.assertEqual(parakeet.cuda_backend((13, 0)), "cu130")
+        self.assertEqual(parakeet.cuda_backend((12, 9)), "cu128")
+        self.assertEqual(parakeet.cuda_backend((12, 4)), "cu126")
+        self.assertIsNone(parakeet.cuda_backend((11, 8)))
+        self.assertIsNone(parakeet.cuda_backend(None))
+
+    def test_cpu_torch_is_swapped_for_cuda_build(self):
+        runs = []
+        with mock.patch.object(parakeet, "driver_cuda_version", return_value=(12, 8)), \
+                mock.patch.object(parakeet, "torch_build", return_value=("2.9.1+cpu", None)), \
+                mock.patch.object(parakeet.laya, "ensure_uv", return_value="uv"), \
+                mock.patch.object(parakeet.laya, "_run", side_effect=lambda args, *a, **k: runs.append(args)), \
+                mock.patch.object(parakeet, "stop_server"), mock.patch.object(parakeet.time, "sleep"):
+            self.assertTrue(parakeet.ensure_gpu(lambda *a: None))
+        self.assertIn("https://download.pytorch.org/whl/cu128", runs[0])
+        self.assertEqual(runs[0][-1], "torch==2.9.1")
+
+    def test_cuda_torch_or_no_gpu_is_left_alone(self):
+        with mock.patch.object(parakeet, "driver_cuda_version", return_value=(12, 8)), \
+                mock.patch.object(parakeet, "torch_build", return_value=("2.9.1+cu128", "12.8")), \
+                mock.patch.object(parakeet.laya, "_run") as run:
+            self.assertFalse(parakeet.ensure_gpu(lambda *a: None))
+        with mock.patch.object(parakeet, "driver_cuda_version", return_value=None), \
+                mock.patch.object(parakeet.laya, "_run") as run2:
+            self.assertFalse(parakeet.ensure_gpu(lambda *a: None))
+        run.assert_not_called()
+        run2.assert_not_called()
 
 
 class StartSession:
@@ -233,13 +293,14 @@ class StartRecordingTests(unittest.TestCase):
         with mock.patch.object(parakeet, "health", side_effect=parakeet.ParakeetError("down")), \
                 mock.patch.object(parakeet, "installed", return_value=False), \
                 mock.patch.object(parakeet, "install", side_effect=lambda p: calls.append("install")), \
+                mock.patch.object(parakeet, "ensure_gpu", side_effect=lambda p: calls.append("gpu")), \
                 mock.patch.object(parakeet, "ensure_running",
                                   side_effect=lambda *a: calls.append("run") or {"device": "cuda"}), \
                 mock.patch.object(parakeet, "start_server", return_value=False):
             result = self.engine.handle("start", {"language": "lv"})
             self.assertTrue(result["ok"])
             self.assertTrue(self.engine.session.started.wait(5))
-        self.assertEqual(calls, ["install", "run"])
+        self.assertEqual(calls, ["install", "gpu", "run"])
         done = [e for e in self.events if e.get("type") == "llm" and e.get("state") == "done"]
         self.assertEqual(done[0]["role"], "transcribe")
         self.assertIn("NVIDIA GPU", done[0]["message"])
@@ -263,6 +324,7 @@ class StartRecordingTests(unittest.TestCase):
         with mock.patch.object(parakeet, "health", side_effect=parakeet.ParakeetError("down")), \
                 mock.patch.object(parakeet, "installed", return_value=True), \
                 mock.patch.object(parakeet, "ensure_running", side_effect=parakeet.ParakeetError("no luck")), \
+                mock.patch.object(parakeet, "ensure_gpu", return_value=False), \
                 mock.patch.object(parakeet, "start_server", return_value=False):
             self.engine.handle("start", {})
             deadline = time.time() + 5
