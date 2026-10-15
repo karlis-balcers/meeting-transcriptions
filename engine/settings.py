@@ -40,7 +40,13 @@ LLM_APIS = ("laya", "ollama", "openai")
 # The answer AI writes text, so Laya (a decision model) is not an option there.
 ANSWER_APIS = ("ollama", "openai")
 LAYA_URL = "http://127.0.0.1:8765"
-SETTINGS_VERSION = 2
+SETTINGS_VERSION = 3
+# Transcription: "parakeet" (local Parakeet Redux, no key needed) or "openai" (OpenAI or a compatible server).
+TRANSCRIBE_APIS = ("parakeet", "openai")
+TRANSCRIBE_DEVICES = ("auto", "cuda", "mps", "cpu")
+PARAKEET_URL = "http://127.0.0.1:8766/v1"
+PARAKEET_MODEL = "moondream/parakeet-redux"
+OPENAI_TRANSCRIBE_MODEL = "gpt-4o-mini-transcribe"
 OLLAMA_URL = "http://127.0.0.1:11434"
 
 DEFAULT_ANSWER_PROMPT = (
@@ -73,12 +79,14 @@ def default_settings() -> dict[str, Any]:
         "auto_start": False,
         "teams_window_name": "Meeting compact view*",
         "remote_speaker_name": "Remote",
-        # Transcription AI: OpenAI, or any OpenAI-compatible speech-to-text server.
-        # "keywords" (under General) is its knowledge: hard words and names it should expect.
+        # Transcription AI: local Parakeet Redux (default, no key), or OpenAI / any OpenAI-compatible
+        # speech-to-text server. "keywords" is its knowledge (OpenAI only, Parakeet takes no prompt).
+        "transcribe_api": "parakeet",
+        "transcribe_device": "auto",  # Parakeet: auto = NVIDIA / Apple GPU when it works, else CPU
         "openai_api_key": "",
-        "transcribe_base_url": "",  # empty = OpenAI
+        "transcribe_base_url": PARAKEET_URL,  # for "openai": empty = OpenAI itself
         "transcribe_api_key_env": "OPENAI_API_KEY",
-        "transcript_model": "gpt-4o-mini-transcribe",
+        "transcribe_model": PARAKEET_MODEL,
         "transcribe_timeout_seconds": 60.0,
         "transcribe_max_retries": 3,
         "transcribe_retry_base_seconds": 1.0,
@@ -150,7 +158,7 @@ _ENV_IMPORT = {
     "KEYWORDS": ("keywords", str),
     "AUTO_START_TRANSCRIPTION": ("auto_start", "bool"),
     "OPENAI_API_KEY": ("openai_api_key", str),
-    "OPENAI_MODEL_FOR_TRANSCRIPT": ("transcript_model", str),
+    "OPENAI_MODEL_FOR_TRANSCRIPT": ("transcribe_model", str),
     "TRANSCRIBE_API_TIMEOUT_SECONDS": ("transcribe_timeout_seconds", float),
     "TRANSCRIBE_API_MAX_RETRIES": ("transcribe_max_retries", int),
     "TRANSCRIBE_API_RETRY_BASE_SECONDS": ("transcribe_retry_base_seconds", float),
@@ -305,6 +313,8 @@ def normalize_checks(raw: Any) -> list[dict[str, Any]]:
 def normalize(values: dict[str, Any]) -> dict[str, Any]:
     defaults = default_settings()
     result = copy.deepcopy(defaults)
+    if "transcript_model" in values and "transcribe_model" not in values:
+        values = dict(values, transcribe_model=values["transcript_model"])  # renamed in settings v3
     for key, default in defaults.items():
         if key in values:
             result[key] = _coerce(key, values[key], default)
@@ -326,6 +336,23 @@ def normalize(values: dict[str, Any]) -> dict[str, Any]:
     if result["answer_api"] == "ollama" and result["answer_base_url"].strip() == "":
         result["answer_base_url"] = OLLAMA_URL
     result["transcribe_base_url"] = result["transcribe_base_url"].strip().rstrip("/")
+    if result["transcribe_api"] not in TRANSCRIBE_APIS:
+        result["transcribe_api"] = "parakeet"
+    if result["transcribe_device"] not in TRANSCRIBE_DEVICES:
+        result["transcribe_device"] = "auto"
+    # Switching between Parakeet and OpenAI with the other one's default URL / model still in place.
+    model = result["transcribe_model"].strip()
+    if result["transcribe_api"] == "parakeet":
+        if result["transcribe_base_url"] == "":
+            result["transcribe_base_url"] = PARAKEET_URL
+        if model == "" or model.startswith(("gpt-", "whisper")):
+            model = PARAKEET_MODEL
+    else:
+        if result["transcribe_base_url"] == PARAKEET_URL:
+            result["transcribe_base_url"] = ""
+        if model == "" or model.startswith("moondream/"):
+            model = OPENAI_TRANSCRIBE_MODEL
+    result["transcribe_model"] = model
     for key in ("transcribe_api_key_env", "llm_api_key_env", "answer_api_key_env"):
         result[key] = result[key].strip()
     result["languages"] = ",".join(parse_language_candidates(result["languages"]))
@@ -346,6 +373,16 @@ def migrate(data: dict[str, Any]) -> bool:
         data["llm_api"] = "laya"
         data["llm_base_url"] = LAYA_URL
         logger.info("Settings: local AI switched from Ollama to Laya (pick Ollama again in Settings if you want it)")
+    if version < 3 and "transcribe_api" not in data:
+        # Transcription moved from OpenAI to local Parakeet. Someone who pointed it at their own
+        # server keeps that server; plain OpenAI users move to Parakeet (no key needed).
+        if str(data.get("transcribe_base_url") or "").strip():
+            data["transcribe_api"] = "openai"
+        else:
+            data["transcribe_api"] = "parakeet"
+            data.pop("transcript_model", None)
+            logger.info("Settings: transcription switched from OpenAI to local Parakeet (pick openai in Settings "
+                        "to go back)")
     data["settings_version"] = SETTINGS_VERSION
     return True
 
@@ -357,7 +394,14 @@ def env_key(name: Any) -> str:
 
 
 def role_settings(settings: dict[str, Any], role: str) -> dict[str, Any]:
-    """Settings as the shared LLM code reads them (llm_* keys), for the "llm" (live checks) or "answer" role."""
+    """Settings as the shared LLM code reads them (llm_* keys), for the "llm" (live checks), "answer"
+    or "transcribe" role."""
+    if role == "transcribe":
+        view = dict(settings)
+        for key in ("api", "base_url", "model", "api_key_env", "device"):
+            view["llm_" + key] = settings["transcribe_" + key]
+        view["llm_enabled"] = True
+        return view
     if role != "answer":
         return settings
     view = dict(settings)
@@ -420,8 +464,11 @@ class SettingsStore:
             return copy.deepcopy(self._values)
 
     def api_key(self) -> str:
-        """Key for the transcription AI: the one pasted in Settings, else its environment variable."""
+        """Key for the transcription AI: the one pasted in Settings, else its environment variable.
+        Local Parakeet needs none."""
         with self._lock:
+            if self._values.get("transcribe_api") == "parakeet":
+                return ""
             return self._values.get("openai_api_key") or env_key(self._values.get("transcribe_api_key_env"))
 
     def public(self) -> dict[str, Any]:

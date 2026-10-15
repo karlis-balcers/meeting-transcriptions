@@ -76,6 +76,12 @@ def main() -> int:
         if not got_hello:
             print("No hello from the engine")
             return 1
+        # Parakeet's server runs in its own venv from this file, so it must ship next to the engine.
+        scripts = list(exe.parent.rglob("parakeet_server.py"))
+        if not scripts:
+            print("parakeet_server.py is missing from the bundle")
+            return 1
+        print(f"parakeet server script: {scripts[0]}")
         return 0
     finally:
         if sock:

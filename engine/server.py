@@ -7,7 +7,8 @@ Protocol: newline-delimited JSON over TCP on 127.0.0.1.
 Events: hello, state, status, transcript, level, active_speaker, stats,
 speaker_stats, speaker_renamed, check, llm, profiles, settings, devices.
 The llm_* setup commands and llm events carry a "role": "llm" (checks AI,
-the default) or "answer" (answer AI).
+the default), "answer" (answer AI) or "transcribe" (transcription AI, where
+the setup buttons install and run local Parakeet).
 """
 from __future__ import annotations
 
@@ -20,7 +21,7 @@ import time
 from collections import deque
 from typing import Any, Callable, Optional
 
-from . import __version__, laya, llm, speedtest
+from . import __version__, laya, llm, parakeet, speedtest
 from .session import Session
 from .settings import SettingsStore, default_config_dir, env_key, role_settings
 
@@ -64,6 +65,7 @@ class Engine:
         self.session = session_factory(store, hub.send)
         self._llm_busy = threading.Lock()
         self._laya_autostarted = False
+        self._parakeet_autostarted = False
         # Install/download output, kept so a UI that (re)connects mid-task can show it.
         self._llm_log: deque[str] = deque(maxlen=500)
         self._llm_current: Optional[dict[str, Any]] = None
@@ -93,12 +95,16 @@ class Engine:
         return {k: v for k, v in result.items() if not k.startswith("_")}
 
     def _role(self, role: Any) -> str:
-        return "answer" if role == "answer" else "llm"
+        return role if role in ("answer", "transcribe") else "llm"
 
     def _role_settings(self, role: str) -> dict[str, Any]:
         return role_settings(self.store.get(), role)
 
     def llm_status(self, role: str = "llm") -> dict[str, Any]:
+        if role == "transcribe":
+            info = self.transcribe_status()
+            self.hub.send({"type": "llm", "state": "status", "role": role, **info})
+            return info
         settings = self._role_settings(role)
         info = llm.status(settings)
         # Laya runs as our own background server; bring it up once when it's installed but not running.
@@ -113,7 +119,9 @@ class Engine:
         return info
 
     def _llm_task(self, name: str, work: Callable[[Callable[[str, float], None]], str],
-                  refresh: bool = True, role: str = "llm") -> dict[str, Any]:
+                  refresh: bool = True, role: str = "llm",
+                  then: Optional[Callable[[], Any]] = None) -> dict[str, Any]:
+        """Run a setup step in the background with progress and log events. `then` runs after it succeeds."""
         if not self._llm_busy.acquire(blocking=False):
             return {"ok": False, "error": "AI setup already running"}
 
@@ -147,10 +155,12 @@ class Engine:
             except OSError:
                 pass
             log(f"{name} started {time.strftime('%Y-%m-%d %H:%M:%S')}")
+            ok = False
             try:
                 message = work(progress)
                 log(f"Done: {message}")
                 self.hub.send({"type": "llm", "state": "done", "role": role, "message": message})
+                ok = True
             except Exception as e:
                 logger.warning("%s failed: %s", name, e)
                 log(f"Failed: {e}")
@@ -160,6 +170,10 @@ class Engine:
                 self._llm_busy.release()
                 if refresh:
                     self.llm_status(role)
+            if ok and then is not None:
+                result = then()
+                if isinstance(result, dict) and result.get("ok") is False:
+                    self.hub.send({"type": "status", "level": "error", "message": result.get("error", "Failed")})
 
         threading.Thread(target=run, name=name, daemon=True).start()
         return {"ok": True}
@@ -210,6 +224,69 @@ class Engine:
         self._enable(role)
         return f"{'Answer' if role == 'answer' else 'Local'} AI ready ({client.model})"
 
+    # ------------------------------------------------------------ transcription AI
+
+    def _parakeet_args(self) -> tuple[str, str, str]:
+        settings = self.store.get()
+        return settings["transcribe_base_url"], settings["transcribe_model"], settings["transcribe_device"]
+
+    def transcribe_status(self) -> dict[str, Any]:
+        """What the Transcription AI setup box shows: Parakeet's state, or a connection check for OpenAI."""
+        settings = self.store.get()
+        base_url, model, device = self._parakeet_args()
+        info: dict[str, Any] = {"enabled": True, "api": settings["transcribe_api"], "base_url": base_url,
+                                "model": model}
+        if settings["transcribe_api"] != "parakeet":
+            check = self.transcribe_check({})
+            info.update({"installed": True, "running": check.get("ok", False), "model_ready": check.get("ok", False),
+                         "models": [], "error": check.get("error"), "hint": check.get("message")})
+            return info
+        info.update(parakeet.status(base_url, model, device))
+        # Like Laya: bring the server up once when it's installed, so the model is loaded by the time Start is pressed.
+        if info["installed"] and not info["running"] and not self._parakeet_autostarted:
+            self._parakeet_autostarted = True
+            if parakeet.start_server(base_url, model, device):
+                info["starting"] = True
+                threading.Thread(target=lambda: parakeet.wait_until_up(base_url) and self.llm_status("transcribe"),
+                                 name="parakeet-start", daemon=True).start()
+        return info
+
+    def _parakeet_ready(self, progress: Callable[[str, float], None]) -> str:
+        base_url, model, device = self._parakeet_args()
+        info = parakeet.ensure_running(base_url, model, device, progress)
+        where = {"cuda": "NVIDIA GPU", "mps": "Apple GPU", "cpu": "CPU"}.get(str(info.get("device")), "CPU")
+        return f"Local transcription ready (Parakeet on the {where})"
+
+    def _install_parakeet(self, progress: Callable[[str, float], None]) -> str:
+        parakeet.install(progress)
+        return self._parakeet_ready(progress)
+
+    def _parakeet_loaded(self) -> bool:
+        base_url, model, device = self._parakeet_args()
+        try:
+            info = parakeet.health(base_url, timeout=1.0)
+        except parakeet.ParakeetError:
+            return False
+        return bool(info.get("loaded")) and info.get("model") == model and info.get("requested_device") == device
+
+    def start_recording(self, language: Any) -> dict[str, Any]:
+        """Start; with Parakeet, first install / start it if needed (the first time that takes a while)."""
+        start = lambda: self.session.start(language)  # noqa: E731
+        if (not getattr(self.session, "uses_transcriber", True) or self.store.get()["transcribe_api"] != "parakeet"
+                or self._parakeet_loaded()):
+            self._background("start", start)
+            return {"ok": True}
+        current = self._llm_current
+        if current is not None:
+            message = ("Still setting up local transcription, press Start again when it's ready"
+                       if current.get("role") == "transcribe" else "Wait for the AI setup to finish, then press Start")
+            self.hub.send({"type": "status", "level": "warning", "message": message})
+            return {"ok": False, "error": message}
+        work = self._parakeet_ready if parakeet.installed() else self._install_parakeet
+        self.hub.send({"type": "status", "level": "info",
+                       "message": "Getting local transcription ready, recording starts when it's done..."})
+        return self._llm_task("transcribe-setup", work, role="transcribe", then=start)
+
     def transcribe_check(self, args: dict[str, Any]) -> dict[str, Any]:
         """Ask the transcription server for its models: proves the URL and key work, costs nothing."""
         settings = self.store.get()
@@ -225,7 +302,7 @@ class Engine:
         except llm.LLMError as e:
             return {"ok": False, "error": str(e)}
         models = [m.get("id", "") for m in (data.get("data") or []) if isinstance(m, dict)]
-        model = str(args.get("transcript_model") or settings["transcript_model"])
+        model = str(args.get("transcribe_model") or settings["transcribe_model"])
         found = "found" if model in models else ("not in the list" if models else "list is empty")
         return {"ok": True, "message": f"Connected to {url.rsplit('/', 1)[0]} ({len(models)} models, {model} {found})"}
 
@@ -252,8 +329,7 @@ class Engine:
             self.store.update({f"{kind}_device_index": args.get("index"), f"{kind}_device_name": args.get("name", "")})
             return {"ok": True}
         if cmd == "start":
-            self._background("start", lambda: s.start(args.get("language")))
-            return {"ok": True}
+            return self.start_recording(args.get("language"))
         if cmd == "stop":
             self._background("stop", s.stop)
             return {"ok": True}
@@ -282,9 +358,9 @@ class Engine:
         if cmd.startswith("llm_"):
             # The setup buttons act on the server type / URL / model as set in the form, saved or not.
             # The form always sends them as llm_*; for the answer AI they land in answer_*.
-            prefix = "answer_" if role == "answer" else "llm_"
-            server = {prefix + k: args["llm_" + k] for k in ("api", "base_url", "model", "api_key_env")
-                      if args.get("llm_" + k) is not None}
+            prefix = {"answer": "answer_", "transcribe": "transcribe_"}.get(role, "llm_")
+            server = {prefix + k: args["llm_" + k] for k in ("api", "base_url", "model", "api_key_env", "device")
+                      if args.get("llm_" + k) is not None and (k != "device" or role == "transcribe")}
             current = self.store.get()
             if any(current.get(k) != v for k, v in server.items()):
                 self.store.update(server)
@@ -298,6 +374,12 @@ class Engine:
                     "message": current.get("message") if current else None,
                     "progress": current.get("progress") if current else None,
                     "elapsed": round(time.time() - current["started"]) if current else None}
+        if role == "transcribe" and cmd in ("llm_install", "llm_pull", "llm_start", "llm_test"):
+            if self.store.get()["transcribe_api"] != "parakeet":
+                return {"ok": False, "error": "Nothing to set up for an OpenAI-compatible server, press Check"}
+            if cmd == "llm_install":
+                return self._llm_task("parakeet-install", self._install_parakeet, role=role)
+            return self._llm_task("parakeet-start", self._parakeet_ready, role=role)
         if cmd == "llm_install":
             return self._llm_task("llm-install", lambda progress: self._install_and_pull(progress, role), role=role)
         settings = self._role_settings(role)

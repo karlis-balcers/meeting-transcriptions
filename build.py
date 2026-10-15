@@ -38,6 +38,8 @@ def build_engine() -> Path:
         "--distpath", str(DIST / "engine-build"), "--workpath", str(ROOT / "build" / "pyinstaller"),
         "--specpath", str(ROOT / "build"), "--paths", str(ROOT),
         "--collect-submodules", "engine",
+        # Run by Parakeet's own venv Python, not imported, so it ships as a plain file next to the modules.
+        "--add-data", f"{ROOT / 'engine' / 'parakeet_server.py'}{os.pathsep}engine",
         str(ROOT / "packaging" / "engine_main.py"),
     ])
     return DIST / "engine-build" / "meeting-engine"

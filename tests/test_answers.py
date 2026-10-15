@@ -127,7 +127,7 @@ class EngineRoleTests(unittest.TestCase):
         self.assertEqual(values["llm_model"], "llama3.2:3b")
 
     def test_transcription_key_comes_from_its_env_variable(self):
-        self.store.update({"transcribe_api_key_env": "MT_TEST_STT_KEY"})
+        self.store.update({"transcribe_api": "openai", "transcribe_api_key_env": "MT_TEST_STT_KEY"})
         with mock.patch.dict(os.environ, {"MT_TEST_STT_KEY": "sk-stt"}):
             self.assertEqual(self.store.api_key(), "sk-stt")
             self.assertTrue(self.store.public()["openai_api_key_set"])
@@ -140,7 +140,7 @@ class EngineRoleTests(unittest.TestCase):
         try:
             url = f"http://127.0.0.1:{server.server_address[1]}/v1"
             result = self.engine.handle("transcribe_check", {"transcribe_base_url": url,
-                                                             "transcript_model": "whisper-1"})
+                                                             "transcribe_model": "whisper-1"})
             self.assertTrue(result["ok"], result)
             self.assertIn("whisper-1 found", result["message"])
             missing = self.engine.handle("transcribe_check", {"transcribe_base_url": "",

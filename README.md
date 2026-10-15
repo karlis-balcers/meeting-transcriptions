@@ -26,7 +26,7 @@ curl -fsSL https://raw.githubusercontent.com/karlis-balcers/meeting-transcriptio
 
 Installs `MeetingTranscriptions.app` to `/Applications` (or `~/Applications`). The app isn't notarized, so the script removes the download quarantine flag for you. For the other side of the call you need BlackHole, see below. Intel Macs: run from source for now.
 
-Or grab the zip yourself from the [Releases](https://github.com/karlis-balcers/meeting-transcriptions/releases) page. Then open **Settings**, paste your OpenAI API key and press **Start**.
+Or grab the zip yourself from the [Releases](https://github.com/karlis-balcers/meeting-transcriptions/releases) page. Then press **Start**. No API key or subscription needed: the first time, the app sets up local transcription ([Parakeet Redux](https://huggingface.co/moondream/parakeet-redux), about 1 GB with PyTorch) and starts recording when it's ready.
 
 ## How it's built
 
@@ -38,7 +38,8 @@ Why this split: the hard platform parts (WASAPI loopback on Windows, Teams UI au
 
 ## What it does
 
-- Records mic + output device, cuts chunks on silence (or on a speaker change in Teams, or when you press **Split** / `S`), transcribes them with OpenAI (`gpt-4o-mini-transcribe` by default) and filters the usual hallucinations ("thanks for watching", URLs...).
+- Records mic + output device, cuts chunks on silence (or on a speaker change in Teams, or when you press **Split** / `S`), transcribes them on your own computer with [Parakeet Redux](https://huggingface.co/moondream/parakeet-redux) (or OpenAI / any OpenAI-compatible server if you pick that) and filters the usual hallucinations ("thanks for watching", URLs...).
+- Local transcription with Parakeet Redux, a 180 MB 1.58-bit version of NVIDIA's Parakeet TDT 0.6B v3 that runs through the `moondream` package. It recognizes 25 European languages by itself (Latvian, English, Russian, German, Lithuanian, Estonian...). Like Laya, it gets its own venv in the settings folder (`parakeet/venv`, made with uv, PyTorch included) and runs as a small local server on `127.0.0.1:8766` that speaks the OpenAI transcription API. The install picks the CUDA build of PyTorch when there's an NVIDIA GPU. **Run on** `auto` tries the NVIDIA GPU (CUDA), then the Apple GPU (MPS), then the CPU, and drops to the CPU when a GPU can't run the model (old card, driver trouble); the setup log says why. Windows x64, Apple silicon Macs and Linux x64 only (its runtime has no Intel Mac build).
 - Speaker names: your mic is you; the remote side gets the active speaker name from Microsoft Teams on Windows (same as the Python version). When that's not available (macOS, other apps) the remote side is one speaker called "Remote", and you can **rename** it in the sidebar. Renaming into an existing name merges the two.
 - Writes the transcript as Markdown to your output folder (`transcription-YYYYMMDD_HHMMSS.md`), the same format as before, plus a `-stats.json` next to it.
 - Live stats per speaker: talk time and share, turns, words, pace (wpm), questions, interruptions, filler words, longest turn, topics. Lines between speakers show who answers whom.
@@ -60,7 +61,7 @@ You need Python 3.11+ and Godot 4.4+.
 - **Windows**: double-click `run_win.bat`. First run creates `.venv` and installs `requirements.txt`. Godot must be on `PATH` (`winget install GodotEngine.GodotEngine`) or set `GODOT=C:\path\to\Godot.exe`.
 - **macOS**: `./run.sh`. It installs `portaudio` with Homebrew if needed. Godot from `brew install --cask godot` or set `GODOT=/path/to/Godot`.
 
-Then open **Settings**, paste your OpenAI API key and press **Start**.
+Then press **Start** (the first time it installs local transcription, see above).
 
 If you used the Python version, your old `.env` (name, language, keywords, folders, audio tuning, filters, API key) is imported on the first run.
 
@@ -81,7 +82,7 @@ Stored as JSON in `%APPDATA%\MeetingTranscriptions\settings.json` (Windows) or `
 
 - General: your name, languages (comma list, the top bar lets you pick per meeting), auto start, name for the unknown remote speaker, Teams window match.
 - Three AI roles, each with its own server URL, API key environment variable (leave empty for local servers), model and knowledge:
-  - Transcription AI: OpenAI by default, or any OpenAI-compatible speech-to-text server (a local Speaches / faster-whisper server, Groq...). Knowledge = keywords, the hard words it should expect. The key can be pasted or read from the variable (`OPENAI_API_KEY` by default). **Check connection** asks the server for its model list.
+  - Transcription AI: `parakeet` (default, local, no key) with Install / Start / Check buttons and **Run on** (auto, cuda, mps, cpu). Or `openai`: OpenAI itself (empty URL, needs a key) or any OpenAI-compatible speech-to-text server (a local Speaches / faster-whisper server, Groq...). For `openai` the knowledge = keywords, the hard words it should expect (Parakeet takes no hints), and the key can be pasted or read from the variable (`OPENAI_API_KEY` by default). Settings from before this switch move from OpenAI to Parakeet; if you had your own server URL set, you stay on it.
   - Checks AI: Laya (default), Ollama or OpenAI-compatible, for mood, fact and custom checks. Knowledge = extra context sent with every check. Install / download / start / check / test buttons.
   - Answer AI: Ollama or OpenAI-compatible, drafts answers to questions. Knowledge = extra context it answers from, plus the answer instruction and whose questions to answer. Same setup buttons for Ollama.
 - Audio: max chunk length, silence threshold and duration, frame size.
@@ -122,6 +123,7 @@ Layout:
 - `engine/session.py` recording pipeline (restored flow from `transcribe.py`)
 - `engine/audio_capture.py`, `speaker_detection.py`, `transcriber.py`, `transcript_filter.py` restored from the Python version
 - `engine/profiles.py` live stats and saved profiles
+- `engine/parakeet.py` Parakeet install and server control, `engine/parakeet_server.py` the local transcription server (runs in Parakeet's venv)
 - `engine/checks.py` local AI checks, `engine/laya.py` Laya install and client, `engine/llm.py` Ollama / OpenAI-style client and Ollama install
 - `engine/server.py` socket protocol, `engine/demo.py` scripted demo meeting
 - `ui/scripts/stage.gd` the speaker circle, `main.gd` app shell, `engine_client.gd` socket + engine launcher, `settings_dialog.gd`, `speaker_panel.gd`, `profiles_dialog.gd`, `avatars.gd` (profile pictures)

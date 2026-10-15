@@ -144,9 +144,10 @@ class Session:
             settings = self.store.get()
             api_key = self.store.api_key()
             base_url = settings["transcribe_base_url"]
-            # OpenAI itself needs a key; a local speech-to-text server usually doesn't.
+            # OpenAI itself needs a key; Parakeet and other local speech-to-text servers don't.
             if not api_key and not base_url:
-                return {"ok": False, "error": "Set your OpenAI API key in Settings first."}
+                return {"ok": False, "error": "Set your OpenAI API key in Settings first, or pick parakeet "
+                                             "(local, no key) in Settings > Transcription AI."}
 
             candidates = parse_language_candidates(settings["languages"])
             self.language = language if language in candidates else candidates[0]
@@ -169,7 +170,7 @@ class Session:
                 self._transcriber = OpenAITranscribe(
                     api_key=api_key,
                     base_url=base_url or None,
-                    model=settings["transcript_model"],
+                    model=settings["transcribe_model"],
                     language=self.language,
                     keywords=settings["keywords"] or None,
                     timeout_seconds=settings["transcribe_timeout_seconds"],
