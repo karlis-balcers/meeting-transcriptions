@@ -19,6 +19,12 @@ Device: PARAKEET_DEVICE=auto (default) tries an NVIDIA GPU (cuda), then an
 Apple GPU (mps), then the CPU, and keeps the first one that loads the model and
 gets through a short test clip. A GPU that is too old or has a broken driver
 falls back to the CPU instead of failing.
+
+On the CPU the 1.58-bit weights need an int8 matrix-multiply kernel. When
+kestrel's own pick says there is none ("scalar", seen on Windows with CPUs
+that do have AVX2) the server asks which paths the CPU can run and uses the
+best one. When even that fails, it loads the full Parakeet TDT 0.6B v3 on the
+CPU instead (same accuracy, a bigger download), so transcription still works.
 """
 from __future__ import annotations
 
@@ -41,6 +47,10 @@ DEVICE = (os.environ.get("PARAKEET_DEVICE") or "auto").strip().lower()
 HOST = os.environ.get("PARAKEET_HOST") or "127.0.0.1"
 PORT = int(os.environ.get("PARAKEET_PORT") or "8766")
 MAX_UPLOAD = 200 * 1024 * 1024
+# The model Parakeet Redux was made from: plain weights, so it runs on any CPU torch runs on.
+FULL_MODEL = "nvidia/parakeet-tdt-0.6b-v3"
+# Int8 matrix-multiply paths kestrel has for the ternary weights, best first.
+CPU_GEMM_PATHS = ("avx512vnni", "avxvnni", "avx2", "neon-i8mm", "neon-dotprod", "neon-mull")
 
 log = logging.getLogger("parakeet-server")
 
@@ -54,6 +64,40 @@ def device_candidates(requested: str, cuda: bool, mps: bool) -> list[str]:
     if "cpu" not in order:
         order.append("cpu")
     return order
+
+
+def pick_cpu_gemm(current: Optional[str], available) -> Optional[str]:
+    """The path to force when kestrel picked none (None/"scalar"): the best one `available(name)` accepts."""
+    if current and current != "scalar":
+        return None
+    for name in CPU_GEMM_PATHS:
+        try:
+            if available(name):
+                return name
+        except Exception:
+            continue
+    return None
+
+
+def fix_cpu_gemm() -> None:
+    """Log the CPU kernel kestrel picked, and force a real one when it fell to the scalar reference."""
+    try:
+        from kestrel_kernels import ternary
+    except Exception as e:
+        log.info("No kestrel CPU kernels to check: %s", e)
+        return
+    cpu = getattr(ternary, "_cpu", None)
+    if cpu is None:
+        log.info("kestrel_kernels has no CPU extension in this build")
+        return
+    current = cpu.ternary_gemm_isa()
+    log.info("CPU int8 kernel picked by kestrel: %s", current)
+    forced = pick_cpu_gemm(current, cpu.gemm_isa_available)
+    if forced:
+        log.info("Forcing the CPU int8 kernel to %s", forced)
+        ternary.set_gemm_isa(forced)
+    elif not current or current == "scalar":
+        log.warning("This CPU reports none of %s for the 1.58-bit weights", ", ".join(CPU_GEMM_PATHS))
 
 
 def _write_silence(path: str, seconds: float = 1.0, rate: int = 16000) -> None:
@@ -71,6 +115,7 @@ class Model:
         self.name = name
         self.requested = requested
         self.device: Optional[str] = None
+        self.loaded_model: Optional[str] = None
         self.error: Optional[str] = None
         self.tried: list[dict[str, str]] = []
         self._speech: Any = None
@@ -89,22 +134,33 @@ class Model:
 
             cuda = bool(torch.cuda.is_available())
             mps = bool(getattr(torch.backends, "mps", None) and torch.backends.mps.is_available())
-            log.info("torch %s, cuda available: %s, mps available: %s", torch.__version__, cuda, mps)
+            log.info("torch %s (CUDA build: %s), cuda available: %s, mps available: %s",
+                     torch.__version__, getattr(torch.version, "cuda", None), cuda, mps)
+            if cuda:
+                log.info("GPU: %s", torch.cuda.get_device_name(0))
+            fix_cpu_gemm()
             probe = os.path.join(tempfile.gettempdir(), f"parakeet-probe-{os.getpid()}.wav")
             _write_silence(probe)
+            attempts = [(self.name, d) for d in device_candidates(self.requested, cuda, mps)]
+            if self.name != FULL_MODEL:
+                attempts.append((FULL_MODEL, "cpu"))  # last resort for a CPU without the int8 kernels
             try:
-                for device in device_candidates(self.requested, cuda, mps):
-                    log.info("Loading %s on %s", self.name, device)
+                for name, device in attempts:
+                    if name == FULL_MODEL and name != self.name:
+                        log.info("Falling back to %s on the CPU (about 2.5 GB download the first time)", name)
+                    log.info("Loading %s on %s", name, device)
                     try:
-                        speech = md.photon(self.name, device=device)
+                        speech = md.photon(name, device=device)
                         speech.transcribe(audio=probe, timestamps="none")
                     except Exception as e:  # unsupported GPU, driver trouble, out of memory...
-                        log.warning("%s did not work on %s: %s", self.name, device, e)
-                        self.tried.append({"device": device, "error": str(e)[:300]})
+                        log.warning("%s did not work on %s: %s", name, device, e)
+                        label = device if name == self.name else f"{device} ({name})"
+                        self.tried.append({"device": label, "error": str(e)[:300]})
                         continue
                     self._speech = speech
                     self.device = device
-                    log.info("Ready on %s after %.1fs", device, time.time() - self.started)
+                    self.loaded_model = name
+                    log.info("Ready: %s on %s after %.1fs", name, device, time.time() - self.started)
                     return
             finally:
                 try:
@@ -130,7 +186,8 @@ class Model:
 
     def health(self) -> dict[str, Any]:
         return {
-            "status": "ok", "model": self.name, "requested_device": self.requested, "device": self.device,
+            "status": "ok", "model": self.name, "loaded_model": self.loaded_model,
+            "requested_device": self.requested, "device": self.device,
             "loaded": self.loaded, "loading": not self._ready.is_set(), "error": self.error, "tried": self.tried,
         }
 

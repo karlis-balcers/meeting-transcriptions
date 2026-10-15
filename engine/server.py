@@ -253,8 +253,12 @@ class Engine:
 
     def _parakeet_ready(self, progress: Callable[[str, float], None]) -> str:
         base_url, model, device = self._parakeet_args()
+        if device in ("auto", "cuda"):
+            parakeet.ensure_gpu(progress)
         info = parakeet.ensure_running(base_url, model, device, progress)
         where = {"cuda": "NVIDIA GPU", "mps": "Apple GPU", "cpu": "CPU"}.get(str(info.get("device")), "CPU")
+        if info.get("loaded_model") and info["loaded_model"] != model:
+            return f"Local transcription ready ({info['loaded_model']} on the CPU, slower)"
         return f"Local transcription ready (Parakeet on the {where})"
 
     def _install_parakeet(self, progress: Callable[[str, float], None]) -> str:

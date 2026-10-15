@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import platform
 import shutil
 import subprocess
@@ -27,7 +28,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from . import laya
-from .proc import LogTail, log_fn
+from .proc import LogTail, log_fn, run_logged
 from .settings import PARAKEET_MODEL, PARAKEET_URL, default_config_dir
 
 PACKAGE = "moondream>=2.4.0"
@@ -216,7 +217,9 @@ def status(base_url: str, model: str, device: str) -> dict[str, Any]:
     if data.get("model") != model or data.get("requested_device") != device:
         info["hint"] = "Runs with older settings, press Start to restart it."
     elif data.get("device") == "cpu" and device == "auto" and laya.nvidia_gpu():
-        info["hint"] = "Runs on the CPU although there is an NVIDIA GPU (see the setup log for why)."
+        info["hint"] = "Runs on the CPU although there is an NVIDIA GPU. Press Install to switch it to the GPU."
+    elif data.get("loaded_model") and data.get("loaded_model") != model:
+        info["hint"] = f"Runs {data['loaded_model']} on the CPU instead (this CPU can't run {model}), slower."
     return info
 
 
@@ -238,3 +241,81 @@ def install(on_progress: Progress) -> str:
     laya._pip_install(uv, _venv_bin("python"), [PACKAGE], on_progress, "Installing Parakeet and PyTorch")
     (home() / "installed").write_text(time.strftime("%Y-%m-%d %H:%M:%S"), encoding="utf-8")
     return "Parakeet installed"
+
+
+# ------------------------------------------------------------------ NVIDIA GPU
+
+TORCH_INDEX = "https://download.pytorch.org/whl/"
+
+
+def driver_cuda_version() -> Optional[tuple[int, int]]:
+    """The newest CUDA the NVIDIA driver supports ("CUDA Version: 12.8" in nvidia-smi), or None."""
+    if not laya.nvidia_gpu():
+        return None
+    try:
+        kwargs: dict[str, Any] = {"capture_output": True, "text": True, "timeout": 20}
+        if sys.platform == "win32":
+            kwargs["creationflags"] = 0x08000000
+        out = subprocess.run(["nvidia-smi"], **kwargs).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = re.search(r"CUDA Version:\s*(\d+)\.(\d+)", out or "")
+    return (int(match.group(1)), int(match.group(2))) if match else None
+
+
+def cuda_backend(version: Optional[tuple[int, int]]) -> Optional[str]:
+    """The PyTorch CUDA wheel set for a driver: the newest one it can run (PyTorch 2.8+ ships 12.6 and up)."""
+    if version is None:
+        return None
+    if version >= (13, 0):
+        return "cu130"
+    if version >= (12, 8):
+        return "cu128"
+    if version >= (12, 0):
+        return "cu126"  # 12.x wheels run on any 12.x driver (CUDA minor version compatibility)
+    return None
+
+
+def torch_build(on_progress: Progress) -> Optional[tuple[str, Optional[str]]]:
+    """(torch version, CUDA version or None) in Parakeet's venv; None when there's no venv or torch."""
+    python = _venv_bin("python")
+    if not python.exists():
+        return None
+    found: list[str] = []
+    code, _ = run_logged([str(python), "-c", "import torch; print('torch=' + torch.__version__ + '|' + str(torch.version.cuda))"],
+                         on_progress, "Checking which PyTorch Parakeet has",
+                         on_line=lambda line: found.append(line) if line.startswith("torch=") else None)
+    if code != 0 or not found:
+        return None
+    version, cuda = found[-1][len("torch="):].split("|", 1)
+    return version, (None if cuda == "None" else cuda)
+
+
+def ensure_gpu(on_progress: Progress) -> bool:
+    """Swap a CPU-only PyTorch for the CUDA build when there is an NVIDIA GPU. True if it did.
+
+    `--torch-backend auto` should already pick CUDA, but an older uv on PATH (or one that can't see the
+    driver) quietly installs the CPU build, and then the GPU is never tried."""
+    backend = cuda_backend(driver_cuda_version())
+    if backend is None:
+        return False
+    build = torch_build(on_progress)
+    if build is None or build[1] is not None:
+        return False
+    version = build[0].split("+", 1)[0]
+    log = log_fn(on_progress)
+    log(f"PyTorch {build[0]} is the CPU build, but there is an NVIDIA GPU: installing the {backend} build")
+    uv = laya.ensure_uv(on_progress)
+    on_progress("Stopping Parakeet to replace PyTorch", -1.0)
+    stop_server()  # Windows locks the loaded torch DLLs
+    time.sleep(2.0)
+    base = [uv, "pip", "install", "--python", str(_venv_bin("python")), "--reinstall-package", "torch",
+            "--index-url", TORCH_INDEX + backend]
+    label = f"Installing the GPU build of PyTorch ({backend}, about 2.5 GB)"
+    try:
+        # Same version first, so the compiled kestrel extensions keep matching it.
+        laya._run(base + [f"torch=={version}"], on_progress, label)
+    except laya.LayaError:
+        log(f"No torch {version} for {backend}, taking the newest one there")
+        laya._run(base + ["torch"], on_progress, label)
+    return True
